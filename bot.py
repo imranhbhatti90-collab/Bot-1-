@@ -18,7 +18,7 @@ server_thread.daemon = True
 server_thread.start()
 
 # ==========================================
-# 2. 5-Minute Candle (OHLC) Strategy Bot with 30x Leverage & 10 USDT Size
+# 2. 5-Minute Candle (OHLC) Strategy Bot with 30x Leverage & Lower Threshold
 # ==========================================
 print("5-Minute Candle Strategy Bot Started...")
 
@@ -92,13 +92,11 @@ def set_product_leverage(product_id, symbol):
 
 def get_latest_candle_change(product_id):
     try:
-        # Delta Exchange OHLC candles API (5m resolution)
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
         response = requests.get(url)
         data = response.json()
         candles = data.get('result', [])
         if candles and len(candles) >= 1:
-            # Latest candle ka Open aur Close price nikal rahe hain
             latest = candles[0]
             open_price = float(latest.get('open', 0))
             close_price = float(latest.get('close', 0))
@@ -139,18 +137,16 @@ def execute_order(product_id, symbol, side, size):
 valid_products = get_target_product_ids()
 print(f"Loaded Target Products: {valid_products}")
 
-# Sabhi target coins ke liye 30x leverage set kar rahe hain
 for symbol, p_id in valid_products.items():
     set_product_leverage(p_id, symbol)
 
-print("Candle monitoring started...")
+print("Candle monitoring started with sensitive threshold (20.0)...")
 
-# Strategy Thresholds for 5m Candle Body/Movement
-DIP_THRESHOLD = 50.0    
-PUMP_THRESHOLD = 50.0   
+# Threshold ko 50 se kam karke 20.0 kar diya hai
+DIP_THRESHOLD = 20.0    
+PUMP_THRESHOLD = 20.0   
 
 while True:
-    # Har 5 minute mein candle check karenge
     time.sleep(300)
     
     for symbol, p_id in valid_products.items():
@@ -160,12 +156,10 @@ while True:
             
         print(f"[5m Candle] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}")
         
-        # 1. Bearish Candle / Drop Strategy (BUY on dip if required or vice versa)
         if candle_diff <= -DIP_THRESHOLD:
             print(f"5m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing BUY...")
             execute_order(p_id, symbol, "buy", size=TRADE_SIZE)
                 
-        # 2. Bullish Candle / Pump Strategy (SELL on breakout)
         elif candle_diff >= PUMP_THRESHOLD:
             print(f"5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...")
             execute_order(p_id, symbol, "sell", size=TRADE_SIZE)
