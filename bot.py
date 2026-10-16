@@ -1,4 +1,4 @@
-import threading
+toimport threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 1. Chota sa dummy server jo Render ko port open dikhayega
@@ -113,7 +113,7 @@ valid_products = get_target_product_ids()
 print(f"Loaded Target Products: {valid_products}")
 
 last_prices = get_market_prices(valid_products.keys())
-while not last_prices:
+while not :
     print("Waiting for initial market prices...")
     time.sleep(3)
     last_prices = get_market_prices(valid_products.keys())
@@ -136,24 +136,4 @@ while True:
             continue
             
         last_price = last_prices[symbol]
-        price_diff = current_price - last_price
-        
-        print(f"Scanning {symbol} -> Current: {current_price} | Diff: {price_diff}")
-        
-        # 1. Dip Buying Logic
-        if price_diff <= -DIP_THRESHOLD:
-            print(f"Dip detected on {symbol}! Drop: {abs(price_diff)}. Executing BUY...")
-            p_id = valid_products.get(symbol)
-            if p_id:
-                execute_order(p_id, symbol, "buy", size=TRADE_SIZE)
-                
-        # 2. Breakout Logic
-        elif price_diff >= PUMP_THRESHOLD:
-            print(f"Breakout detected on {symbol}! Rise: {price_diff}. Executing SELL...")
-            p_id = valid_products.get(symbol)
-            if p_id:
-                execute_order(p_id, symbol, "sell", size=TRADE_SIZE)
-                
-        last_prices[symbol] = current_price
-        
-    time.sleep(3)
+        price_diff = current_price - last_pr
