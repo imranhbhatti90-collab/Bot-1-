@@ -1,3 +1,4 @@
+
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
@@ -64,6 +65,10 @@ def get_latest_candle_info(product_id):
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
+        
+        # Debug print to see raw API response
+        print(f"[API Response ID {product_id}]: {response.text[:200]}", flush=True)
+        
         candles = data.get('result', [])
         if candles and len(candles) >= 1:
             latest = candles[0]
@@ -120,7 +125,6 @@ while True:
         
         c_time, open_p, close_p, candle_diff = get_latest_candle_info(p_id)
         if c_time is None:
-            print(f"[Debug] Skipping {symbol} due to missing candle time", flush=True)
             continue
             
         if symbol not in last_traded_candle:
