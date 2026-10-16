@@ -1,5 +1,4 @@
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+ http.server import HTTPServer, BaseHTTPRequestHandler
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
