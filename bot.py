@@ -1,3 +1,27 @@
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# 1. Chota sa dummy server jo Render ko port open dikhayega
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_server():
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server.serve_forever()
+
+# Server ko background thread mein chala rahe hain taaki trading bot na ruke
+server_thread = threading.Thread(target=run_server)
+server_thread.daemon = True
+server_thread.start()
+
+# ==========================================
+# 2. Aapka apna trading bot ka code yahan se shuru hoga
+# ==========================================
+print("Trading bot started successfully...")
+
 import time
 import hmac
 hashlib = __import__('hashlib')
