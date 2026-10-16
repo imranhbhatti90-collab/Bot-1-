@@ -61,14 +61,18 @@ def get_target_product_info():
 
 def get_latest_candle_info(product_id):
     try:
-        current_time = int(time.time())
-        start_time = current_time - 3600  # last 1 hour
-        
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&start={start_time}&end={current_time}&limit=2"
+        # Using simple limit without conflicting start/end parameters
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
+        if not candles:
+            # Fallback to alternative endpoint if CDN returns empty/error
+            alt_url = f"https://testnet-api.deltaex.org/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
+            res = requests.get(alt_url, timeout=10)
+            candles = res.json().get('result', [])
+            
         if candles and len(candles) >= 1:
             latest = candles[0]
             candle_time = latest.get('time', 0)
@@ -103,7 +107,7 @@ def execute_order(product_id, symbol, side, size):
     }
     
     try:
-        response = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
+        response = requests.post("https://testnet-api.deltaex.org" + path, headers=headers, data=payload, timeout=10)
         print(f"[{side.upper()}] Candle Order Response for {symbol}: {response.text}", flush=True)
     except Exception as e:
         print(f"Order execution failed for {symbol}: {e}", flush=True)
