@@ -1,4 +1,3 @@
-
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
@@ -62,12 +61,12 @@ def get_target_product_info():
 
 def get_latest_candle_info(product_id):
     try:
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
+        current_time = int(time.time())
+        start_time = current_time - 3600  # last 1 hour
+        
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&start={start_time}&end={current_time}&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
-        
-        # Debug print to see raw API response
-        print(f"[API Response ID {product_id}]: {response.text[:200]}", flush=True)
         
         candles = data.get('result', [])
         if candles and len(candles) >= 1:
