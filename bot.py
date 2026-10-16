@@ -20,7 +20,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Fast Candle Strategy Bot Started...")
+print("Fast Candle Strategy Bot Started...", flush=True)
 
 API_KEY = 'HDou10O61WI9QV2fuINZxOeKPbOYAH'
 API_SECRET = 'k4E5UkY1633GAHkskl5mxoAEMtlzANXGMohqdiOdAAYnX9Cumfc8z61BJESZ'
@@ -56,7 +56,7 @@ def get_target_product_info():
                     "min_size": max(min_size, 1.0)
                 }
     except Exception as e:
-        print("Error fetching products info:", e)
+        print("Error fetching products info:", e, flush=True)
     return product_info
 
 def get_latest_candle_info(product_id):
@@ -73,7 +73,7 @@ def get_latest_candle_info(product_id):
             candle_diff = close_price - open_price
             return candle_time, open_price, close_price, candle_diff
     except Exception as e:
-        print("Error fetching candle data:", e)
+        print("Error fetching candle data:", e, flush=True)
     return None, 0, 0, 0
 
 def execute_order(product_id, symbol, side, size):
@@ -100,13 +100,13 @@ def execute_order(product_id, symbol, side, size):
     
     try:
         response = requests.post(BASE_URL + path, headers=headers, data=payload)
-        print(f"[{side.upper()}] Candle Order Response for {symbol}:", response.text)
+        print(f"[{side.upper()}] Candle Order Response for {symbol}: {response.text}", flush=True)
     except Exception as e:
-        print(f"Order execution failed for {symbol}:", e)
+        print(f"Order execution failed for {symbol}: {e}", flush=True)
 
 product_data = get_target_product_info()
-print(f"Loaded Target Products & Sizes: {product_data}")
-print("Fast candle monitoring started...")
+print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
+print("Fast candle monitoring started...", flush=True)
 
 DIP_THRESHOLD = 20.0    
 PUMP_THRESHOLD = 20.0   
@@ -126,15 +126,15 @@ while True:
             last_traded_candle[symbol] = 0
             
         if c_time != last_traded_candle[symbol]:
-            print(f"[Live Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}")
+            print(f"[Live Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}", flush=True)
             
             if candle_diff <= -DIP_THRESHOLD:
-                print(f"5m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing BUY...")
+                print(f"5m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing BUY...", flush=True)
                 execute_order(p_id, symbol, "buy", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
             elif candle_diff >= PUMP_THRESHOLD:
-                print(f"5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...")
+                print(f"5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...", flush=True)
                 execute_order(p_id, symbol, "sell", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
