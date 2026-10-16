@@ -1,4 +1,4 @@
-toimport threading
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # 1. Chota sa dummy server jo Render ko port open dikhayega
@@ -18,9 +18,9 @@ server_thread.daemon = True
 server_thread.start()
 
 # ==========================================
-# 2. Aapka apna trading bot ka code yahan se shuru hoga
+# 2. 5-Minute Candle (OHLC) Strategy Bot with 30x Leverage & 10 USDT Size
 # ==========================================
-print("Trading bot started successfully...")
+print("5-Minute Candle Strategy Bot Started...")
 
 import time
 import hmac
@@ -36,8 +36,9 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 # Jin-jin coins ko scan karna hai
 TARGET_COINS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD']
 
-# Yahan aap apna trade size (contracts/amount) set kar sakte hain
-TRADE_SIZE = 1  # Agar size badhana ho toh yahan 2, 5 ya usse zyada kar sakte hain
+# Trade Settings: 30x Leverage aur Trade Size
+LEVERAGE = 30
+TRADE_SIZE = 1  
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -63,21 +64,49 @@ def get_target_product_ids():
         print("Error fetching products:", e)
     return product_map
 
-def get_market_prices(valid_symbols):
-    prices = {}
+def set_product_leverage(product_id, symbol):
+    path = '/v2/orders/leverage'
+    method = 'POST'
+    timestamp = str(int(time.time()))
+    
+    payload_data = {
+        "product_id": product_id,
+        "leverage": LEVERAGE
+    }
+    
+    payload = json.dumps(payload_data)
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
+    
+    headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'Content-Type': 'application/json'
+    }
+    
     try:
-        url = BASE_URL + "/v2/tickers"
+        response = requests.post(BASE_URL + path, headers=headers, data=payload)
+        print(f"Leverage set to {LEVERAGE}x for {symbol}:", response.json())
+    except Exception as e:
+        print(f"Failed to set leverage for {symbol}:", e)
+
+def get_latest_candle_change(product_id):
+    try:
+        # Delta Exchange OHLC candles API (5m resolution)
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
         response = requests.get(url)
         data = response.json()
-        for ticker in data.get('result', []):
-            symbol = ticker.get('symbol')
-            if symbol in valid_symbols:
-                price = ticker.get('close') or ticker.get('mark_price') or ticker.get('spot_price')
-                if price:
-                    prices[symbol] = float(price)
+        candles = data.get('result', [])
+        if candles and len(candles) >= 1:
+            # Latest candle ka Open aur Close price nikal rahe hain
+            latest = candles[0]
+            open_price = float(latest.get('open', 0))
+            close_price = float(latest.get('close', 0))
+            candle_diff = close_price - open_price
+            return open_price, close_price, candle_diff
     except Exception as e:
-        print("Error fetching market data:", e)
-    return prices
+        print("Error fetching candle data:", e)
+    return None, None, 0
 
 def execute_order(product_id, symbol, side, size):
     path = '/v2/orders'
@@ -103,37 +132,40 @@ def execute_order(product_id, symbol, side, size):
     
     try:
         response = requests.post(BASE_URL + path, headers=headers, data=payload)
-        print(f"[{side.upper()}] Order Response for {symbol}:", response.json())
+        print(f"[{side.upper()}] Candle Order Response for {symbol}:", response.json())
     except Exception as e:
         print(f"Order execution failed for {symbol}:", e)
-
-print("Multi-Coin Scalping Bot Started...")
 
 valid_products = get_target_product_ids()
 print(f"Loaded Target Products: {valid_products}")
 
-last_prices = get_market_prices(valid_products.keys())
-while not :
-    print("Waiting for initial market prices...")
-    time.sleep(3)
-    last_prices = get_market_prices(valid_products.keys())
+# Sabhi target coins ke liye 30x leverage set kar rahe hain
+for symbol, p_id in valid_products.items():
+    set_product_leverage(p_id, symbol)
 
-print("Prices loaded. Scanning all target coins...")
+print("Candle monitoring started...")
 
-# Strategy Thresholds (Aap ise apne hisab se adjust kar sakte hain)
+# Strategy Thresholds for 5m Candle Body/Movement
 DIP_THRESHOLD = 50.0    
 PUMP_THRESHOLD = 50.0   
 
 while True:
-    current_prices = get_market_prices(valid_products.keys())
-    if not current_prices:
-        time.sleep(5)
-        continue
-        
-    for symbol, current_price in current_prices.items():
-        if symbol not in last_prices:
-            last_prices[symbol] = current_price
+    # Har 5 minute mein candle check karenge
+    time.sleep(300)
+    
+    for symbol, p_id in valid_products.items():
+        open_p, close_p, candle_diff = get_latest_candle_change(p_id)
+        if open_p is None:
             continue
             
-        last_price = last_prices[symbol]
-        price_diff = current_price - last_pr
+        print(f"[5m Candle] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}")
+        
+        # 1. Bearish Candle / Drop Strategy (BUY on dip if required or vice versa)
+        if candle_diff <= -DIP_THRESHOLD:
+            print(f"5m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing BUY...")
+            execute_order(p_id, symbol, "buy", size=TRADE_SIZE)
+                
+        # 2. Bullish Candle / Pump Strategy (SELL on breakout)
+        elif candle_diff >= PUMP_THRESHOLD:
+            print(f"5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...")
+            execute_order(p_id, symbol, "sell", size=TRADE_SIZE)
