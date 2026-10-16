@@ -41,7 +41,7 @@ def get_target_product_info():
     product_info = {}
     try:
         url = BASE_URL + "/v2/products"
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         data = response.json()
         for product in data.get('result', []):
             symbol = product.get('symbol')
@@ -62,7 +62,7 @@ def get_target_product_info():
 def get_latest_candle_info(product_id):
     try:
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         data = response.json()
         candles = data.get('result', [])
         if candles and len(candles) >= 1:
@@ -73,7 +73,7 @@ def get_latest_candle_info(product_id):
             candle_diff = close_price - open_price
             return candle_time, open_price, close_price, candle_diff
     except Exception as e:
-        print("Error fetching candle data:", e, flush=True)
+        print(f"Error fetching candle data for ID {product_id}: {e}", flush=True)
     return None, 0, 0, 0
 
 def execute_order(product_id, symbol, side, size):
@@ -99,7 +99,7 @@ def execute_order(product_id, symbol, side, size):
     }
     
     try:
-        response = requests.post(BASE_URL + path, headers=headers, data=payload)
+        response = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
         print(f"[{side.upper()}] Candle Order Response for {symbol}: {response.text}", flush=True)
     except Exception as e:
         print(f"Order execution failed for {symbol}: {e}", flush=True)
@@ -120,6 +120,7 @@ while True:
         
         c_time, open_p, close_p, candle_diff = get_latest_candle_info(p_id)
         if c_time is None:
+            print(f"[Debug] Skipping {symbol} due to missing candle time", flush=True)
             continue
             
         if symbol not in last_traded_candle:
