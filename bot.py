@@ -12,13 +12,12 @@ def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
     server.serve_forever()
 
-# Server ko background thread mein chala rahe hain taaki trading bot na ruke
 server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
 # ==========================================
-# 2. 5-Minute Candle (OHLC) Strategy Bot with 30x Leverage & Lower Threshold
+# 2. 5-Minute Candle Strategy Bot with Fixed Lot Size
 # ==========================================
 print("5-Minute Candle Strategy Bot Started...")
 
@@ -28,17 +27,15 @@ hashlib = __import__('hashlib')
 import json
 import requests
 
-# Apni API Key aur Secret yahan dalein
 API_KEY = 'HDou10O61WI9QV2fuINZxOeKPbOYAH'
 API_SECRET = 'k4E5UkY1633GAHkskl5mxoAEMtlzANXGMohqdiOdAAYnX9Cumfc8z61BJESZ'
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 
-# Jin-jin coins ko scan karna hai
 TARGET_COINS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD']
 
-# Trade Settings: 30x Leverage aur Trade Size
 LEVERAGE = 30
-TRADE_SIZE = 1  
+# Minimum quantity size fix kar diya hai (jaise 1 lot / minimum allowed size)
+TRADE_SIZE = 1  # Delta Exchange API par size contracts/lots mein hota hai
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -140,9 +137,8 @@ print(f"Loaded Target Products: {valid_products}")
 for symbol, p_id in valid_products.items():
     set_product_leverage(p_id, symbol)
 
-print("Candle monitoring started with sensitive threshold (20.0)...")
+print("Candle monitoring started...")
 
-# Threshold ko 50 se kam karke 20.0 kar diya hai
 DIP_THRESHOLD = 20.0    
 PUMP_THRESHOLD = 20.0   
 
@@ -163,3 +159,4 @@ while True:
         elif candle_diff >= PUMP_THRESHOLD:
             print(f"5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...")
             execute_order(p_id, symbol, "sell", size=TRADE_SIZE)
+
