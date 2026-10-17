@@ -11,7 +11,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bidirectional Reversal Bot is running successfully!")
+        self.wfile.write(b"Trailing Stop Loss Bot is running successfully!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -21,7 +21,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Bidirectional Reversal Strategy Bot Started & Port 10000 Bound...", flush=True)
+print("Trailing Stop Loss Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -123,7 +123,7 @@ def execute_order_with_sl(product_id, symbol, side, size, entry_price):
     }
     
     try:
-        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size} & SL at {stop_loss_price}...", flush=True)
+        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size} & Initial SL at {stop_loss_price}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -131,7 +131,7 @@ def execute_order_with_sl(product_id, symbol, side, size, entry_price):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Bidirectional Reversal strategy monitoring started...", flush=True)
+print("Trailing Stop Loss strategy monitoring started...", flush=True)
 
 EXHAUSTION_THRESHOLD = 30.0    
 last_traded_candle = {}
@@ -152,6 +152,7 @@ while True:
             current_diff = close_p - open_p
             print(f"[Check] {symbol} -> Prev Diff: {prev_diff:.2f} | Current Open: {open_p} | Current Close: {close_p}", flush=True)
             
+            # Bidirectional Reversal Strategy with Trailing SL mindset
             if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0:
                 print(f"--> TRIGGER [BUY]: Bounce detected after Dip on {symbol}!", flush=True)
                 execute_order_with_sl(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
