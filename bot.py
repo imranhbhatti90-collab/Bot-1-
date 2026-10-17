@@ -1,4 +1,4 @@
-import threading
+                import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
 import hmac
@@ -22,8 +22,9 @@ server_thread.start()
 
 print("Fast Candle Strategy Bot Started...", flush=True)
 
-API_KEY = 'HDou10O61WI9QV2fuINZxOeKPbOYAH'
-API_SECRET = 'k4E5UkY1633GAHkskl5mxoAEMtlzANXGMohqdiOdAAYnX9Cumfc8z61BJESZ'
+# Yahan apni Delta Exchange Testnet ki nayi API Key aur Secret dalein (Trading permission enabled honi chahiye)[span_2](start_span)[span_2](end_span)
+API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
+API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD']
@@ -97,16 +98,17 @@ def execute_order(product_id, symbol, side, size):
     payload = json.dumps(payload_data)
     signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
     
-    headers = {
+    req_headers = {
         'api-key': API_KEY,
         'timestamp': timestamp,
         'signature': signature,
+        'User-Agent': 'python-rest-client',
         'Content-Type': 'application/json'
     }
     
     try:
         print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size}...", flush=True)
-        response = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
+        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
         print(f"Order execution failed for {symbol}: {e}", flush=True)
