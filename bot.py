@@ -61,13 +61,17 @@ def get_target_product_info():
 
 def get_latest_candle_info(product_id, symbol):
     try:
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
+        current_time = int(time.time())
+        start_time = current_time - 3600  # last 1 hour
+        
+        # Including product_id, symbol, start, end, and resolution as required by API schema
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
         if not candles:
-            print(f"[Debug] Empty candles received for {symbol}: {response.text}", flush=True)
+            print(f"[Debug] Empty candles for {symbol}: {response.text}", flush=True)
             return None, 0, 0, 0
             
         latest = candles[0]
