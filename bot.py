@@ -21,7 +21,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Fast Candle Strategy Bot Started & Port 10000 Bound...", flush=True)
+print("Advanced Video Strategy Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -52,7 +52,6 @@ def get_target_product_info():
                 if 'spot_lot_size' in product:
                     min_size = float(product.get('spot_lot_size'))
                 
-                # Updated size to 30.0 for BTC and ETH
                 custom_size = max(min_size, 1.0)
                 if symbol == 'BTCUSD':
                     custom_size = 30.0  
@@ -67,29 +66,45 @@ def get_target_product_info():
         print("Error fetching products info:", e, flush=True)
     return product_info
 
-def get_latest_candle_info(product_id, symbol):
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+def get_market_data(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 3600
+        start_time = current_time - 7200
         
-        # Changed resolution to 1m for fast scalping like the reference video
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=1m&start={start_time}&end={current_time}&limit=2"
+        # 1m candles fetch kar rahe hain multiple candles ke sath EMA calculate karne ke liye
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=1m&start={start_time}&end={current_time}&limit=20"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
-        if not candles:
-            return None, 0, 0, 0
+        if len(candles) < 10:
+            return None, 0, 0, 0, 0, 0
             
+        closes = [float(c.get('close', 0)) for c in candles]
         latest = candles[0]
+        
         candle_time = latest.get('time', 0)
         open_price = float(latest.get('open', 0))
         close_price = float(latest.get('close', 0))
         candle_diff = close_price - open_price
-        return candle_time, open_price, close_price, candle_diff
+        
+        # Video jaisi MA/EMA filter logic (e.g., 5 and 10 period EMA)
+        ema_fast = calculate_ema(closes, 5)
+        ema_slow = calculate_ema(closes, 10)
+        
+        return candle_time, open_price, close_price, candle_diff, ema_fast, ema_slow
     except Exception as e:
-        print(f"Error fetching candle data for {symbol}: {e}", flush=True)
-    return None, 0, 0, 0
+        print(f"Error fetching market data for {symbol}: {e}", flush=True)
+    return None, 0, 0, 0, 0, 0
 
 def execute_order(product_id, symbol, side, size):
     path = '/v2/orders'
@@ -123,11 +138,9 @@ def execute_order(product_id, symbol, side, size):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Fast candle monitoring started...", flush=True)
+print("Advanced strategy monitoring started...", flush=True)
 
-DIP_THRESHOLD = 20.0    
-PUMP_THRESHOLD = 20.0   
-
+THRESHOLD = 25.0    # Threshold ko thoda filter out karne ke liye badhaya hai taaki false signals reduce ho sakein
 last_traded_candle = {}
 
 while True:
@@ -135,24 +148,26 @@ while True:
         p_id = info["id"]
         trade_size = info["min_size"]
         
-        c_time, open_p, close_p, candle_diff = get_latest_candle_info(p_id, symbol)
-        if c_time is None:
+        c_time, open_p, close_p, candle_diff, ema_fast, ema_slow = get_market_data(p_id, symbol)
+        if c_time is None or ema_fast is None or ema_slow is None:
             continue
             
         if symbol not in last_traded_candle:
             last_traded_candle[symbol] = 0
             
         if c_time != last_traded_candle[symbol]:
-            print(f"[Live Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}", flush=True)
+            print(f"[Check] {symbol} -> Diff: {candle_diff:.2f} | Fast EMA: {ema_fast:.2f} | Slow EMA: {ema_slow:.2f}", flush=True)
             
-            # Trend-following logic: Green Pump -> BUY, Red Drop -> SELL
-            if candle_diff >= PUMP_THRESHOLD:
-                print(f"--> TRIGGER: 1m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing BUY...", flush=True)
+            # Video strategy simulation: Candle momentum + EMA Trend Confirmation
+            # Buy tabhi hoga jab green pump ho aur Fast EMA Slow EMA ke upar ho (Bullish Trend)
+            if candle_diff >= THRESHOLD and ema_fast > ema_slow:
+                print(f"--> TRIGGER: Valid Bullish Pump on {symbol}. Executing BUY...", flush=True)
                 execute_order(p_id, symbol, "buy", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
-            elif candle_diff <= -DIP_THRESHOLD:
-                print(f"--> TRIGGER: 1m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing SELL...", flush=True)
+            # Sell tabhi hoga jab red drop ho aur Fast EMA Slow EMA ke niche ho (Bearish Trend)
+            elif candle_diff <= -THRESHOLD and ema_fast < ema_slow:
+                print(f"--> TRIGGER: Valid Bearish Drop on {symbol}. Executing SELL...", flush=True)
                 execute_order(p_id, symbol, "sell", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
