@@ -22,6 +22,15 @@ server_thread.start()
 
 print("Fast Candle Strategy Bot Started...", flush=True)
 
+# Render Outbound IP Check
+try:
+    current_ip = requests.get('https://api.ipify.org', timeout=5).text
+    print(f"=========================================", flush=True)
+    print(f"--> RENDER SERVER IP: {current_ip}", flush=True)
+    print(f"=========================================", flush=True)
+except Exception as e:
+    print("Could not fetch IP:", e, flush=True)
+
 API_KEY = 'HDou10O61WI9QV2fuINZxOeKPbOYAH'
 API_SECRET = 'k4E5UkY1633GAHkskl5mxoAEMtlzANXGMohqdiOdAAYnX9Cumfc8z61BJESZ'
 
