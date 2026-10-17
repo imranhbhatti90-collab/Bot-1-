@@ -64,14 +64,12 @@ def get_latest_candle_info(product_id, symbol):
         current_time = int(time.time())
         start_time = current_time - 3600  # last 1 hour
         
-        # Including product_id, symbol, start, end, and resolution as required by API schema
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
         if not candles:
-            print(f"[Debug] Empty candles for {symbol}: {response.text}", flush=True)
             return None, 0, 0, 0
             
         latest = candles[0]
@@ -107,8 +105,9 @@ def execute_order(product_id, symbol, side, size):
     }
     
     try:
+        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size}...", flush=True)
         response = requests.post(BASE_URL + path, headers=headers, data=payload, timeout=10)
-        print(f"[{side.upper()}] Candle Order Response for {symbol}: {response.text}", flush=True)
+        print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
         print(f"Order execution failed for {symbol}: {e}", flush=True)
 
@@ -137,12 +136,12 @@ while True:
             print(f"[Live Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}", flush=True)
             
             if candle_diff <= -DIP_THRESHOLD:
-                print(f"5m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing BUY...", flush=True)
+                print(f"--> TRIGGER: 5m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing BUY...", flush=True)
                 execute_order(p_id, symbol, "buy", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
             elif candle_diff >= PUMP_THRESHOLD:
-                print(f"5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...", flush=True)
+                print(f"--> TRIGGER: 5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...", flush=True)
                 execute_order(p_id, symbol, "sell", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
