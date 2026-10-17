@@ -11,7 +11,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running successfully!")
+        self.wfile.write(b"Bidirectional Scalping Bot is running!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -21,7 +21,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Advanced Video Strategy Bot Started & Port 10000 Bound...", flush=True)
+print("Bidirectional Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -52,11 +52,12 @@ def get_target_product_info():
                 if 'spot_lot_size' in product:
                     min_size = float(product.get('spot_lot_size'))
                 
+                # 100 USD equivalent size (BTC ke liye 40.0 units)
                 custom_size = max(min_size, 1.0)
                 if symbol == 'BTCUSD':
-                    custom_size = 30.0  
+                    custom_size = 40.0  
                 elif symbol == 'ETHUSD':
-                    custom_size = 30.0
+                    custom_size = 40.0
                 
                 product_info[symbol] = {
                     "id": p_id,
@@ -66,56 +67,45 @@ def get_target_product_info():
         print("Error fetching products info:", e, flush=True)
     return product_info
 
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return None
-    multiplier = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
-    for price in prices[period:]:
-        ema = (price - ema) * multiplier + ema
-    return ema
-
-def get_market_data(product_id, symbol):
+def get_latest_candle_info(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 7200
+        start_time = current_time - 3600
         
-        # 1m candles fetch kar rahe hain multiple candles ke sath EMA calculate karne ke liye
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=1m&start={start_time}&end={current_time}&limit=20"
+        # 1m resolution for fast scalping
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=1m&start={start_time}&end={current_time}&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
-        if len(candles) < 10:
-            return None, 0, 0, 0, 0, 0
+        if not candles:
+            return None, 0, 0, 0
             
-        closes = [float(c.get('close', 0)) for c in candles]
         latest = candles[0]
-        
         candle_time = latest.get('time', 0)
         open_price = float(latest.get('open', 0))
         close_price = float(latest.get('close', 0))
         candle_diff = close_price - open_price
-        
-        # Video jaisi MA/EMA filter logic (e.g., 5 and 10 period EMA)
-        ema_fast = calculate_ema(closes, 5)
-        ema_slow = calculate_ema(closes, 10)
-        
-        return candle_time, open_price, close_price, candle_diff, ema_fast, ema_slow
+        return candle_time, open_price, close_price, candle_diff
     except Exception as e:
-        print(f"Error fetching market data for {symbol}: {e}", flush=True)
-    return None, 0, 0, 0, 0, 0
+        print(f"Error fetching candle data for {symbol}: {e}", flush=True)
+    return None, 0, 0, 0
 
-def execute_order(product_id, symbol, side, size):
+def execute_order_with_sl(product_id, symbol, side, size, entry_price):
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
+    
+    # Automatic Stop Loss offset (15 points risk management)
+    sl_offset = 15.0
+    stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
     
     payload_data = {
         "product_id": product_id,
         "size": int(size),
         "side": side,
-        "order_type": "market_order"
+        "order_type": "market_order",
+        "stop_loss_price": round(stop_loss_price, 2)
     }
     
     payload = json.dumps(payload_data)
@@ -130,7 +120,7 @@ def execute_order(product_id, symbol, side, size):
     }
     
     try:
-        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size}...", flush=True)
+        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size} & SL at {stop_loss_price}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -138,9 +128,11 @@ def execute_order(product_id, symbol, side, size):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Advanced strategy monitoring started...", flush=True)
+print("Bidirectional scalping monitoring started...", flush=True)
 
-THRESHOLD = 25.0    # Threshold ko thoda filter out karne ke liye badhaya hai taaki false signals reduce ho sakein
+DIP_THRESHOLD = 20.0    
+PUMP_THRESHOLD = 20.0   
+
 last_traded_candle = {}
 
 while True:
@@ -148,27 +140,27 @@ while True:
         p_id = info["id"]
         trade_size = info["min_size"]
         
-        c_time, open_p, close_p, candle_diff, ema_fast, ema_slow = get_market_data(p_id, symbol)
-        if c_time is None or ema_fast is None or ema_slow is None:
+        c_time, open_p, close_p, candle_diff = get_latest_candle_info(p_id, symbol)
+        if c_time is None:
             continue
             
         if symbol not in last_traded_candle:
             last_traded_candle[symbol] = 0
             
         if c_time != last_traded_candle[symbol]:
-            print(f"[Check] {symbol} -> Diff: {candle_diff:.2f} | Fast EMA: {ema_fast:.2f} | Slow EMA: {ema_slow:.2f}", flush=True)
+            print(f"[Live Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}", flush=True)
             
-            # Video strategy simulation: Candle momentum + EMA Trend Confirmation
-            # Buy tabhi hoga jab green pump ho aur Fast EMA Slow EMA ke upar ho (Bullish Trend)
-            if candle_diff >= THRESHOLD and ema_fast > ema_slow:
-                print(f"--> TRIGGER: Valid Bullish Pump on {symbol}. Executing BUY...", flush=True)
-                execute_order(p_id, symbol, "buy", size=trade_size)
+            # Bidirectional Strategy Logic:
+            # 1. Market dip karega toh BUY karenge
+            if candle_diff <= -DIP_THRESHOLD:
+                print(f"--> TRIGGER: Dip Detected on {symbol}! Buying the dip...", flush=True)
+                execute_order_with_sl(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
-            # Sell tabhi hoga jab red drop ho aur Fast EMA Slow EMA ke niche ho (Bearish Trend)
-            elif candle_diff <= -THRESHOLD and ema_fast < ema_slow:
-                print(f"--> TRIGGER: Valid Bearish Drop on {symbol}. Executing SELL...", flush=True)
-                execute_order(p_id, symbol, "sell", size=trade_size)
+            # 2. Market pump/peak par jayega toh SELL karenge
+            elif candle_diff >= PUMP_THRESHOLD:
+                print(f"--> TRIGGER: Peak/Pump Detected on {symbol}! Selling the peak...", flush=True)
+                execute_order_with_sl(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
     time.sleep(15)
