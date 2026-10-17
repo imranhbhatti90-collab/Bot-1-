@@ -22,14 +22,15 @@ server_thread.start()
 
 print("Fast Candle Strategy Bot Started...", flush=True)
 
-# Render Outbound IP Check
+# Force print exact outbound IP on startup
 try:
-    current_ip = requests.get('https://api.ipify.org', timeout=5).text
-    print(f"=========================================", flush=True)
-    print(f"--> RENDER SERVER IP: {current_ip}", flush=True)
-    print(f"=========================================", flush=True)
+    ip_response = requests.get('https://api.ipify.org?format=json', timeout=5)
+    my_ip = ip_response.json().get('ip')
+    print(f"#################################################", flush=True)
+    print(f"--> EXACT RENDER OUTBOUND IP: {my_ip}", flush=True)
+    print(f"#################################################", flush=True)
 except Exception as e:
-    print("Could not fetch IP:", e, flush=True)
+    print(f"IP Fetch Error: {e}", flush=True)
 
 API_KEY = 'HDou10O61WI9QV2fuINZxOeKPbOYAH'
 API_SECRET = 'k4E5UkY1633GAHkskl5mxoAEMtlzANXGMohqdiOdAAYnX9Cumfc8z61BJESZ'
