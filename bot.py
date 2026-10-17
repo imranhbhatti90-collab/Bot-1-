@@ -11,7 +11,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bidirectional Scalping Bot is running!")
+        self.wfile.write(b"Exhaustion Reversal Bot is running successfully!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -21,7 +21,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Bidirectional Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Exhaustion Reversal Strategy Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -52,7 +52,7 @@ def get_target_product_info():
                 if 'spot_lot_size' in product:
                     min_size = float(product.get('spot_lot_size'))
                 
-                # 100 USD equivalent size (BTC ke liye 40.0 units)
+                # 100 USD equivalent size setup (BTC aur ETH ke liye 40.0 units)
                 custom_size = max(min_size, 1.0)
                 if symbol == 'BTCUSD':
                     custom_size = 40.0  
@@ -67,13 +67,13 @@ def get_target_product_info():
         print("Error fetching products info:", e, flush=True)
     return product_info
 
-def get_latest_candle_info(product_id, symbol):
+def get_market_candles(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 3600
+        start_time = current_time - 7200
         
-        # 1m resolution for fast scalping
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=1m&start={start_time}&end={current_time}&limit=2"
+        # Video ke mutabiq 30m ya high timeframe exhaustion check ke liye resolution set kar sakte hain
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=30m&start={start_time}&end={current_time}&limit=5"
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -88,7 +88,7 @@ def get_latest_candle_info(product_id, symbol):
         candle_diff = close_price - open_price
         return candle_time, open_price, close_price, candle_diff
     except Exception as e:
-        print(f"Error fetching candle data for {symbol}: {e}", flush=True)
+        print(f"Error fetching candles for {symbol}: {e}", flush=True)
     return None, 0, 0, 0
 
 def execute_order_with_sl(product_id, symbol, side, size, entry_price):
@@ -96,8 +96,8 @@ def execute_order_with_sl(product_id, symbol, side, size, entry_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    # Automatic Stop Loss offset (15 points risk management)
-    sl_offset = 15.0
+    # Risk management ke liye automatic Stop Loss offset
+    sl_offset = 20.0
     stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
     
     payload_data = {
@@ -128,11 +128,9 @@ def execute_order_with_sl(product_id, symbol, side, size, entry_price):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Bidirectional scalping monitoring started...", flush=True)
+print("Exhaustion strategy monitoring started...", flush=True)
 
-DIP_THRESHOLD = 20.0    
-PUMP_THRESHOLD = 20.0   
-
+EXHAUSTION_THRESHOLD = 30.0    
 last_traded_candle = {}
 
 while True:
@@ -140,7 +138,7 @@ while True:
         p_id = info["id"]
         trade_size = info["min_size"]
         
-        c_time, open_p, close_p, candle_diff = get_latest_candle_info(p_id, symbol)
+        c_time, open_p, close_p, candle_diff = get_market_candles(p_id, symbol)
         if c_time is None:
             continue
             
@@ -148,19 +146,19 @@ while True:
             last_traded_candle[symbol] = 0
             
         if c_time != last_traded_candle[symbol]:
-            print(f"[Live Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}", flush=True)
+            print(f"[Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff:.2f}", flush=True)
             
-            # Bidirectional Strategy Logic:
-            # 1. Market dip karega toh BUY karenge
-            if candle_diff <= -DIP_THRESHOLD:
-                print(f"--> TRIGGER: Dip Detected on {symbol}! Buying the dip...", flush=True)
+            # Reversal / Exhaustion Strategy Logic (Bidirectional):
+            # 1. Agar market bohot zyada dip (negative diff) kar gaya hai, toh exhaustion par BUY karenge
+            if candle_diff <= -EXHAUSTION_THRESHOLD:
+                print(f"--> TRIGGER: Oversold Exhaustion Dip on {symbol}! Buying...", flush=True)
                 execute_order_with_sl(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
-            # 2. Market pump/peak par jayega toh SELL karenge
-            elif candle_diff >= PUMP_THRESHOLD:
-                print(f"--> TRIGGER: Peak/Pump Detected on {symbol}! Selling the peak...", flush=True)
+            # 2. Agar market bohot zyada pump (positive diff) kar gaya hai, toh peak exhaustion par SELL karenge
+            elif candle_diff >= EXHAUSTION_THRESHOLD:
+                print(f"--> TRIGGER: Overbought Exhaustion Peak on {symbol}! Selling...", flush=True)
                 execute_order_with_sl(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
-    time.sleep(15)
+    time.sleep(30)
