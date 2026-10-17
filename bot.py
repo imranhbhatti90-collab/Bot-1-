@@ -59,22 +59,25 @@ def get_target_product_info():
         print("Error fetching products info:", e, flush=True)
     return product_info
 
-def get_latest_candle_info(product_id):
+def get_latest_candle_info(product_id, symbol):
     try:
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
-        if candles and len(candles) >= 1:
-            latest = candles[0]
-            candle_time = latest.get('time', 0)
-            open_price = float(latest.get('open', 0))
-            close_price = float(latest.get('close', 0))
-            candle_diff = close_price - open_price
-            return candle_time, open_price, close_price, candle_diff
+        if not candles:
+            print(f"[Debug] Empty candles received for {symbol}: {response.text}", flush=True)
+            return None, 0, 0, 0
+            
+        latest = candles[0]
+        candle_time = latest.get('time', 0)
+        open_price = float(latest.get('open', 0))
+        close_price = float(latest.get('close', 0))
+        candle_diff = close_price - open_price
+        return candle_time, open_price, close_price, candle_diff
     except Exception as e:
-        print(f"Error fetching candle data for ID {product_id}: {e}", flush=True)
+        print(f"Error fetching candle data for {symbol}: {e}", flush=True)
     return None, 0, 0, 0
 
 def execute_order(product_id, symbol, side, size):
@@ -119,7 +122,7 @@ while True:
         p_id = info["id"]
         trade_size = info["min_size"]
         
-        c_time, open_p, close_p, candle_diff = get_latest_candle_info(p_id)
+        c_time, open_p, close_p, candle_diff = get_latest_candle_info(p_id, symbol)
         if c_time is None:
             continue
             
