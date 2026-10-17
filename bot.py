@@ -6,7 +6,6 @@ import hashlib
 import json
 import requests
 
-# 1. Sabse pehle HTTP Server start karo taaki Render ka port bind ho jaye
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -23,7 +22,6 @@ server_thread.start()
 
 print("Fast Candle Strategy Bot Started & Port 10000 Bound...", flush=True)
 
-# 2. Apni Delta Exchange Testnet ki API Keys yahan dalein (Trading permission enabled honi chahiye)
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 
@@ -53,9 +51,16 @@ def get_target_product_info():
                 if 'spot_lot_size' in product:
                     min_size = float(product.get('spot_lot_size'))
                 
+                # Custom multiplier to scale up order size closer to desired margin
+                custom_size = max(min_size, 1.0)
+                if symbol == 'BTCUSD':
+                    custom_size = 5.0  # BTC ke liye size badha diya hai
+                elif symbol == 'ETHUSD':
+                    custom_size = 5.0
+                
                 product_info[symbol] = {
                     "id": p_id,
-                    "min_size": max(min_size, 1.0)
+                    "min_size": custom_size
                 }
     except Exception as e:
         print("Error fetching products info:", e, flush=True)
@@ -64,7 +69,7 @@ def get_target_product_info():
 def get_latest_candle_info(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 3600  # last 1 hour
+        start_time = current_time - 3600
         
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=2"
         response = requests.get(url, timeout=10)
