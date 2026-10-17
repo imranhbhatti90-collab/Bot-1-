@@ -1,4 +1,4 @@
-                import threading
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
 import hmac
@@ -6,11 +6,12 @@ import hashlib
 import json
 import requests
 
+# 1. Sabse pehle HTTP Server start karo taaki Render ka port bind ho jaye
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot is running!")
+        self.wfile.write(b"Bot is running successfully!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -20,9 +21,9 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Fast Candle Strategy Bot Started...", flush=True)
+print("Fast Candle Strategy Bot Started & Port 10000 Bound...", flush=True)
 
-# Yahan apni Delta Exchange Testnet ki nayi API Key aur Secret dalein (Trading permission enabled honi chahiye)[span_2](start_span)[span_2](end_span)
+# 2. Apni Delta Exchange Testnet ki API Keys yahan dalein (Trading permission enabled honi chahiye)
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 
