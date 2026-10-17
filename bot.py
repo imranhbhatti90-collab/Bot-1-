@@ -6,6 +6,7 @@ import hashlib
 import json
 import requests
 
+# Render Server Uptime Handler
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -51,12 +52,12 @@ def get_target_product_info():
                 if 'spot_lot_size' in product:
                     min_size = float(product.get('spot_lot_size'))
                 
-                # Custom multiplier to scale up order size closer to desired margin
+                # Updated size to 30.0 for BTC and ETH
                 custom_size = max(min_size, 1.0)
                 if symbol == 'BTCUSD':
-                    custom_size = 5.0  # BTC ke liye size badha diya hai
+                    custom_size = 30.0  
                 elif symbol == 'ETHUSD':
-                    custom_size = 5.0
+                    custom_size = 30.0
                 
                 product_info[symbol] = {
                     "id": p_id,
@@ -71,7 +72,8 @@ def get_latest_candle_info(product_id, symbol):
         current_time = int(time.time())
         start_time = current_time - 3600
         
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=2"
+        # Changed resolution to 1m for fast scalping like the reference video
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=1m&start={start_time}&end={current_time}&limit=2"
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -143,13 +145,14 @@ while True:
         if c_time != last_traded_candle[symbol]:
             print(f"[Live Check] {symbol} -> Open: {open_p} | Close: {close_p} | Diff: {candle_diff}", flush=True)
             
-            if candle_diff <= -DIP_THRESHOLD:
-                print(f"--> TRIGGER: 5m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing BUY...", flush=True)
+            # Trend-following logic: Green Pump -> BUY, Red Drop -> SELL
+            if candle_diff >= PUMP_THRESHOLD:
+                print(f"--> TRIGGER: 1m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing BUY...", flush=True)
                 execute_order(p_id, symbol, "buy", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
-            elif candle_diff >= PUMP_THRESHOLD:
-                print(f"--> TRIGGER: 5m Green Candle Pump on {symbol}! Diff: {candle_diff}. Executing SELL...", flush=True)
+            elif candle_diff <= -DIP_THRESHOLD:
+                print(f"--> TRIGGER: 1m Red Candle Drop on {symbol}! Diff: {abs(candle_diff)}. Executing SELL...", flush=True)
                 execute_order(p_id, symbol, "sell", size=trade_size)
                 last_traded_candle[symbol] = c_time
                 
