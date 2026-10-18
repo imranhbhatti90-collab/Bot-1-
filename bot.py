@@ -206,54 +206,58 @@ def get_market_data(product_id, symbol):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Scalping Trend Strategy Started...", flush=True)
+print("Scalping Trend Strategy Started & Monitoring Loop Active...", flush=True)
 
 last_traded_candle = {}
 
 while True:
-    open_positions = get_open_positions()
-    
-    for symbol, info in product_data.items():
-        p_id = info["id"]
-        trade_size = info["min_size"]
+    try:
+        print("[Loop] Checking market data for all coins...", flush=True)
+        open_positions = get_open_positions()
         
-        c_time, open_p, close_p, ema9, ema21 = get_market_data(p_id, symbol)
-        if c_time is None or ema9 is None or ema21 is None:
-            continue
+        for symbol, info in product_data.items():
+            p_id = info["id"]
+            trade_size = info["min_size"]
             
-        if symbol not in last_traded_candle:
-            last_traded_candle[symbol] = 0
-            
-        has_position = p_id in open_positions
-        pos_side = open_positions[p_id]["side"] if has_position else None
-        
-        is_buy_signal = (ema9 > ema21) and (close_p > open_p)
-        is_sell_signal = (ema9 < ema21) and (close_p < open_p)
-        
-        if has_position:
-            if pos_side == "sell" and is_buy_signal:
-                print(f"--> SCALP SWITCH [BUY] on {symbol}: Trend flipped to UP!", flush=True)
-                close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
-                time.sleep(2)
-                execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
-                last_traded_candle[symbol] = c_time
+            c_time, open_p, close_p, ema9, ema21 = get_market_data(p_id, symbol)
+            if c_time is None or ema9 is None or ema21 is None:
+                continue
                 
-            elif pos_side == "buy" and is_sell_signal:
-                print(f"--> SCALP SWITCH [SELL] on {symbol}: Trend flipped to DOWN!", flush=True)
-                close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
-                time.sleep(2)
-                execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
-                last_traded_candle[symbol] = c_time
-        else:
-            if c_time != last_traded_candle[symbol]:
-                if is_buy_signal:
-                    print(f"--> SCALP TRIGGER [BUY] on {symbol}: Upward Trend Scalp!", flush=True)
+            if symbol not in last_traded_candle:
+                last_traded_candle[symbol] = 0
+                
+            has_position = p_id in open_positions
+            pos_side = open_positions[p_id]["side"] if has_position else None
+            
+            is_buy_signal = (ema9 > ema21) and (close_p > open_p)
+            is_sell_signal = (ema9 < ema21) and (close_p < open_p)
+            
+            if has_position:
+                if pos_side == "sell" and is_buy_signal:
+                    print(f"--> SCALP SWITCH [BUY] on {symbol}: Trend flipped to UP!", flush=True)
+                    close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
+                    time.sleep(2)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                     
-                elif is_sell_signal:
-                    print(f"--> SCALP TRIGGER [SELL] on {symbol}: Downward Trend Scalp!", flush=True)
+                elif pos_side == "buy" and is_sell_signal:
+                    print(f"--> SCALP SWITCH [SELL] on {symbol}: Trend flipped to DOWN!", flush=True)
+                    close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
+                    time.sleep(2)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
+            else:
+                if c_time != last_traded_candle[symbol]:
+                    if is_buy_signal:
+                        print(f"--> SCALP TRIGGER [BUY] on {symbol}: Upward Trend Scalp!", flush=True)
+                        execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+                        last_traded_candle[symbol] = c_time
+                        
+                    elif is_sell_signal:
+                        print(f"--> SCALP TRIGGER [SELL] on {symbol}: Downward Trend Scalp!", flush=True)
+                        execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+                        last_traded_candle[symbol] = c_time
+    except Exception as e:
+        print(f"Error in main loop: {e}", flush=True)
                 
     time.sleep(15)
