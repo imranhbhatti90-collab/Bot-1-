@@ -187,11 +187,10 @@ def get_market_data(product_id, symbol):
         
         candles = data.get('result', [])
         if len(candles) < 30:
-            return None, 0, 0, 0, 0
+            return None, 0, 0, 0, 0, 0
             
         closes = [float(c.get('close', 0)) for c in candles]
         
-        # Calculate EMA for current and previous candle to check exact crossover
         closes_current = closes
         closes_prev = closes[1:]
         
@@ -233,23 +232,19 @@ while True:
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        # Pure Crossover Detection:
-        # Bullish Crossover: Previously EMA9 was below/equal to EMA21, now EMA9 is strictly above EMA21
         is_bullish_cross = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr)
-        
-        # Bearish Crossover: Previously EMA9 was above/equal to EMA21, now EMA9 is strictly below EMA21
         is_bearish_cross = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr)
         
         if has_position:
             if pos_side == "sell" and is_bullish_cross:
-                print(f"--> PURE CROSS SWITCH [BUY] on {symbol}: Bullish EMA 9/21 Crossover!", flush=True)
+                print(f"--> PURE CROSS SWITCH [BUY] on {symbol}: Bullish EMA Crossover!", flush=True)
                 close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
             elif pos_side == "buy" and is_bearish_cross:
-                print(f"--> PURE CROSS SWITCH [SELL] on {symbol}: Bearish EMA 9/21 Crossover!", flush=True)
+                print(f"--> PURE CROSS SWITCH [SELL] on {symbol}: Bearish EMA Crossover!", flush=True)
                 close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
