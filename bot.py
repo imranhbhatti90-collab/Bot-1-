@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"5m Chart-Matching Reversal Bot is running!")
+        self.wfile.write(b"Pure EMA Crossover Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("5m Chart-Matching Bot Started & Port 10000 Bound...", flush=True)
+print("Pure EMA Crossover Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -181,37 +181,38 @@ def get_market_data(product_id, symbol):
         current_time = int(time.time())
         start_time = current_time - 7200
         
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=30"
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=35"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
-        if len(candles) < 25:
-            return None, 0, 0, 0, 0, 0, 0
+        if len(candles) < 30:
+            return None, 0, 0, 0, 0
             
         closes = [float(c.get('close', 0)) for c in candles]
         
-        latest = candles[0]
-        prev = candles[1]
+        # Calculate EMA for current and previous candle to check exact crossover
+        closes_current = closes
+        closes_prev = closes[1:]
         
+        ema9_curr = calculate_ema(closes_current, 9)
+        ema21_curr = calculate_ema(closes_current, 21)
+        
+        ema9_prev = calculate_ema(closes_prev, 9)
+        ema21_prev = calculate_ema(closes_prev, 21)
+        
+        latest = candles[0]
         c_time = latest.get('time', 0)
-        open_p = float(latest.get('open', 0))
         close_p = float(latest.get('close', 0))
         
-        prev_open = float(prev.get('open', 0))
-        prev_close = float(prev.get('close', 0))
-        
-        ema9 = calculate_ema(closes, 9)
-        ema21 = calculate_ema(closes, 21)
-        
-        return c_time, open_p, close_p, prev_open, prev_close, ema9, ema21
+        return c_time, close_p, ema9_curr, ema21_curr, ema9_prev, ema21_prev
     except Exception as e:
         print(f"Error fetching market data for {symbol}: {e}", flush=True)
-    return None, 0, 0, 0, 0, 0, 0
+    return None, 0, 0, 0, 0, 0
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("5m Chart-Matching Strategy Started...", flush=True)
+print("Pure EMA Crossover Strategy Started...", flush=True)
 
 last_traded_candle = {}
 
@@ -222,8 +223,8 @@ while True:
         p_id = info["id"]
         trade_size = info["min_size"]
         
-        c_time, open_p, close_p, prev_open, prev_close, ema9, ema21 = get_market_data(p_id, symbol)
-        if c_time is None or ema9 is None or ema21 is None:
+        c_time, close_p, ema9_curr, ema21_curr, ema9_prev, ema21_prev = get_market_data(p_id, symbol)
+        if c_time is None or ema9_curr is None or ema21_curr is None or ema9_prev is None or ema21_prev is None:
             continue
             
         if symbol not in last_traded_candle:
@@ -232,32 +233,36 @@ while True:
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        is_dip_bounce = (prev_close < prev_open) and ((prev_open - prev_close) > 5.0) and (close_p > open_p) and (ema9 >= ema21)
-        is_peak_rejection = (prev_close > prev_open) and ((prev_close - prev_open) > 5.0) and (close_p < open_p) and (ema9 <= ema21)
+        # Pure Crossover Detection:
+        # Bullish Crossover: Previously EMA9 was below/equal to EMA21, now EMA9 is strictly above EMA21
+        is_bullish_cross = (ema9_prev <= ema21_prev) and (ema9_curr > ema21_curr)
+        
+        # Bearish Crossover: Previously EMA9 was above/equal to EMA21, now EMA9 is strictly below EMA21
+        is_bearish_cross = (ema9_prev >= ema21_prev) and (ema9_curr < ema21_curr)
         
         if has_position:
-            if pos_side == "sell" and is_dip_bounce:
-                print(f"--> 5m CHART SWITCH [BUY] on {symbol}: Dip bounce + EMA cross!", flush=True)
+            if pos_side == "sell" and is_bullish_cross:
+                print(f"--> PURE CROSS SWITCH [BUY] on {symbol}: Bullish EMA 9/21 Crossover!", flush=True)
                 close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
-            elif pos_side == "buy" and is_peak_rejection:
-                print(f"--> 5m CHART SWITCH [SELL] on {symbol}: Peak rejection + EMA cross!", flush=True)
+            elif pos_side == "buy" and is_bearish_cross:
+                print(f"--> PURE CROSS SWITCH [SELL] on {symbol}: Bearish EMA 9/21 Crossover!", flush=True)
                 close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
         else:
             if c_time != last_traded_candle[symbol]:
-                if is_dip_bounce:
-                    print(f"--> 5m CHART TRIGGER [BUY] on {symbol}: Valid Dip Reversal!", flush=True)
+                if is_bullish_cross:
+                    print(f"--> PURE CROSS TRIGGER [BUY] on {symbol}: Valid Bullish Crossover!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                     
-                elif is_peak_rejection:
-                    print(f"--> 5m CHART TRIGGER [SELL] on {symbol}: Valid Peak Rejection!", flush=True)
+                elif is_bearish_cross:
+                    print(f"--> PURE CROSS TRIGGER [SELL] on {symbol}: Valid Bearish Crossover!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                 
