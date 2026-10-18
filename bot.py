@@ -6,12 +6,11 @@ import hashlib
 import json
 import requests
 
-# Render Server Uptime Handler
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Advanced Position-Managed Reversal Bot is running!")
+        self.wfile.write(b"Professional Reversal Bot is running!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -21,7 +20,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Advanced Position-Managed Bot Started & Port 10000 Bound...", flush=True)
+print("Professional Reversal Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -122,7 +121,7 @@ def close_position(product_id, symbol, current_side, size):
     }
     
     try:
-        print(f"[Closing] Reversing position for {symbol} by executing {side.upper()}...", flush=True)
+        print(f"[Closing] Exiting position for {symbol} via {side.upper()}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[CLOSE RESPONSE] {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -162,21 +161,32 @@ def execute_order(product_id, symbol, side, size, entry_price):
     except Exception as e:
         print(f"Order execution failed for {symbol}: {e}", flush=True)
 
-def get_market_candles(product_id, symbol):
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+def get_market_data(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 7200
+        start_time = current_time - 14400
         
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=30m&start={start_time}&end={current_time}&limit=3"
+        # Video ke mutabiq 30m resolution par market data fetch kar rahe hain
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=30m&start={start_time}&end={current_time}&limit=20"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
-        if len(candles) < 2:
-            return None, 0, 0, 0
+        if len(candles) < 10:
+            return None, 0, 0, 0, 0, 0
             
-        latest = candles[0] 
-        prev = candles[1]    
+        closes = [float(c.get('close', 0)) for c in candles]
+        latest = candles[0]
+        prev = candles[1]
         
         c_time = latest.get('time', 0)
         open_p = float(latest.get('open', 0))
@@ -186,16 +196,19 @@ def get_market_candles(product_id, symbol):
         prev_close = float(prev.get('close', 0))
         prev_diff = prev_close - prev_open
         
-        return c_time, open_p, close_p, prev_diff
+        ema_fast = calculate_ema(closes, 9)
+        ema_slow = calculate_ema(closes, 21)
+        
+        return c_time, open_p, close_p, prev_diff, ema_fast, ema_slow
     except Exception as e:
-        print(f"Error fetching candles for {symbol}: {e}", flush=True)
-    return None, 0, 0, 0
+        print(f"Error fetching market data for {symbol}: {e}", flush=True)
+    return None, 0, 0, 0, 0, 0
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Position-managed reversal monitoring started...", flush=True)
+print("Professional Filtered Strategy Monitoring Started...", flush=True)
 
-EXHAUSTION_THRESHOLD = 30.0    
+EXHAUSTION_THRESHOLD = 35.0  # Sideways market ko filter out karne ke liye bada threshold
 last_traded_candle = {}
 
 while True:
@@ -205,44 +218,48 @@ while True:
         p_id = info["id"]
         trade_size = info["min_size"]
         
-        c_time, open_p, close_p, prev_diff = get_market_candles(p_id, symbol)
-        if c_time is None:
+        c_time, open_p, close_p, prev_diff, ema_fast, ema_slow = get_market_data(p_id, symbol)
+        if c_time is None or ema_fast is None or ema_slow is None:
             continue
             
         if symbol not in last_traded_candle:
             last_traded_candle[symbol] = 0
             
         current_diff = close_p - open_p
-        
-        # Check if we have an active position for this coin
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        # Reversal Logic: If market flips against our position or hits reversal trigger
+        # Video jaisa filter: Agar EMA ke beech gap kam hai (yani market sideways hai), toh trade mat lo
+        is_sideways = abs(ema_fast - ema_slow) < 15.0
+        if is_sideways:
+            print(f"[Sideways Filter] {symbol} is in range/sideways market. Skipping trades.", flush=True)
+            continue
+            
         if has_position:
-            if pos_side == "sell" and (prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0):
-                print(f"--> REVERSE TRIGGER: Market bouncing after dip on {symbol}! Closing SELL and opening BUY...", flush=True)
+            # Opposite Reversal trigger (Agar market direction badle toh position switch karo)
+            if pos_side == "sell" and (prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0 and ema_fast > ema_slow):
+                print(f"--> SWITCH [BUY]: Exhaustion dip & EMA confirmation on {symbol}!", flush=True)
                 close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
-            elif pos_side == "buy" and (prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0):
-                print(f"--> REVERSE TRIGGER: Market rejecting after peak on {symbol}! Closing BUY and opening SELL...", flush=True)
+            elif pos_side == "buy" and (prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0 and ema_fast < ema_slow):
+                print(f"--> SWITCH [SELL]: Exhaustion peak & EMA confirmation on {symbol}!", flush=True)
                 close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
         else:
-            # Fresh Entry Logic when no position is open
+            # Fresh Entry with strict video logic (No sideways trades)
             if c_time != last_traded_candle[symbol]:
-                if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0:
-                    print(f"--> TRIGGER [BUY]: Bounce detected after Dip on {symbol}!", flush=True)
+                if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0 and ema_fast > ema_slow:
+                    print(f"--> TRIGGER [BUY]: Valid Dip Reversal on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                     
-                elif prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0:
-                    print(f"--> TRIGGER [SELL]: Rejection detected after Pump/Peak on {symbol}!", flush=True)
+                elif prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0 and ema_fast < ema_slow:
+                    print(f"--> TRIGGER [SELL]: Valid Peak Rejection on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                 
