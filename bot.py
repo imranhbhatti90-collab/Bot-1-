@@ -187,7 +187,7 @@ def get_market_data(product_id, symbol):
         
         candles = data.get('result', [])
         if len(candles) < 25:
-            return None, 0, 0, 0, 0, 0
+            return None, 0, 0, 0, 0
             
         closes = [float(c.get('close', 0)) for c in candles]
         
@@ -227,10 +227,7 @@ while True:
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        # Trend Scalping Conditions:
-        # Buy when EMA9 is above EMA21 and candle is Green (Up trend)
         is_buy_signal = (ema9 > ema21) and (close_p > open_p)
-        # Sell when EMA9 is below EMA21 and candle is Red (Down trend)
         is_sell_signal = (ema9 < ema21) and (close_p < open_p)
         
         if has_position:
