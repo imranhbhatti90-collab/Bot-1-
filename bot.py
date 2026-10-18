@@ -26,7 +26,9 @@ API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
-TARGET_COINS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'DOGEUSD']
+
+# Updated coin list based on your latest market screenshot (DOGE removed, new ones added)
+TARGET_COINS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'XRPUSD', 'BNBUSD', 'XAUTUSD', 'PAXGUSD']
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -56,6 +58,8 @@ def get_target_product_info():
                     custom_size = 40.0  
                 elif symbol == 'ETHUSD':
                     custom_size = 40.0
+                elif symbol in ['XRPUSD', 'SOLUSD', 'BNBUSD', 'XAUTUSD', 'PAXGUSD']:
+                    custom_size = max(min_size, 10.0)
                 
                 product_info[symbol] = {
                     "id": p_id,
@@ -175,7 +179,6 @@ def get_market_data(product_id, symbol):
         current_time = int(time.time())
         start_time = current_time - 14400
         
-        # Video ke mutabiq 30m resolution par market data fetch kar rahe hain
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=30m&start={start_time}&end={current_time}&limit=20"
         response = requests.get(url, timeout=10)
         data = response.json()
@@ -208,7 +211,7 @@ product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
 print("Professional Filtered Strategy Monitoring Started...", flush=True)
 
-EXHAUSTION_THRESHOLD = 35.0  # Sideways market ko filter out karne ke liye bada threshold
+EXHAUSTION_THRESHOLD = 35.0  
 last_traded_candle = {}
 
 while True:
@@ -229,14 +232,11 @@ while True:
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        # Video jaisa filter: Agar EMA ke beech gap kam hai (yani market sideways hai), toh trade mat lo
         is_sideways = abs(ema_fast - ema_slow) < 15.0
         if is_sideways:
-            print(f"[Sideways Filter] {symbol} is in range/sideways market. Skipping trades.", flush=True)
             continue
             
         if has_position:
-            # Opposite Reversal trigger (Agar market direction badle toh position switch karo)
             if pos_side == "sell" and (prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0 and ema_fast > ema_slow):
                 print(f"--> SWITCH [BUY]: Exhaustion dip & EMA confirmation on {symbol}!", flush=True)
                 close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
@@ -251,7 +251,6 @@ while True:
                 execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
         else:
-            # Fresh Entry with strict video logic (No sideways trades)
             if c_time != last_traded_candle[symbol]:
                 if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0 and ema_fast > ema_slow:
                     print(f"--> TRIGGER [BUY]: Valid Dip Reversal on {symbol}!", flush=True)
