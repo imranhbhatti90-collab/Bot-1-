@@ -12,6 +12,10 @@ class SimpleHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"5m Chart-Matching Reversal Bot is running!")
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
     server.serve_forever()
@@ -177,7 +181,6 @@ def get_market_data(product_id, symbol):
         current_time = int(time.time())
         start_time = current_time - 7200
         
-        # 5-minute timeframe resolution
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=30"
         response = requests.get(url, timeout=10)
         data = response.json()
@@ -229,20 +232,19 @@ while True:
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        # 5m Chart matching trigger logic (sensitive threshold of 5.0 points)
         is_dip_bounce = (prev_close < prev_open) and ((prev_open - prev_close) > 5.0) and (close_p > open_p) and (ema9 >= ema21)
         is_peak_rejection = (prev_close > prev_open) and ((prev_close - prev_open) > 5.0) and (close_p < open_p) and (ema9 <= ema21)
         
         if has_position:
             if pos_side == "sell" and is_dip_bounce:
-                print(f"--> 5m CHART SWITCH [BUY] on {symbol}: Dip bounce + EMA 9/21 cross!", flush=True)
+                print(f"--> 5m CHART SWITCH [BUY] on {symbol}: Dip bounce + EMA cross!", flush=True)
                 close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
             elif pos_side == "buy" and is_peak_rejection:
-                print(f"--> 5m CHART SWITCH [SELL] on {symbol}: Peak rejection + EMA 9/21 cross!", flush=True)
+                print(f"--> 5m CHART SWITCH [SELL] on {symbol}: Peak rejection + EMA cross!", flush=True)
                 close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
@@ -250,12 +252,12 @@ while True:
         else:
             if c_time != last_traded_candle[symbol]:
                 if is_dip_bounce:
-                    print(f"--> 5m CHART TRIGGER [BUY] on {symbol}: Valid 5m Reversal Dip!", flush=True)
+                    print(f"--> 5m CHART TRIGGER [BUY] on {symbol}: Valid Dip Reversal!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                     
                 elif is_peak_rejection:
-                    print(f"--> 5m CHART TRIGGER [SELL] on {symbol}: Valid 5m Reversal Peak!", flush=True)
+                    print(f"--> 5m CHART TRIGGER [SELL] on {symbol}: Valid Peak Rejection!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                 
