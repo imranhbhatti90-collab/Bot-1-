@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Professional Reversal Bot is running!")
+        self.wfile.write(b"Optimized 15m Reversal Bot is running!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -20,14 +20,12 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Professional Reversal Bot Started & Port 10000 Bound...", flush=True)
+print("Optimized 15m Reversal Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
-
-# Updated coin list based on your latest market screenshot (DOGE removed, new ones added)
 TARGET_COINS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'XRPUSD', 'BNBUSD', 'XAUTUSD', 'PAXGUSD']
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -177,9 +175,10 @@ def calculate_ema(prices, period):
 def get_market_data(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 14400
+        start_time = current_time - 7200
         
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=30m&start={start_time}&end={current_time}&limit=20"
+        # 15m resolution set ki hai taaki fast aur accurate moves pakde jayein
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=15m&start={start_time}&end={current_time}&limit=20"
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -209,9 +208,9 @@ def get_market_data(product_id, symbol):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Professional Filtered Strategy Monitoring Started...", flush=True)
+print("Optimized 15m Reversal Strategy Started...", flush=True)
 
-EXHAUSTION_THRESHOLD = 35.0  
+EXHAUSTION_THRESHOLD = 15.0  # 15m timeframe ke liye perfect balance threshold
 last_traded_candle = {}
 
 while True:
@@ -232,34 +231,30 @@ while True:
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        is_sideways = abs(ema_fast - ema_slow) < 15.0
-        if is_sideways:
-            continue
-            
         if has_position:
-            if pos_side == "sell" and (prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0 and ema_fast > ema_slow):
-                print(f"--> SWITCH [BUY]: Exhaustion dip & EMA confirmation on {symbol}!", flush=True)
+            if pos_side == "sell" and (prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0):
+                print(f"--> SWITCH [BUY]: 15m Bounce caught on {symbol}!", flush=True)
                 close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
-            elif pos_side == "buy" and (prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0 and ema_fast < ema_slow):
-                print(f"--> SWITCH [SELL]: Exhaustion peak & EMA confirmation on {symbol}!", flush=True)
+            elif pos_side == "buy" and (prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0):
+                print(f"--> SWITCH [SELL]: 15m Rejection caught on {symbol}!", flush=True)
                 close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
         else:
             if c_time != last_traded_candle[symbol]:
-                if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0 and ema_fast > ema_slow:
-                    print(f"--> TRIGGER [BUY]: Valid Dip Reversal on {symbol}!", flush=True)
+                if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0:
+                    print(f"--> TRIGGER [BUY]: 15m Dip Reversal caught on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                     
-                elif prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0 and ema_fast < ema_slow:
-                    print(f"--> TRIGGER [SELL]: Valid Peak Rejection on {symbol}!", flush=True)
+                elif prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0:
+                    print(f"--> TRIGGER [SELL]: 15m Peak Rejection caught on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                 
-    time.sleep(30)
+    time.sleep(20)
