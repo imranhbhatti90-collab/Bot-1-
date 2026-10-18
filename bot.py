@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Pure Python Chart-Matching Reversal Bot is running!")
+        self.wfile.write(b"5m Chart-Matching Reversal Bot is running!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -20,7 +20,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Pure Python Chart-Matching Bot Started & Port 10000 Bound...", flush=True)
+print("5m Chart-Matching Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -175,10 +175,10 @@ def calculate_ema(prices, period):
 def get_market_data(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 14400
+        start_time = current_time - 7200
         
-        # 15-minute timeframe data
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=15m&start={start_time}&end={current_time}&limit=30"
+        # 5-minute timeframe resolution
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=30"
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -188,7 +188,6 @@ def get_market_data(product_id, symbol):
             
         closes = [float(c.get('close', 0)) for c in candles]
         
-        # Latest completed candle and current running state
         latest = candles[0]
         prev = candles[1]
         
@@ -199,7 +198,6 @@ def get_market_data(product_id, symbol):
         prev_open = float(prev.get('open', 0))
         prev_close = float(prev.get('close', 0))
         
-        # Calculate 9 and 21 EMA across history
         ema9 = calculate_ema(closes, 9)
         ema21 = calculate_ema(closes, 21)
         
@@ -210,7 +208,7 @@ def get_market_data(product_id, symbol):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Pure Python Chart-Matching Strategy Started...", flush=True)
+print("5m Chart-Matching Strategy Started...", flush=True)
 
 last_traded_candle = {}
 
@@ -231,23 +229,20 @@ while True:
         has_position = p_id in open_positions
         pos_side = open_positions[p_id]["side"] if has_position else None
         
-        # Chart matching trigger logic:
-        # BUY Trigger: Previous candle was a strong dip/red, current candle is recovering green, and EMA 9 is crossing/above EMA 21 (Bullish alignment)
-        is_dip_bounce = (prev_close < prev_open) and ((prev_open - prev_close) > 15.0) and (close_p > open_p) and (ema9 >= ema21)
-        
-        # SELL Trigger: Previous candle was a strong pump/green, current candle is rejecting red, and EMA 9 is crossing/below EMA 21 (Bearish alignment)
-        is_peak_rejection = (prev_close > prev_open) and ((prev_close - prev_open) > 15.0) and (close_p < open_p) and (ema9 <= ema21)
+        # 5m Chart matching trigger logic (sensitive threshold of 5.0 points)
+        is_dip_bounce = (prev_close < prev_open) and ((prev_open - prev_close) > 5.0) and (close_p > open_p) and (ema9 >= ema21)
+        is_peak_rejection = (prev_close > prev_open) and ((prev_close - prev_open) > 5.0) and (close_p < open_p) and (ema9 <= ema21)
         
         if has_position:
             if pos_side == "sell" and is_dip_bounce:
-                print(f"--> CHART SWITCH [BUY] on {symbol}: Dip bounce + EMA 9/21 bullish cross!", flush=True)
+                print(f"--> 5m CHART SWITCH [BUY] on {symbol}: Dip bounce + EMA 9/21 cross!", flush=True)
                 close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
             elif pos_side == "buy" and is_peak_rejection:
-                print(f"--> CHART SWITCH [SELL] on {symbol}: Peak rejection + EMA 9/21 bearish cross!", flush=True)
+                print(f"--> 5m CHART SWITCH [SELL] on {symbol}: Peak rejection + EMA 9/21 cross!", flush=True)
                 close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                 time.sleep(2)
                 execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
@@ -255,13 +250,13 @@ while True:
         else:
             if c_time != last_traded_candle[symbol]:
                 if is_dip_bounce:
-                    print(f"--> CHART TRIGGER [BUY] on {symbol}: Valid 15m Reversal Dip!", flush=True)
+                    print(f"--> 5m CHART TRIGGER [BUY] on {symbol}: Valid 5m Reversal Dip!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                     
                 elif is_peak_rejection:
-                    print(f"--> CHART TRIGGER [SELL] on {symbol}: Valid 15m Reversal Peak!", flush=True)
+                    print(f"--> 5m CHART TRIGGER [SELL] on {symbol}: Valid 5m Reversal Peak!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     last_traded_candle[symbol] = c_time
                 
-    time.sleep(20)
+    time.sleep(15)
