@@ -11,7 +11,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Trailing Stop Loss Bot is running successfully!")
+        self.wfile.write(b"Advanced Position-Managed Reversal Bot is running!")
 
 def run_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
@@ -21,7 +21,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Trailing Stop Loss Bot Started & Port 10000 Bound...", flush=True)
+print("Advanced Position-Managed Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -66,6 +66,102 @@ def get_target_product_info():
         print("Error fetching products info:", e, flush=True)
     return product_info
 
+def get_open_positions():
+    path = '/v2/positions'
+    method = 'GET'
+    timestamp = str(int(time.time()))
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', '')
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.get(BASE_URL + path, headers=req_headers, timeout=10)
+        data = response.json()
+        positions = {}
+        for pos in data.get('result', []):
+            if float(pos.get('size', 0)) != 0:
+                positions[pos.get('product_id')] = {
+                    "side": pos.get('side'),
+                    "size": float(pos.get('size')),
+                    "entry_price": float(pos.get('entry_price', 0))
+                }
+        return positions
+    except Exception as e:
+        print("Error fetching positions:", e, flush=True)
+    return {}
+
+def close_position(product_id, symbol, current_side, size):
+    side = "sell" if current_side == "buy" else "buy"
+    path = '/v2/orders'
+    method = 'POST'
+    timestamp = str(int(time.time()))
+    
+    payload_data = {
+        "product_id": product_id,
+        "size": int(size),
+        "side": side,
+        "order_type": "market_order",
+        "reduce_only": True
+    }
+    
+    payload = json.dumps(payload_data)
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        print(f"[Closing] Reversing position for {symbol} by executing {side.upper()}...", flush=True)
+        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
+        print(f"[CLOSE RESPONSE] {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+    except Exception as e:
+        print(f"Failed to close position for {symbol}: {e}", flush=True)
+
+def execute_order(product_id, symbol, side, size, entry_price):
+    path = '/v2/orders'
+    method = 'POST'
+    timestamp = str(int(time.time()))
+    
+    sl_offset = 20.0
+    stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
+    
+    payload_data = {
+        "product_id": product_id,
+        "size": int(size),
+        "side": side,
+        "order_type": "market_order",
+        "stop_loss_price": round(stop_loss_price, 2)
+    }
+    
+    payload = json.dumps(payload_data)
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size} & SL at {stop_loss_price}...", flush=True)
+        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
+        print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+    except Exception as e:
+        print(f"Order execution failed for {symbol}: {e}", flush=True)
+
 def get_market_candles(product_id, symbol):
     try:
         current_time = int(time.time())
@@ -95,48 +191,16 @@ def get_market_candles(product_id, symbol):
         print(f"Error fetching candles for {symbol}: {e}", flush=True)
     return None, 0, 0, 0
 
-def execute_order_with_sl(product_id, symbol, side, size, entry_price):
-    path = '/v2/orders'
-    method = 'POST'
-    timestamp = str(int(time.time()))
-    
-    sl_offset = 20.0
-    stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
-    
-    payload_data = {
-        "product_id": product_id,
-        "size": int(size),
-        "side": side,
-        "order_type": "market_order",
-        "stop_loss_price": round(stop_loss_price, 2)
-    }
-    
-    payload = json.dumps(payload_data)
-    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
-    
-    req_headers = {
-        'api-key': API_KEY,
-        'timestamp': timestamp,
-        'signature': signature,
-        'User-Agent': 'python-rest-client',
-        'Content-Type': 'application/json'
-    }
-    
-    try:
-        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size} & Initial SL at {stop_loss_price}...", flush=True)
-        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
-    except Exception as e:
-        print(f"Order execution failed for {symbol}: {e}", flush=True)
-
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Trailing Stop Loss strategy monitoring started...", flush=True)
+print("Position-managed reversal monitoring started...", flush=True)
 
 EXHAUSTION_THRESHOLD = 30.0    
 last_traded_candle = {}
 
 while True:
+    open_positions = get_open_positions()
+    
     for symbol, info in product_data.items():
         p_id = info["id"]
         trade_size = info["min_size"]
@@ -148,19 +212,38 @@ while True:
         if symbol not in last_traded_candle:
             last_traded_candle[symbol] = 0
             
-        if c_time != last_traded_candle[symbol]:
-            current_diff = close_p - open_p
-            print(f"[Check] {symbol} -> Prev Diff: {prev_diff:.2f} | Current Open: {open_p} | Current Close: {close_p}", flush=True)
-            
-            # Bidirectional Reversal Strategy with Trailing SL mindset
-            if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0:
-                print(f"--> TRIGGER [BUY]: Bounce detected after Dip on {symbol}!", flush=True)
-                execute_order_with_sl(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+        current_diff = close_p - open_p
+        
+        # Check if we have an active position for this coin
+        has_position = p_id in open_positions
+        pos_side = open_positions[p_id]["side"] if has_position else None
+        
+        # Reversal Logic: If market flips against our position or hits reversal trigger
+        if has_position:
+            if pos_side == "sell" and (prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0):
+                print(f"--> REVERSE TRIGGER: Market bouncing after dip on {symbol}! Closing SELL and opening BUY...", flush=True)
+                close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
+                time.sleep(2)
+                execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
                 
-            elif prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0:
-                print(f"--> TRIGGER [SELL]: Rejection detected after Pump/Peak on {symbol}!", flush=True)
-                execute_order_with_sl(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+            elif pos_side == "buy" and (prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0):
+                print(f"--> REVERSE TRIGGER: Market rejecting after peak on {symbol}! Closing BUY and opening SELL...", flush=True)
+                close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
+                time.sleep(2)
+                execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                 last_traded_candle[symbol] = c_time
+        else:
+            # Fresh Entry Logic when no position is open
+            if c_time != last_traded_candle[symbol]:
+                if prev_diff <= -EXHAUSTION_THRESHOLD and current_diff > 0:
+                    print(f"--> TRIGGER [BUY]: Bounce detected after Dip on {symbol}!", flush=True)
+                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+                    last_traded_candle[symbol] = c_time
+                    
+                elif prev_diff >= EXHAUSTION_THRESHOLD and current_diff < 0:
+                    print(f"--> TRIGGER [SELL]: Rejection detected after Pump/Peak on {symbol}!", flush=True)
+                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+                    last_traded_candle[symbol] = c_time
                 
     time.sleep(30)
