@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Trailing SL BTC Scalping Bot is running!")
+        self.wfile.write(b"Strict Anti-Whipsaw BTC Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Trailing SL BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Strict Anti-Whipsaw BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -36,7 +36,7 @@ live_prices = {
 }
 
 last_trade_close_time = 0
-COOLDOWN_SECONDS = 45
+COOLDOWN_SECONDS = 60  # Sideways se bachne ke liye lamba cooldown
 last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -191,7 +191,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Trailing Stop-Loss Bot Active...", flush=True)
+print("Strict Anti-Whipsaw Bot Active...", flush=True)
 
 while True:
     try:
@@ -208,16 +208,16 @@ while True:
             if symbol not in live_prices:
                 live_prices[symbol] = []
             live_prices[symbol].append(current_price)
-            if len(live_prices[symbol]) > 35:
+            if len(live_prices[symbol]) > 40:
                 live_prices[symbol].pop(0)
                 
             prices = live_prices[symbol]
-            if len(prices) < 15:
+            if len(prices) < 20:
                 time.sleep(3)
                 continue
                 
-            ema_fast = calculate_ema(prices, 6)
-            ema_slow = calculate_ema(prices, 15)
+            ema_fast = calculate_ema(prices, 8)
+            ema_slow = calculate_ema(prices, 21)
             
             if ema_fast is None or ema_slow is None:
                 continue
@@ -242,7 +242,6 @@ while True:
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
                 
-                # Trailing SL Levels Check
                 if profit_points >= 50.0 and last_trailing_level.get(p_id, 0) < 50:
                     print(f"--> TRAILING SL UPGRADE: Locking 25 points profit!", flush=True)
                     last_trailing_level[p_id] = 50
@@ -263,34 +262,35 @@ while True:
             
             if not has_position:
                 if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
-                    print(f"[{symbol}] In Cooldown Period. Waiting to avoid sideways whipsaw...", flush=True)
+                    print(f"[{symbol}] In Cooldown Period. Sideways market blocked...", flush=True)
                     continue
             
+            # Strong Trend Filter: Gap must be significant to avoid chop
             ema_diff = abs(ema_fast - ema_slow)
-            min_gap_required = current_price * 0.00008
+            min_gap_required = current_price * 0.00015  # Strict filter for sideways market
             
             is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
             is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
             
             if has_position:
                 if pos_side == "sell" and is_uptrend:
-                    print(f"--> TREND SHIFT TO BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
+                    print(f"--> STRONG TREND SHIFT TO BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(1)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif pos_side == "buy" and is_downtrend:
-                    print(f"--> TREND SHIFT TO SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
+                    print(f"--> STRONG TREND SHIFT TO SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(1)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
             else:
                 if is_uptrend:
-                    print(f"--> UPTREND ACTIVE: Executing BUY on {symbol}!", flush=True)
+                    print(f"--> STRONG UPTREND: Executing BUY on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif is_downtrend:
-                    print(f"--> DOWNTREND ACTIVE: Executing SELL on {symbol}!", flush=True)
+                    print(f"--> STRONG DOWNTREND: Executing SELL on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
                     
     except Exception as e:
