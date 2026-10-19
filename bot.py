@@ -186,6 +186,7 @@ def get_market_data(product_id, symbol):
         data = response.json()
         
         candles = data.get('result', [])
+        print(f"[API Fetch] {symbol} candles count: {len(candles)}", flush=True)
         if len(candles) < 25:
             return None, 0, 0, 0
             
@@ -218,9 +219,9 @@ while True:
             
             c_time, close_p, ema9, ema21 = get_market_data(p_id, symbol)
             if c_time is None or ema9 is None or ema21 is None:
+                print(f"[Skip] Skipping {symbol} due to missing data (c_time: {c_time}, ema9: {ema9}, ema21: {ema21})", flush=True)
                 continue
             
-            # Debugging print to see calculated values in logs
             print(f"[{symbol}] Price: {close_p} | EMA9: {round(ema9, 2)} | EMA21: {round(ema21, 2)}", flush=True)
                 
             has_position = p_id in open_positions
