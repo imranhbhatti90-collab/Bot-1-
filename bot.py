@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Aggressive Scalping Bot is running!")
+        self.wfile.write(b"Safe Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,13 +24,13 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Aggressive Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Safe BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
-TARGET_COINS = ['BTCUSD', 'ETHUSD', 'SOLUSD', 'XRPUSD', 'BNBUSD', 'XAUTUSD', 'PAXGUSD']
+TARGET_COINS = ['BTCUSD']  # Sirf BTCUSD safe trading ke liye ($200 capital)
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -51,17 +51,8 @@ def get_target_product_info():
             symbol = product.get('symbol')
             if symbol in TARGET_COINS:
                 p_id = product.get('id')
-                min_size = float(product.get('contract_unit', 1))
-                if 'spot_lot_size' in product:
-                    min_size = float(product.get('spot_lot_size'))
-                
-                custom_size = max(min_size, 1.0)
-                if symbol == 'BTCUSD':
-                    custom_size = 40.0  
-                elif symbol == 'ETHUSD':
-                    custom_size = 40.0
-                elif symbol in ['XRPUSD', 'SOLUSD', 'BNBUSD', 'XAUTUSD', 'PAXGUSD']:
-                    custom_size = max(min_size, 10.0)
+                # Safe small size for $200 capital on BTCUSD
+                custom_size = 1.0 
                 
                 product_info[symbol] = {
                     "id": p_id,
@@ -127,7 +118,7 @@ def close_position(product_id, symbol, current_side, size):
     }
     
     try:
-        print(f"[Closing] Switching position for {symbol} via {side.upper()}...", flush=True)
+        print(f"[Closing] Position for {symbol} via {side.upper()}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[CLOSE RESPONSE] {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -138,7 +129,8 @@ def execute_order(product_id, symbol, side, size, entry_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    sl_offset = 25.0
+    # Tight Stop Loss for $200 account safety
+    sl_offset = 30.0
     stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
     
     payload_data = {
@@ -179,7 +171,7 @@ def calculate_ema(prices, period):
 def get_market_data(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 14400  # 4 hours data
+        start_time = current_time - 14400
         
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=100"
         response = requests.get(url, timeout=10)
@@ -205,11 +197,11 @@ def get_market_data(product_id, symbol):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Aggressive Scalping Strategy Started & Monitoring Loop Active...", flush=True)
+print("Safe BTC Scalping Strategy Started & Monitoring Loop Active...", flush=True)
 
 while True:
     try:
-        print("[Loop] Checking market trends...", flush=True)
+        print("[Loop] Checking market trends securely...", flush=True)
         open_positions = get_open_positions()
         
         for symbol, info in product_data.items():
@@ -225,31 +217,35 @@ while True:
             has_position = p_id in open_positions
             pos_side = open_positions[p_id]["side"] if has_position else None
             
-            is_buy_trend = ema9 > ema21
-            is_sell_trend = ema9 < ema21
+            # Strict Filter: EMA gap must be significant to avoid fake trades
+            ema_diff = abs(ema9 - ema21)
+            min_gap_required = close_p * 0.0003  # 0.03% minimum gap requirement
+            
+            is_strong_buy = (ema9 > ema21) and (ema_diff > min_gap_required)
+            is_strong_sell = (ema9 < ema21) and (ema_diff > min_gap_required)
             
             if has_position:
-                if pos_side == "sell" and is_buy_trend:
-                    print(f"--> TREND SWITCH [BUY] on {symbol}: EMA9 crossed above EMA21!", flush=True)
+                if pos_side == "sell" and is_strong_buy:
+                    print(f"--> STRICT TREND SWITCH [BUY] on {symbol}!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     
-                elif pos_side == "buy" and is_sell_trend:
-                    print(f"--> TREND SWITCH [SELL] on {symbol}: EMA9 crossed below EMA21!", flush=True)
+                elif pos_side == "buy" and is_strong_sell:
+                    print(f"--> STRICT TREND SWITCH [SELL] on {symbol}!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
             else:
-                if is_buy_trend:
-                    print(f"--> AGGRESSIVE TRIGGER [BUY] on {symbol}: Uptrend Active!", flush=True)
+                if is_strong_buy:
+                    print(f"--> PERFECT SETUP [BUY] on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     
-                elif is_sell_trend:
-                    print(f"--> AGGRESSIVE TRIGGER [SELL] on {symbol}: Downtrend Active!", flush=True)
+                elif is_strong_sell:
+                    print(f"--> PERFECT SETUP [SELL] on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
-    time.sleep(15)
+    time.sleep(20)
