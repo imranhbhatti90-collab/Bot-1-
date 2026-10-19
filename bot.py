@@ -1,4 +1,4 @@
-import threading
+  import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
 import hmac
@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Scalping Trend Bot is running!")
+        self.wfile.write(b"Aggressive Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Scalping Trend Bot Started & Port 10000 Bound...", flush=True)
+print("Aggressive Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -138,7 +138,7 @@ def execute_order(product_id, symbol, side, size, entry_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    sl_offset = 20.0
+    sl_offset = 25.0
     stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
     
     payload_data = {
@@ -187,76 +187,67 @@ def get_market_data(product_id, symbol):
         
         candles = data.get('result', [])
         if len(candles) < 25:
-            return None, 0, 0, 0, 0
+            return None, 0, 0, 0
             
         closes = [float(c.get('close', 0)) for c in candles]
         
         latest = candles[0]
         c_time = latest.get('time', 0)
-        open_p = float(latest.get('open', 0))
         close_p = float(latest.get('close', 0))
         
         ema9 = calculate_ema(closes, 9)
         ema21 = calculate_ema(closes, 21)
         
-        return c_time, open_p, close_p, ema9, ema21
+        return c_time, close_p, ema9, ema21
     except Exception as e:
         print(f"Error fetching market data for {symbol}: {e}", flush=True)
-    return None, 0, 0, 0, 0
+    return None, 0, 0, 0
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Scalping Trend Strategy Started & Monitoring Loop Active...", flush=True)
-
-last_traded_candle = {}
+print("Aggressive Scalping Strategy Started & Monitoring Loop Active...", flush=True)
 
 while True:
     try:
-        print("[Loop] Checking market data for all coins...", flush=True)
+        print("[Loop] Checking market trends...", flush=True)
         open_positions = get_open_positions()
         
         for symbol, info in product_data.items():
             p_id = info["id"]
             trade_size = info["min_size"]
             
-            c_time, open_p, close_p, ema9, ema21 = get_market_data(p_id, symbol)
+            c_time, close_p, ema9, ema21 = get_market_data(p_id, symbol)
             if c_time is None or ema9 is None or ema21 is None:
                 continue
-                
-            if symbol not in last_traded_candle:
-                last_traded_candle[symbol] = 0
                 
             has_position = p_id in open_positions
             pos_side = open_positions[p_id]["side"] if has_position else None
             
-            is_buy_signal = (ema9 > ema21) and (close_p > open_p)
-            is_sell_signal = (ema9 < ema21) and (close_p < open_p)
+            # Pure Trend Signals (No Candle Color Restriction)
+            is_buy_trend = ema9 > ema21
+            is_sell_trend = ema9 < ema21
             
             if has_position:
-                if pos_side == "sell" and is_buy_signal:
-                    print(f"--> SCALP SWITCH [BUY] on {symbol}: Trend flipped to UP!", flush=True)
+                if pos_side == "sell" and is_buy_trend:
+                    print(f"--> TREND SWITCH [BUY] on {symbol}: EMA9 crossed above EMA21!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
-                    last_traded_candle[symbol] = c_time
                     
-                elif pos_side == "buy" and is_sell_signal:
-                    print(f"--> SCALP SWITCH [SELL] on {symbol}: Trend flipped to DOWN!", flush=True)
+                elif pos_side == "buy" and is_sell_trend:
+                    print(f"--> TREND SWITCH [SELL] on {symbol}: EMA9 crossed below EMA21!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
-                    last_traded_candle[symbol] = c_time
             else:
-                if c_time != last_traded_candle[symbol]:
-                    if is_buy_signal:
-                        print(f"--> SCALP TRIGGER [BUY] on {symbol}: Upward Trend Scalp!", flush=True)
-                        execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
-                        last_traded_candle[symbol] = c_time
-                        
-                    elif is_sell_signal:
-                        print(f"--> SCALP TRIGGER [SELL] on {symbol}: Downward Trend Scalp!", flush=True)
-                        execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
-                        last_traded_candle[symbol] = c_time
+                if is_buy_trend:
+                    print(f"--> AGGRESSIVE TRIGGER [BUY] on {symbol}: Uptrend Active!", flush=True)
+                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+                    
+                elif is_sell_trend:
+                    print(f"--> AGGRESSIVE TRIGGER [SELL] on {symbol}: Downtrend Active!", flush=True)
+                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+                    
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
