@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Real-Time Live Ticker BTC Scalping Bot is running!")
+        self.wfile.write(b"Trailing SL BTC Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,17 +24,20 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Real-Time Live Ticker BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Trailing SL BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
-# Global store for live price ticks to calculate instant EMAs
 live_prices = {
     'BTCUSD': []
 }
+
+last_trade_close_time = 0
+COOLDOWN_SECONDS = 45
+last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -70,7 +73,6 @@ def get_live_ticker_price(symbol):
         data = response.json()
         for ticker in data.get('result', []):
             if ticker.get('symbol') == symbol:
-                # Mark price ya close price jo sabse live ho
                 price = float(ticker.get('mark_price', 0) or ticker.get('close', 0))
                 if price > 0:
                     return price
@@ -109,6 +111,7 @@ def get_open_positions():
     return {}
 
 def close_position(product_id, symbol, current_side, size):
+    global last_trade_close_time, last_trailing_level
     side = "sell" if current_side == "buy" else "buy"
     path = '/v2/orders'
     method = 'POST'
@@ -137,6 +140,9 @@ def close_position(product_id, symbol, current_side, size):
         print(f"[Closing] Exiting position for {symbol} via {side.upper()}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[CLOSE RESPONSE] {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+        last_trade_close_time = time.time()
+        if product_id in last_trailing_level:
+            del last_trailing_level[product_id]
     except Exception as e:
         print(f"Failed to close position for {symbol}: {e}", flush=True)
 
@@ -145,7 +151,7 @@ def execute_order(product_id, symbol, side, size, entry_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    sl_offset = 30.0
+    sl_offset = 60.0
     stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
     
     payload_data = {
@@ -168,7 +174,7 @@ def execute_order(product_id, symbol, side, size, entry_price):
     }
     
     try:
-        print(f"[Executing] Sending {side.upper()} order for {symbol} (Size: {size}, SL: {stop_loss_price})...", flush=True)
+        print(f"[Executing] Sending {side.upper()} order for {symbol} (Size: {size}, Initial SL: {stop_loss_price}, TP: 60 pts)...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -185,7 +191,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Real-Time Ticker Bot Active...", flush=True)
+print("Trailing Stop-Loss Bot Active...", flush=True)
 
 while True:
     try:
@@ -199,11 +205,10 @@ while True:
             if not current_price:
                 continue
                 
-            # Maintain live tick history (last 30 ticks)
             if symbol not in live_prices:
                 live_prices[symbol] = []
             live_prices[symbol].append(current_price)
-            if len(live_prices[symbol]) > 30:
+            if len(live_prices[symbol]) > 35:
                 live_prices[symbol].pop(0)
                 
             prices = live_prices[symbol]
@@ -211,9 +216,8 @@ while True:
                 time.sleep(3)
                 continue
                 
-            # Fast live EMAs (Fast period = 5, Slow period = 12)
-            ema_fast = calculate_ema(prices, 5)
-            ema_slow = calculate_ema(prices, 12)
+            ema_fast = calculate_ema(prices, 6)
+            ema_slow = calculate_ema(prices, 15)
             
             if ema_fast is None or ema_slow is None:
                 continue
@@ -238,13 +242,35 @@ while True:
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
                 
-                if profit_points <= -30.0:
-                    print(f"--> STOP LOSS HIT (-30 Points)! Cutting loss on {symbol} immediately.", flush=True)
+                # Trailing SL Levels Check
+                if profit_points >= 50.0 and last_trailing_level.get(p_id, 0) < 50:
+                    print(f"--> TRAILING SL UPGRADE: Locking 25 points profit!", flush=True)
+                    last_trailing_level[p_id] = 50
+                elif profit_points >= 30.0 and last_trailing_level.get(p_id, 0) < 30:
+                    print(f"--> TRAILING SL BREAKEVEN: Moving SL to Entry Price!", flush=True)
+                    last_trailing_level[p_id] = 30
+                
+                current_sl_limit = -60.0
+                if last_trailing_level.get(p_id, 0) == 30:
+                    current_sl_limit = 0.0
+                elif last_trailing_level.get(p_id, 0) == 50:
+                    current_sl_limit = 25.0
+                
+                if profit_points <= current_sl_limit:
+                    print(f"--> STOP LOSS / TRAILING EXIT HIT! Closing {symbol} position.", flush=True)
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
             
-            is_uptrend = ema_fast > ema_slow
-            is_downtrend = ema_fast < ema_slow
+            if not has_position:
+                if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
+                    print(f"[{symbol}] In Cooldown Period. Waiting to avoid sideways whipsaw...", flush=True)
+                    continue
+            
+            ema_diff = abs(ema_fast - ema_slow)
+            min_gap_required = current_price * 0.00008
+            
+            is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
+            is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
             
             if has_position:
                 if pos_side == "sell" and is_uptrend:
