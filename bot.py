@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Safe BTC Scalping Bot is running!")
+        self.wfile.write(b"Safe BTC Scalping Bot with Trailing SL is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,12 +24,12 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Safe BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Safe BTC Scalping Bot with Trailing SL Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
-TARGET_COINS = ['BTCUSD']  # Sirf BTCUSD ($200 capital safety ke liye)
+TARGET_COINS = ['BTCUSD']
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -52,7 +52,7 @@ def get_target_product_info():
                 p_id = product.get('id')
                 product_info[symbol] = {
                     "id": p_id,
-                    "min_size": 40.0  # Safe minimum size for BTCUSD
+                    "min_size": 40.0
                 }
     except Exception as e:
         print("Error fetching products info:", e, flush=True)
@@ -114,7 +114,7 @@ def close_position(product_id, symbol, current_side, size):
     }
     
     try:
-        print(f"[Closing] Position for {symbol} via {side.upper()}...", flush=True)
+        print(f"[Closing] Taking profit/exiting position for {symbol} via {side.upper()}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[CLOSE RESPONSE] {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -125,7 +125,8 @@ def execute_order(product_id, symbol, side, size, entry_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    sl_offset = 35.0
+    # 30 points Stop Loss initially
+    sl_offset = 30.0
     stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
     
     payload_data = {
@@ -148,7 +149,7 @@ def execute_order(product_id, symbol, side, size, entry_price):
     }
     
     try:
-        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size} & SL at {stop_loss_price}...", flush=True)
+        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size}, SL at {stop_loss_price} (Target: 60 pts profit)...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -192,11 +193,11 @@ def get_market_data(product_id, symbol):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Safe BTC Scalping Strategy Started & Monitoring Loop Active...", flush=True)
+print("Safe BTC Scalping Strategy with Trailing Target Active...", flush=True)
 
 while True:
     try:
-        print("[Loop] Checking BTCUSD trend securely...", flush=True)
+        print("[Loop] Checking market trends and active profit targets...", flush=True)
         open_positions = get_open_positions()
         
         for symbol, info in product_data.items():
@@ -211,22 +212,39 @@ while True:
                 
             has_position = p_id in open_positions
             pos_side = open_positions[p_id]["side"] if has_position else None
+            entry_price = open_positions[p_id]["entry_price"] if has_position else 0
+            
+            # Trailing & Profit Target Logic Check if position is active
+            if has_position:
+                profit_points = 0
+                if pos_side == "buy":
+                    profit_points = close_p - entry_price
+                elif pos_side == "sell":
+                    profit_points = entry_price - close_p
+                
+                print(f"[{symbol}] Active Position ({pos_side.upper()}) | Entry: {entry_price} | Current Profit/Loss Points: {round(profit_points, 2)}", flush=True)
+                
+                # Agar 60 points ya usse zyada ka profit mil gaya hai, toh profit book karne ke liye close kar do
+                if profit_points >= 60.0:
+                    print(f"--> TARGET REACHED (+60 Points Profit)! Closing {symbol} to secure profits.", flush=True)
+                    close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
+                    continue
             
             ema_diff = abs(ema9 - ema21)
-            min_gap_required = close_p * 0.0003  # 0.03% momentum gap filter
+            min_gap_required = close_p * 0.0003
             
             is_strong_buy = (ema9 > ema21) and (ema_diff > min_gap_required)
             is_strong_sell = (ema9 < ema21) and (ema_diff > min_gap_required)
             
             if has_position:
                 if pos_side == "sell" and is_strong_buy:
-                    print(f"--> STRICT TREND SWITCH [BUY] on {symbol}!", flush=True)
+                    print(f"--> TREND SWITCH [BUY] on {symbol}: Closing old sell and switching!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     
                 elif pos_side == "buy" and is_strong_sell:
-                    print(f"--> STRICT TREND SWITCH [SELL] on {symbol}!", flush=True)
+                    print(f"--> TREND SWITCH [SELL] on {symbol}: Closing old buy and switching!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
@@ -242,4 +260,4 @@ while True:
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
-    time.sleep(25)
+    time.sleep(20)
