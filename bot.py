@@ -179,15 +179,14 @@ def calculate_ema(prices, period):
 def get_market_data(product_id, symbol):
     try:
         current_time = int(time.time())
-        start_time = current_time - 7200
+        start_time = current_time - 14400  # 4 hours data
         
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=30"
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=100"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         candles = data.get('result', [])
-        print(f"[API Fetch] {symbol} candles count: {len(candles)}", flush=True)
-        if len(candles) < 25:
+        if len(candles) < 10:
             return None, 0, 0, 0
             
         closes = [float(c.get('close', 0)) for c in candles]
@@ -219,7 +218,6 @@ while True:
             
             c_time, close_p, ema9, ema21 = get_market_data(p_id, symbol)
             if c_time is None or ema9 is None or ema21 is None:
-                print(f"[Skip] Skipping {symbol} due to missing data (c_time: {c_time}, ema9: {ema9}, ema21: {ema21})", flush=True)
                 continue
             
             print(f"[{symbol}] Price: {close_p} | EMA9: {round(ema9, 2)} | EMA21: {round(ema21, 2)}", flush=True)
