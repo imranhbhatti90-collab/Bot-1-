@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Direct Trend BTC Scalping Bot is running!")
+        self.wfile.write(b"Real-Time Live Ticker BTC Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,12 +24,17 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Direct Trend BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Real-Time Live Ticker BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
+
+# Global store for live price ticks to calculate instant EMAs
+live_prices = {
+    'BTCUSD': []
+}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -57,6 +62,21 @@ def get_target_product_info():
     except Exception as e:
         print("Error fetching products info:", e, flush=True)
     return product_info
+
+def get_live_ticker_price(symbol):
+    try:
+        url = f"{BASE_URL}/v2/tickers"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        for ticker in data.get('result', []):
+            if ticker.get('symbol') == symbol:
+                # Mark price ya close price jo sabse live ho
+                price = float(ticker.get('mark_price', 0) or ticker.get('close', 0))
+                if price > 0:
+                    return price
+    except Exception as e:
+        print(f"Error fetching live ticker for {symbol}: {e}", flush=True)
+    return None
 
 def get_open_positions():
     path = '/v2/positions'
@@ -163,51 +183,42 @@ def calculate_ema(prices, period):
         ema = (price - ema) * multiplier + ema
     return ema
 
-def get_market_data(product_id, symbol):
-    try:
-        current_time = int(time.time())
-        start_time = current_time - 14400
-        
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=100"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        candles = data.get('result', [])
-        if len(candles) < 10:
-            return None, 0, 0, 0
-            
-        closes = [float(c.get('close', 0)) for c in candles]
-        
-        latest = candles[0]
-        c_time = latest.get('time', 0)
-        close_p = float(latest.get('close', 0))
-        
-        ema9 = calculate_ema(closes, 9)
-        ema21 = calculate_ema(closes, 21)
-        
-        return c_time, close_p, ema9, ema21
-    except Exception as e:
-        print(f"Error fetching market data for {symbol}: {e}", flush=True)
-    return None, 0, 0, 0
-
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Direct Trend Bot Active...", flush=True)
+print("Real-Time Ticker Bot Active...", flush=True)
 
 while True:
     try:
-        print("[Loop] Checking direct trend direction...", flush=True)
         open_positions = get_open_positions()
         
         for symbol, info in product_data.items():
             p_id = info["id"]
             trade_size = info["min_size"]
             
-            c_time, close_p, ema9, ema21 = get_market_data(p_id, symbol)
-            if c_time is None or ema9 is None or ema21 is None:
+            current_price = get_live_ticker_price(symbol)
+            if not current_price:
                 continue
+                
+            # Maintain live tick history (last 30 ticks)
+            if symbol not in live_prices:
+                live_prices[symbol] = []
+            live_prices[symbol].append(current_price)
+            if len(live_prices[symbol]) > 30:
+                live_prices[symbol].pop(0)
+                
+            prices = live_prices[symbol]
+            if len(prices) < 15:
+                time.sleep(3)
+                continue
+                
+            # Fast live EMAs (Fast period = 5, Slow period = 12)
+            ema_fast = calculate_ema(prices, 5)
+            ema_slow = calculate_ema(prices, 12)
             
-            print(f"[{symbol}] Price: {close_p} | EMA9: {round(ema9, 2)} | EMA21: {round(ema21, 2)}", flush=True)
+            if ema_fast is None or ema_slow is None:
+                continue
+                
+            print(f"[{symbol}] Live Price: {current_price} | FastEMA: {round(ema_fast, 2)} | SlowEMA: {round(ema_slow, 2)}", flush=True)
                 
             has_position = p_id in open_positions
             pos_side = open_positions[p_id]["side"] if has_position else None
@@ -216,9 +227,9 @@ while True:
             if has_position:
                 profit_points = 0
                 if pos_side == "buy":
-                    profit_points = close_p - entry_price
+                    profit_points = current_price - entry_price
                 elif pos_side == "sell":
-                    profit_points = entry_price - close_p
+                    profit_points = entry_price - current_price
                 
                 print(f"[{symbol}] Active {pos_side.upper()} | Entry: {entry_price} | PnL Points: {round(profit_points, 2)}", flush=True)
                 
@@ -232,32 +243,31 @@ while True:
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
             
-            # Direct Trend State
-            is_uptrend = ema9 > ema21
-            is_downtrend = ema9 < ema21
+            is_uptrend = ema_fast > ema_slow
+            is_downtrend = ema_fast < ema_slow
             
             if has_position:
                 if pos_side == "sell" and is_uptrend:
-                    print(f"--> TREND SHIFT TO UPTREND: Closing SELL and taking BUY on {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT TO BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
-                    time.sleep(2)
-                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+                    time.sleep(1)
+                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif pos_side == "buy" and is_downtrend:
-                    print(f"--> TREND SHIFT TO DOWNTREND: Closing BUY and taking SELL on {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT TO SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
-                    time.sleep(2)
-                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+                    time.sleep(1)
+                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
             else:
                 if is_uptrend:
                     print(f"--> UPTREND ACTIVE: Executing BUY on {symbol}!", flush=True)
-                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif is_downtrend:
                     print(f"--> DOWNTREND ACTIVE: Executing SELL on {symbol}!", flush=True)
-                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
-    time.sleep(15)
+    time.sleep(5)
