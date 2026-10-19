@@ -219,11 +219,13 @@ while True:
             c_time, close_p, ema9, ema21 = get_market_data(p_id, symbol)
             if c_time is None or ema9 is None or ema21 is None:
                 continue
+            
+            # Debugging print to see calculated values in logs
+            print(f"[{symbol}] Price: {close_p} | EMA9: {round(ema9, 2)} | EMA21: {round(ema21, 2)}", flush=True)
                 
             has_position = p_id in open_positions
             pos_side = open_positions[p_id]["side"] if has_position else None
             
-            # Pure Trend Signals (No Candle Color Restriction)
             is_buy_trend = ema9 > ema21
             is_sell_trend = ema9 < ema21
             
