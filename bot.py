@@ -1,16 +1,17 @@
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import time
 import hmac
 import hashlib
 import json
 import requests
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Emergency Closer is running!")
+        self.wfile.write(b"Safe BTC Scalping Bot is running!")
+
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
@@ -23,9 +24,12 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
+print("Safe BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
+
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
 BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
+TARGET_COINS = ['BTCUSD']  # Sirf BTCUSD ($200 capital safety ke liye)
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -36,16 +40,64 @@ def generate_signature(secret, method, timestamp, path, query_string='', payload
     ).hexdigest()
     return signature
 
-def force_close_sol_remaining():
+def get_target_product_info():
+    product_info = {}
+    try:
+        url = BASE_URL + "/v2/products"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        for product in data.get('result', []):
+            symbol = product.get('symbol')
+            if symbol in TARGET_COINS:
+                p_id = product.get('id')
+                product_info[symbol] = {
+                    "id": p_id,
+                    "min_size": 40.0  # Safe minimum size for BTCUSD
+                }
+    except Exception as e:
+        print("Error fetching products info:", e, flush=True)
+    return product_info
+
+def get_open_positions():
+    path = '/v2/positions'
+    method = 'GET'
+    timestamp = str(int(time.time()))
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', '')
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.get(BASE_URL + path, headers=req_headers, timeout=10)
+        data = response.json()
+        positions = {}
+        for pos in data.get('result', []):
+            if float(pos.get('size', 0)) != 0:
+                positions[pos.get('product_id')] = {
+                    "side": pos.get('side'),
+                    "size": float(pos.get('size')),
+                    "entry_price": float(pos.get('entry_price', 0))
+                }
+        return positions
+    except Exception as e:
+        print("Error fetching positions:", e, flush=True)
+    return {}
+
+def close_position(product_id, symbol, current_side, size):
+    side = "sell" if current_side == "buy" else "buy"
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    # Remaining size 181 (or smaller chunks) to clear the orderbook completely
     payload_data = {
-        "product_id": 92572,
-        "size": 181,
-        "side": "buy",
+        "product_id": product_id,
+        "size": int(size),
+        "side": side,
         "order_type": "market_order",
         "reduce_only": True
     }
@@ -62,15 +114,132 @@ def force_close_sol_remaining():
     }
     
     try:
-        print("Sending Emergency Close Request for remaining SOLUSD size (181)...", flush=True)
+        print(f"[Closing] Position for {symbol} via {side.upper()}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        print(f"CLOSE RESPONSE -> Status: {response.status_code} | Body: {response.text}", flush=True)
+        print(f"[CLOSE RESPONSE] {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
-        print(f"Failed to close remaining SOLUSD: {e}", flush=True)
+        print(f"Failed to close position for {symbol}: {e}", flush=True)
 
-# Run once immediately
-force_close_sol_remaining()
+def execute_order(product_id, symbol, side, size, entry_price):
+    path = '/v2/orders'
+    method = 'POST'
+    timestamp = str(int(time.time()))
+    
+    sl_offset = 35.0
+    stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
+    
+    payload_data = {
+        "product_id": product_id,
+        "size": int(size),
+        "side": side,
+        "order_type": "market_order",
+        "stop_loss_price": round(stop_loss_price, 2)
+    }
+    
+    payload = json.dumps(payload_data)
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        print(f"[Executing] Sending {side.upper()} order for {symbol} with size {size} & SL at {stop_loss_price}...", flush=True)
+        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
+        print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+    except Exception as e:
+        print(f"Order execution failed for {symbol}: {e}", flush=True)
 
-# Keep alive loop
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return None
+    multiplier = 2 / (period + 1)
+    ema = sum(prices[:period]) / period
+    for price in prices[period:]:
+        ema = (price - ema) * multiplier + ema
+    return ema
+
+def get_market_data(product_id, symbol):
+    try:
+        current_time = int(time.time())
+        start_time = current_time - 14400
+        
+        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&symbol={symbol}&resolution=5m&start={start_time}&end={current_time}&limit=100"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        candles = data.get('result', [])
+        if len(candles) < 10:
+            return None, 0, 0, 0
+            
+        closes = [float(c.get('close', 0)) for c in candles]
+        
+        latest = candles[0]
+        c_time = latest.get('time', 0)
+        close_p = float(latest.get('close', 0))
+        
+        ema9 = calculate_ema(closes, 9)
+        ema21 = calculate_ema(closes, 21)
+        
+        return c_time, close_p, ema9, ema21
+    except Exception as e:
+        print(f"Error fetching market data for {symbol}: {e}", flush=True)
+    return None, 0, 0, 0
+
+product_data = get_target_product_info()
+print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
+print("Safe BTC Scalping Strategy Started & Monitoring Loop Active...", flush=True)
+
 while True:
-    time.sleep(60)
+    try:
+        print("[Loop] Checking BTCUSD trend securely...", flush=True)
+        open_positions = get_open_positions()
+        
+        for symbol, info in product_data.items():
+            p_id = info["id"]
+            trade_size = info["min_size"]
+            
+            c_time, close_p, ema9, ema21 = get_market_data(p_id, symbol)
+            if c_time is None or ema9 is None or ema21 is None:
+                continue
+            
+            print(f"[{symbol}] Price: {close_p} | EMA9: {round(ema9, 2)} | EMA21: {round(ema21, 2)}", flush=True)
+                
+            has_position = p_id in open_positions
+            pos_side = open_positions[p_id]["side"] if has_position else None
+            
+            ema_diff = abs(ema9 - ema21)
+            min_gap_required = close_p * 0.0003  # 0.03% momentum gap filter
+            
+            is_strong_buy = (ema9 > ema21) and (ema_diff > min_gap_required)
+            is_strong_sell = (ema9 < ema21) and (ema_diff > min_gap_required)
+            
+            if has_position:
+                if pos_side == "sell" and is_strong_buy:
+                    print(f"--> STRICT TREND SWITCH [BUY] on {symbol}!", flush=True)
+                    close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
+                    time.sleep(2)
+                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+                    
+                elif pos_side == "buy" and is_strong_sell:
+                    print(f"--> STRICT TREND SWITCH [SELL] on {symbol}!", flush=True)
+                    close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
+                    time.sleep(2)
+                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+            else:
+                if is_strong_buy:
+                    print(f"--> PERFECT SETUP [BUY] on {symbol}!", flush=True)
+                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
+                    
+                elif is_strong_sell:
+                    print(f"--> PERFECT SETUP [SELL] on {symbol}!", flush=True)
+                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
+                    
+    except Exception as e:
+        print(f"Error in main loop: {e}", flush=True)
+                
+    time.sleep(25)
