@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Strict Trend BTC Scalping Bot is running!")
+        self.wfile.write(b"Direct Trend BTC Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Strict Trend BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Direct Trend BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -125,7 +125,6 @@ def execute_order(product_id, symbol, side, size, entry_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    # Strict 30 points Stop Loss
     sl_offset = 30.0
     stop_loss_price = entry_price - sl_offset if side == 'buy' else entry_price + sl_offset
     
@@ -193,11 +192,11 @@ def get_market_data(product_id, symbol):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Strict Trend & Target Bot Active...", flush=True)
+print("Direct Trend Bot Active...", flush=True)
 
 while True:
     try:
-        print("[Loop] Checking strict market direction...", flush=True)
+        print("[Loop] Checking direct trend direction...", flush=True)
         open_positions = get_open_positions()
         
         for symbol, info in product_data.items():
@@ -214,7 +213,6 @@ while True:
             pos_side = open_positions[p_id]["side"] if has_position else None
             entry_price = open_positions[p_id]["entry_price"] if has_position else 0
             
-            # Check Profit/Loss Exit Conditions in Loop
             if has_position:
                 profit_points = 0
                 if pos_side == "buy":
@@ -224,47 +222,42 @@ while True:
                 
                 print(f"[{symbol}] Active {pos_side.upper()} | Entry: {entry_price} | PnL Points: {round(profit_points, 2)}", flush=True)
                 
-                # 60 Points Profit Target Reached
                 if profit_points >= 60.0:
                     print(f"--> TARGET REACHED (+60 Points)! Taking profit on {symbol}.", flush=True)
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
                 
-                # 30 Points Stop Loss Reached
                 if profit_points <= -30.0:
                     print(f"--> STOP LOSS HIT (-30 Points)! Cutting loss on {symbol} immediately.", flush=True)
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
             
-            ema_diff = abs(ema9 - ema21)
-            min_gap_required = close_p * 0.0004  # Thoda aur strict gap filter taaki fake moves na pakde
-            
-            # Strict Directional Conditions
-            is_strict_buy = (ema9 > ema21) and (ema_diff > min_gap_required)
-            is_strict_sell = (ema9 < ema21) and (ema_diff > min_gap_required)
+            # Direct Trend State
+            is_uptrend = ema9 > ema21
+            is_downtrend = ema9 < ema21
             
             if has_position:
-                if pos_side == "sell" and is_strict_buy:
-                    print(f"--> TREND REVERSAL TO BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
+                if pos_side == "sell" and is_uptrend:
+                    print(f"--> TREND SHIFT TO UPTREND: Closing SELL and taking BUY on {symbol}!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     
-                elif pos_side == "buy" and is_strict_sell:
-                    print(f"--> TREND REVERSAL TO SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
+                elif pos_side == "buy" and is_downtrend:
+                    print(f"--> TREND SHIFT TO DOWNTREND: Closing BUY and taking SELL on {symbol}!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
             else:
-                if is_strict_buy:
-                    print(f"--> UPTREND DETECTED: Executing BUY on {symbol}!", flush=True)
+                if is_uptrend:
+                    print(f"--> UPTREND ACTIVE: Executing BUY on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=close_p)
                     
-                elif is_strict_sell:
-                    print(f"--> DOWNTREND DETECTED: Executing SELL on {symbol}!", flush=True)
+                elif is_downtrend:
+                    print(f"--> DOWNTREND ACTIVE: Executing SELL on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=close_p)
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
-    time.sleep(20)
+    time.sleep(15)
