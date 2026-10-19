@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Strict Anti-Whipsaw BTC Scalping Bot is running!")
+        self.wfile.write(b"Strict Trailing SL BTC Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Strict Anti-Whipsaw BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Strict Trailing SL BTC Scalping Bot Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -36,7 +36,7 @@ live_prices = {
 }
 
 last_trade_close_time = 0
-COOLDOWN_SECONDS = 60  # Sideways se bachne ke liye lamba cooldown
+COOLDOWN_SECONDS = 45
 last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -174,7 +174,7 @@ def execute_order(product_id, symbol, side, size, entry_price):
     }
     
     try:
-        print(f"[Executing] Sending {side.upper()} order for {symbol} (Size: {size}, Initial SL: {stop_loss_price}, TP: 60 pts)...", flush=True)
+        print(f"[Executing] Sending {side.upper()} order for {symbol} (Size: {size}, Initial SL: {stop_loss_price})...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -191,7 +191,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Strict Anti-Whipsaw Bot Active...", flush=True)
+print("Strict Trailing Bot Active...", flush=True)
 
 while True:
     try:
@@ -237,50 +237,58 @@ while True:
                 
                 print(f"[{symbol}] Active {pos_side.upper()} | Entry: {entry_price} | PnL Points: {round(profit_points, 2)}", flush=True)
                 
-                if profit_points >= 60.0:
-                    print(f"--> TARGET REACHED (+60 Points)! Taking profit on {symbol}.", flush=True)
-                    close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
-                    continue
+                # Dynamic Trailing Logic Levels:
+                # Jaise hi profit 25 points ho -> SL comes to Breakeven (0 loss)
+                # Jaise hi profit 40 points ho -> SL locks 20 points profit
+                # Jaise hi profit 60 points ho -> SL locks 40 points profit (or target booked)
                 
-                if profit_points >= 50.0 and last_trailing_level.get(p_id, 0) < 50:
-                    print(f"--> TRAILING SL UPGRADE: Locking 25 points profit!", flush=True)
-                    last_trailing_level[p_id] = 50
-                elif profit_points >= 30.0 and last_trailing_level.get(p_id, 0) < 30:
-                    print(f"--> TRAILING SL BREAKEVEN: Moving SL to Entry Price!", flush=True)
-                    last_trailing_level[p_id] = 30
+                current_level = last_trailing_level.get(p_id, 0)
                 
-                current_sl_limit = -60.0
-                if last_trailing_level.get(p_id, 0) == 30:
-                    current_sl_limit = 0.0
-                elif last_trailing_level.get(p_id, 0) == 50:
-                    current_sl_limit = 25.0
+                if profit_points >= 60.0 and current_level < 60:
+                    last_trailing_level[p_id] = 60
+                    print(f"--> TRAILING UPGRADE (Level 3): Locking 40 points profit!", flush=True)
+                elif profit_points >= 40.0 and current_level < 40:
+                    last_trailing_level[p_id] = 40
+                    print(f"--> TRAILING UPGRADE (Level 2): Locking 20 points profit!", flush=True)
+                elif profit_points >= 25.0 and current_level < 25:
+                    last_trailing_level[p_id] = 25
+                    print(f"--> TRAILING UPGRADE (Level 1): Moving SL to Breakeven (Zero Loss)!", flush=True)
                 
-                if profit_points <= current_sl_limit:
-                    print(f"--> STOP LOSS / TRAILING EXIT HIT! Closing {symbol} position.", flush=True)
+                # Check exit based on trailing levels
+                active_sl_limit = -60.0 # Initial SL
+                lvl = last_trailing_level.get(p_id, 0)
+                if lvl == 25:
+                    active_sl_limit = 0.0   # Breakeven
+                elif lvl == 40:
+                    active_sl_limit = 20.0  # Lock +20 points
+                elif lvl == 60:
+                    active_sl_limit = 40.0  # Lock +40 points
+                
+                if profit_points <= active_sl_limit:
+                    print(f"--> TRAILING STOP HIT! Securing profit/cutting at level {lvl}. Closing {symbol}.", flush=True)
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
             
             if not has_position:
                 if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
-                    print(f"[{symbol}] In Cooldown Period. Sideways market blocked...", flush=True)
+                    print(f"[{symbol}] In Cooldown Period. Waiting...", flush=True)
                     continue
             
-            # Strong Trend Filter: Gap must be significant to avoid chop
             ema_diff = abs(ema_fast - ema_slow)
-            min_gap_required = current_price * 0.00015  # Strict filter for sideways market
+            min_gap_required = current_price * 0.00015
             
             is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
             is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
             
             if has_position:
                 if pos_side == "sell" and is_uptrend:
-                    print(f"--> STRONG TREND SHIFT TO BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT TO BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(1)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif pos_side == "buy" and is_downtrend:
-                    print(f"--> STRONG TREND SHIFT TO SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT TO SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(1)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
@@ -291,7 +299,7 @@ while True:
                     
                 elif is_downtrend:
                     print(f"--> STRONG DOWNTREND: Executing SELL on {symbol}!", flush=True)
-                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
+                    execute_avan = execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
