@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Always-Active TradingView 5m EMA Scalping Bot is running!")
+        self.wfile.write(b"Dynamic Trailing Stop-Loss Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Always-Active Bot Server Started & Port 10000 Bound...", flush=True)
+print("Dynamic Trailing Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -65,16 +65,13 @@ def get_target_product_info():
 def get_historical_candles(symbol):
     try:
         end_time = int(time.time())
-        start_time = end_time - (6 * 3600)  # Last 6 hours of 5m candles
+        start_time = end_time - (6 * 3600)
         url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=5m&start={start_time}&end={end_time}"
         response = requests.get(url, timeout=10)
         data = response.json()
         
-        print(f"[DEBUG Candles API] Symbol {symbol} Response Status: {response.status_code}", flush=True)
-        
         candles = data.get('result', [])
         if not candles:
-            print(f"[WARNING] No candles returned from API for {symbol}. Raw data: {data}", flush=True)
             return []
             
         candles = sorted(candles, key=lambda x: x.get('time', 0))
@@ -195,11 +192,10 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Always-Active TradingView 5m Bot Running & Entering Main Loop...", flush=True)
+print("Dynamic Trailing Bot Running...", flush=True)
 
 while True:
     try:
-        print("[Loop Check] Fetching positions and candles...", flush=True)
         open_positions = get_open_positions()
         
         for symbol, info in product_data.items():
@@ -207,10 +203,7 @@ while True:
             trade_size = info["min_size"]
             
             closes = get_historical_candles(symbol)
-            print(f"[{symbol}] Total Candles Fetched: {len(closes)}", flush=True)
-            
             if len(closes) < 25:
-                print(f"[{symbol}] Waiting for more candles (Got {len(closes)}/25 needed)...", flush=True)
                 time.sleep(10)
                 continue
                 
@@ -221,8 +214,6 @@ while True:
             
             if ema_fast is None or ema_slow is None:
                 continue
-                
-            print(f"[{symbol}] 5m Close: {current_price} | Fast(8): {round(ema_fast, 2)} | Slow(21): {round(ema_slow, 2)}", flush=True)
                 
             has_position = p_id in open_positions
             pos_side = open_positions[p_id]["side"] if has_position else None
@@ -235,36 +226,33 @@ while True:
                 elif pos_side == "sell":
                     profit_points = entry_price - current_price
                 
-                print(f"[{symbol}] Active {pos_side.upper()} | Entry: {entry_price} | PnL: {round(profit_points, 2)} pts", flush=True)
+                print(f"[{symbol}] Active {pos_side.upper()} | Entry: {entry_price} | Current PnL: {round(profit_points, 2)} pts", flush=True)
                 
-                if profit_points >= 60.0:
-                    print(f"--> TARGET REACHED (+60 Points)! Taking profit on {symbol}.", flush=True)
-                    close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
-                    continue
+                # Dynamic Trailing Logic based on your exact requirement
+                current_level = last_trailing_level.get(p_id, -60.0)
                 
-                current_level = last_trailing_level.get(p_id, 0)
-                if profit_points >= 50.0 and current_level < 50:
-                    last_trailing_level[p_id] = 50
-                    print(f"--> TRAILING UPGRADE: Locking profit at level 50 pts!", flush=True)
-                elif profit_points >= 30.0 and current_level < 30:
-                    last_trailing_level[p_id] = 30
-                    print(f"--> TRAILING UPGRADE: Moving SL to Breakeven!", flush=True)
+                if profit_points >= 600.0 and current_level < 550.0:
+                    last_trailing_level[p_id] = 550.0
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 600 pts! Locking SL at +550 pts profit.", flush=True)
+                elif profit_points >= 200.0 and current_level < 150.0:
+                    last_trailing_level[p_id] = 150.0
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 200 pts! Locking SL at +150 pts profit.", flush=True)
+                elif profit_points >= 100.0 and current_level < 50.0:
+                    last_trailing_level[p_id] = 50.0
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 100 pts! Locking SL at +50 pts profit.", flush=True)
+                elif profit_points >= 40.0 and current_level < 0.0:
+                    last_trailing_level[p_id] = 0.0
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 40 pts! Moving SL to Breakeven (0 loss).", flush=True)
                 
-                active_sl_limit = -60.0
-                lvl = last_trailing_level.get(p_id, 0)
-                if lvl == 30:
-                    active_sl_limit = 0.0
-                elif lvl == 50:
-                    active_sl_limit = 25.0
-                
+                # Check if current profit falls below the active trailing stop limit
+                active_sl_limit = last_trailing_level.get(p_id, -60.0)
                 if profit_points <= active_sl_limit:
-                    print(f"--> STOP LOSS / TRAILING HIT! Closing {symbol} position.", flush=True)
+                    print(f"--> STOP LOSS / DYNAMIC TRAILING HIT! Closing {symbol} safely at profit level {active_sl_limit}.", flush=True)
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
             
             if not has_position:
                 if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
-                    print(f"[{symbol}] In Cooldown Period...", flush=True)
                     continue
             
             ema_diff = abs(ema_fast - ema_slow)
@@ -275,13 +263,13 @@ while True:
             
             if has_position:
                 if pos_side == "sell" and is_uptrend:
-                    print(f"--> TREND SHIFT BUY: Closing SELL and buying {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif pos_side == "buy" and is_downtrend:
-                    print(f"--> TREND SHIFT SELL: Closing BUY and selling {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
@@ -298,3 +286,4 @@ while True:
         print(f"Error in main loop: {e}", flush=True)
                 
     time.sleep(10)
+u
