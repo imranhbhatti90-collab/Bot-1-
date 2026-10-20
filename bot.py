@@ -62,25 +62,26 @@ def get_target_product_info():
         print("Error fetching products info:", e, flush=True)
     return product_info
 
-def get_historical_candles(product_id):
+def get_historical_candles(symbol):
     try:
-        url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=50"
+        end_time = int(time.time())
+        start_time = end_time - (6 * 3600)  # Last 6 hours of 5m candles
+        url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=5m&start={start_time}&end={end_time}"
         response = requests.get(url, timeout=10)
         data = response.json()
         
-        # Debug print to check what API is returning
-        print(f"[DEBUG Candles API] Product {product_id} Response Status: {response.status_code}", flush=True)
+        print(f"[DEBUG Candles API] Symbol {symbol} Response Status: {response.status_code}", flush=True)
         
         candles = data.get('result', [])
         if not candles:
-            print(f"[WARNING] No candles returned from API for product {product_id}. Raw data: {data}", flush=True)
+            print(f"[WARNING] No candles returned from API for {symbol}. Raw data: {data}", flush=True)
             return []
             
         candles = sorted(candles, key=lambda x: x.get('time', 0))
         closes = [float(c['close']) for c in candles if 'close' in c]
         return closes
     except Exception as e:
-        print(f"Error fetching 5m candles for product {product_id}: {e}", flush=True)
+        print(f"Error fetching 5m candles for {symbol}: {e}", flush=True)
     return []
 
 def get_open_positions():
@@ -205,7 +206,7 @@ while True:
             p_id = info["id"]
             trade_size = info["min_size"]
             
-            closes = get_historical_candles(p_id)
+            closes = get_historical_candles(symbol)
             print(f"[{symbol}] Total Candles Fetched: {len(closes)}", flush=True)
             
             if len(closes) < 25:
