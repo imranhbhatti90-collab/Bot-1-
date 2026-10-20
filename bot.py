@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Fixed Trailing Scalping Bot is running!")
+        self.wfile.write(b"Secure Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Fixed Bot Server Started & Port 10000 Bound...", flush=True)
+print("Secure Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,7 +32,7 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_close_time = 0
-COOLDOWN_SECONDS = 15
+COOLDOWN_SECONDS = 30
 last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -162,6 +162,12 @@ def close_position(product_id, symbol, current_side, size):
         print(f"Failed to close position for {symbol}: {e}", flush=True)
 
 def execute_order(product_id, symbol, side, size, entry_price):
+    # Double check open positions right before executing to prevent spamming
+    current_active_positions = get_open_positions()
+    if product_id in current_active_positions:
+        print(f"--> SAFETY BLOCK: Position already active for {symbol}. Skipping new order execution.", flush=True)
+        return
+
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
@@ -185,7 +191,7 @@ def execute_order(product_id, symbol, side, size, entry_price):
     }
     
     try:
-        print(f"[Executing] Sending pure {side.upper()} order for {symbol} (Size: {size}) with Internal Dynamic Trailing...", flush=True)
+        print(f"[Executing] Sending pure {side.upper()} order for {symbol} (Size: {size})...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
     except Exception as e:
@@ -202,7 +208,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Fixed Dynamic Trailing Bot Running...", flush=True)
+print("Secure Trailing Bot Running...", flush=True)
 
 while True:
     try:
@@ -247,42 +253,39 @@ while True:
                 close_position(p_id, symbol, pos_side, pos_info["size"])
                 continue
 
-        # SECOND: Check candles for EMA Crossover Signals
-        for symbol, info in product_data.items():
-            p_id = info["id"]
-            trade_size = info["min_size"]
-            
-            # If position is already open for this product, skip opening a new one!
-            if p_id in open_positions:
-                continue
+        # SECOND: Check candles for EMA Crossover Signals (Only if NO position is active)
+        if len(open_positions) == 0:
+            for symbol, info in product_data.items():
+                p_id = info["id"]
+                trade_size = info["min_size"]
                 
-            closes = get_historical_candles(symbol)
-            if len(closes) < 25:
-                continue
+                closes = get_historical_candles(symbol)
+                if len(closes) < 25:
+                    continue
+                    
+                current_price = closes[-1]
+                ema_fast = calculate_ema(closes, 8)
+                ema_slow = calculate_ema(closes, 21)
                 
-            current_price = closes[-1]
-            ema_fast = calculate_ema(closes, 8)
-            ema_slow = calculate_ema(closes, 21)
-            
-            if ema_fast is None or ema_slow is None:
-                continue
+                if ema_fast is None or ema_slow is None:
+                    continue
+                    
+                if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
+                    continue
                 
-            if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
-                continue
-            
-            ema_diff = abs(ema_fast - ema_slow)
-            min_gap_required = current_price * 0.00001
-            
-            is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
-            is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
-            
-            if is_uptrend:
-                print(f"--> INSTANT SIGNAL UPTREND: Executing BUY on {symbol}!", flush=True)
-                execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
+                ema_diff = abs(ema_fast - ema_slow)
+                min_gap_required = current_price * 0.00001
                 
-            elif is_downtrend:
-                print(f"--> INSTANT SIGNAL DOWNTREND: Executing SELL on {symbol}!", flush=True)
-                execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
+                is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
+                is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
+                
+                if is_uptrend:
+                    print(f"--> INSTANT SIGNAL UPTREND: Executing BUY on {symbol}!", flush=True)
+                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
+                    
+                elif is_downtrend:
+                    print(f"--> INSTANT SIGNAL DOWNTREND: Executing SELL on {symbol}!", flush=True)
+                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
