@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Dynamic Pure Internal Trailing Bot is running!")
+        self.wfile.write(b"Fixed Trailing Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Dynamic Trailing Bot Server Started & Port 10000 Bound...", flush=True)
+print("Fixed Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -53,7 +53,7 @@ def get_target_product_info():
         for product in data.get('result', []):
             symbol = product.get('symbol')
             if symbol in TARGET_COINS:
-                p_id = product.get('id')
+                p_id = str(product.get('id'))
                 product_info[symbol] = {
                     "id": p_id,
                     "min_size": 40.0
@@ -113,7 +113,8 @@ def get_open_positions():
         positions = {}
         for pos in data.get('result', []):
             if float(pos.get('size', 0)) != 0:
-                positions[pos.get('product_id')] = {
+                p_id = str(pos.get('product_id'))
+                positions[p_id] = {
                     "symbol": pos.get('product_symbol', 'BTCUSD'),
                     "side": pos.get('side'),
                     "size": float(pos.get('size')),
@@ -132,7 +133,7 @@ def close_position(product_id, symbol, current_side, size):
     timestamp = str(int(time.time()))
     
     payload_data = {
-        "product_id": product_id,
+        "product_id": int(product_id),
         "size": int(size),
         "side": side,
         "order_type": "market_order",
@@ -165,9 +166,8 @@ def execute_order(product_id, symbol, side, size, entry_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    # Pure market order execution without fixed exchange stop loss to allow full bot trailing control
     payload_data = {
-        "product_id": product_id,
+        "product_id": int(product_id),
         "size": int(size),
         "side": side,
         "order_type": "market_order"
@@ -202,13 +202,13 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Dynamic Internal Trailing Bot Running...", flush=True)
+print("Fixed Dynamic Trailing Bot Running...", flush=True)
 
 while True:
     try:
         open_positions = get_open_positions()
         
-        # FIRST: Real-time price tracking for dynamic trailing stop loss & maximum profit protection
+        # FIRST: Real-time price tracking & dynamic trailing stop loss
         for p_id, pos_info in open_positions.items():
             symbol = pos_info["symbol"]
             pos_side = pos_info["side"]
@@ -228,7 +228,6 @@ while True:
             
             current_level = last_trailing_level.get(p_id, -60.0)
             
-            # Dynamic Trailing Milestones
             if profit_points >= 600.0 and current_level < 550.0:
                 last_trailing_level[p_id] = 550.0
                 print(f"--> DYNAMIC TRAIL: Profit crossed 600 pts! Locking SL at +550 pts profit.", flush=True)
@@ -253,6 +252,10 @@ while True:
             p_id = info["id"]
             trade_size = info["min_size"]
             
+            # If position is already open for this product, skip opening a new one!
+            if p_id in open_positions:
+                continue
+                
             closes = get_historical_candles(symbol)
             if len(closes) < 25:
                 continue
@@ -264,12 +267,8 @@ while True:
             if ema_fast is None or ema_slow is None:
                 continue
                 
-            has_position = p_id in open_positions
-            pos_side = open_positions[p_id]["side"] if has_position else None
-            
-            if not has_position:
-                if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
-                    continue
+            if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
+                continue
             
             ema_diff = abs(ema_fast - ema_slow)
             min_gap_required = current_price * 0.00001
@@ -277,26 +276,13 @@ while True:
             is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
             is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
             
-            if has_position:
-                if pos_side == "sell" and is_uptrend:
-                    print(f"--> INSTANT TREND SHIFT BUY: Closing SELL and buying {symbol}!", flush=True)
-                    close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
-                    time.sleep(1)
-                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
-                    
-                elif pos_side == "buy" and is_downtrend:
-                    print(f"--> INSTANT TREND SHIFT SELL: Closing BUY and selling {symbol}!", flush=True)
-                    close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
-                    time.sleep(1)
-                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
-            else:
-                if is_uptrend:
-                    print(f"--> INSTANT SIGNAL UPTREND: Executing BUY on {symbol}!", flush=True)
-                    execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
-                    
-                elif is_downtrend:
-                    print(f"--> INSTANT SIGNAL DOWNTREND: Executing SELL on {symbol}!", flush=True)
-                    execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
+            if is_uptrend:
+                print(f"--> INSTANT SIGNAL UPTREND: Executing BUY on {symbol}!", flush=True)
+                execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
+                
+            elif is_downtrend:
+                print(f"--> INSTANT SIGNAL DOWNTREND: Executing SELL on {symbol}!", flush=True)
+                execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
