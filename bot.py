@@ -67,7 +67,15 @@ def get_historical_candles(product_id):
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=50"
         response = requests.get(url, timeout=10)
         data = response.json()
+        
+        # Debug print to check what API is returning
+        print(f"[DEBUG Candles API] Product {product_id} Response Status: {response.status_code}", flush=True)
+        
         candles = data.get('result', [])
+        if not candles:
+            print(f"[WARNING] No candles returned from API for product {product_id}. Raw data: {data}", flush=True)
+            return []
+            
         candles = sorted(candles, key=lambda x: x.get('time', 0))
         closes = [float(c['close']) for c in candles if 'close' in c]
         return closes
@@ -186,10 +194,11 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Always-Active TradingView 5m Bot Running...", flush=True)
+print("Always-Active TradingView 5m Bot Running & Entering Main Loop...", flush=True)
 
 while True:
     try:
+        print("[Loop Check] Fetching positions and candles...", flush=True)
         open_positions = get_open_positions()
         
         for symbol, info in product_data.items():
@@ -197,7 +206,10 @@ while True:
             trade_size = info["min_size"]
             
             closes = get_historical_candles(p_id)
+            print(f"[{symbol}] Total Candles Fetched: {len(closes)}", flush=True)
+            
             if len(closes) < 25:
+                print(f"[{symbol}] Waiting for more candles (Got {len(closes)}/25 needed)...", flush=True)
                 time.sleep(10)
                 continue
                 
@@ -209,7 +221,7 @@ while True:
             if ema_fast is None or ema_slow is None:
                 continue
                 
-            print(f"[{symbol}] 5m Candle Close: {current_price} | FastEMA(8): {round(ema_fast, 2)} | SlowEMA(21): {round(ema_slow, 2)}", flush=True)
+            print(f"[{symbol}] 5m Close: {current_price} | Fast(8): {round(ema_fast, 2)} | Slow(21): {round(ema_slow, 2)}", flush=True)
                 
             has_position = p_id in open_positions
             pos_side = open_positions[p_id]["side"] if has_position else None
@@ -222,7 +234,7 @@ while True:
                 elif pos_side == "sell":
                     profit_points = entry_price - current_price
                 
-                print(f"[{symbol}] Active {pos_side.upper()} | Entry: {entry_price} | PnL Points: {round(profit_points, 2)}", flush=True)
+                print(f"[{symbol}] Active {pos_side.upper()} | Entry: {entry_price} | PnL: {round(profit_points, 2)} pts", flush=True)
                 
                 if profit_points >= 60.0:
                     print(f"--> TARGET REACHED (+60 Points)! Taking profit on {symbol}.", flush=True)
@@ -235,7 +247,7 @@ while True:
                     print(f"--> TRAILING UPGRADE: Locking profit at level 50 pts!", flush=True)
                 elif profit_points >= 30.0 and current_level < 30:
                     last_trailing_level[p_id] = 30
-                    print(f"--> TRAILING UPGRADE: Moving SL to Breakeven (0 loss)!", flush=True)
+                    print(f"--> TRAILING UPGRADE: Moving SL to Breakeven!", flush=True)
                 
                 active_sl_limit = -60.0
                 lvl = last_trailing_level.get(p_id, 0)
@@ -245,41 +257,40 @@ while True:
                     active_sl_limit = 25.0
                 
                 if profit_points <= active_sl_limit:
-                    print(f"--> TRAILING STOP / LOSS HIT! Closing {symbol} position safely.", flush=True)
+                    print(f"--> STOP LOSS / TRAILING HIT! Closing {symbol} position.", flush=True)
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
             
             if not has_position:
                 if time.time() - last_trade_close_time < COOLDOWN_SECONDS:
-                    print(f"[{symbol}] In Cooldown Period. Waiting...", flush=True)
+                    print(f"[{symbol}] In Cooldown Period...", flush=True)
                     continue
             
-            # Optimized filter to ensure signals are captured cleanly
             ema_diff = abs(ema_fast - ema_slow)
-            min_gap_required = current_price * 0.00008  # Balanced sensitivity
+            min_gap_required = current_price * 0.00008
             
             is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
             is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
             
             if has_position:
                 if pos_side == "sell" and is_uptrend:
-                    print(f"--> CHART TREND SHIFT TO BUY: Closing SELL and taking BUY on {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT BUY: Closing SELL and buying {symbol}!", flush=True)
                     close_position(p_id, symbol, "sell", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif pos_side == "buy" and is_downtrend:
-                    print(f"--> CHART TREND SHIFT TO SELL: Closing BUY and taking SELL on {symbol}!", flush=True)
+                    print(f"--> TREND SHIFT SELL: Closing BUY and selling {symbol}!", flush=True)
                     close_position(p_id, symbol, "buy", open_positions[p_id]["size"])
                     time.sleep(2)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
             else:
                 if is_uptrend:
-                    print(f"--> CHART UPTREND SIGNAL: Executing BUY on {symbol}!", flush=True)
+                    print(f"--> SIGNAL UPTREND: Executing BUY on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size, entry_price=current_price)
                     
                 elif is_downtrend:
-                    print(f"--> CHART DOWNTREND SIGNAL: Executing SELL on {symbol}!", flush=True)
+                    print(f"--> SIGNAL DOWNTREND: Executing SELL on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size, entry_price=current_price)
                     
     except Exception as e:
