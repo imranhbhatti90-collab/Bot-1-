@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"TradingView 5m Candle EMA Scalping Bot is running!")
+        self.wfile.write(b"Always-Active TradingView 5m EMA Scalping Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("TradingView 5m Candle EMA Scalping Bot Started & Port 10000 Bound...", flush=True)
+print("Always-Active Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,7 +32,7 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_close_time = 0
-COOLDOWN_SECONDS = 60
+COOLDOWN_SECONDS = 30
 last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -64,12 +64,10 @@ def get_target_product_info():
 
 def get_historical_candles(product_id):
     try:
-        # Fetching 5-minute candles matching TradingView setup
         url = f"{BASE_URL}/v2/history/candles?product_id={product_id}&resolution=5m&limit=50"
         response = requests.get(url, timeout=10)
         data = response.json()
         candles = data.get('result', [])
-        # Sort candles by time ascending
         candles = sorted(candles, key=lambda x: x.get('time', 0))
         closes = [float(c['close']) for c in candles if 'close' in c]
         return closes
@@ -188,7 +186,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("TradingView 5m Candle Bot Active...", flush=True)
+print("Always-Active TradingView 5m Bot Running...", flush=True)
 
 while True:
     try:
@@ -205,7 +203,6 @@ while True:
                 
             current_price = closes[-1]
             
-            # 5-minute Chart EMAs (Fast EMA 8, Slow EMA 21)
             ema_fast = calculate_ema(closes, 8)
             ema_slow = calculate_ema(closes, 21)
             
@@ -232,7 +229,6 @@ while True:
                     close_position(p_id, symbol, pos_side, open_positions[p_id]["size"])
                     continue
                 
-                # Trailing SL internal checks
                 current_level = last_trailing_level.get(p_id, 0)
                 if profit_points >= 50.0 and current_level < 50:
                     last_trailing_level[p_id] = 50
@@ -258,8 +254,9 @@ while True:
                     print(f"[{symbol}] In Cooldown Period. Waiting...", flush=True)
                     continue
             
+            # Optimized filter to ensure signals are captured cleanly
             ema_diff = abs(ema_fast - ema_slow)
-            min_gap_required = current_price * 0.00015
+            min_gap_required = current_price * 0.00008  # Balanced sensitivity
             
             is_uptrend = (ema_fast > ema_slow) and (ema_diff > min_gap_required)
             is_downtrend = (ema_fast < ema_slow) and (ema_diff > min_gap_required)
@@ -288,4 +285,4 @@ while True:
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
-    time.sleep(15)  # Check every 15 seconds matching 5m candle pacing
+    time.sleep(10)
