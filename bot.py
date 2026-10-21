@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Fixed Schema Native SL & TP Bot is running!")
+        self.wfile.write(b"Built-in Bracket SL & TP Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Fixed Schema Bot Server Started & Port 10000 Bound...", flush=True)
+print("Bracket Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -136,43 +136,7 @@ def get_open_positions():
         print("Error fetching positions:", e, flush=True)
     return {}
 
-def place_native_order(product_id, size, side, order_type, limit_price=None, stop_price=None):
-    path = '/v2/orders'
-    method = 'POST'
-    timestamp = str(int(time.time()))
-    
-    payload_data = {
-        "product_id": int(product_id),
-        "size": int(size),
-        "side": side,
-        "order_type": order_type,
-        "reduce_only": True
-    }
-    if limit_price:
-        payload_data["limit_price"] = round(limit_price, 1)
-    if stop_price:
-        payload_data["stop_price"] = round(stop_price, 1)
-        
-    payload = json.dumps(payload_data)
-    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
-    
-    req_headers = {
-        'api-key': API_KEY,
-        'timestamp': timestamp,
-        'signature': signature,
-        'User-Agent': 'python-rest-client',
-        'Content-Type': 'application/json'
-    }
-    
-    try:
-        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        print(f"[ORDER {order_type.upper()}] Status: {response.status_code} | Body: {response.text}", flush=True)
-        return response.status_code == 200
-    except Exception as e:
-        print(f"Failed to place {order_type}: {e}", flush=True)
-        return False
-
-def execute_trade_with_fixed_risk(product_id, symbol, side, size, current_price):
+def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
     global last_trade_attempt_time
     
     available_usd = get_account_balance()
@@ -183,21 +147,22 @@ def execute_trade_with_fixed_risk(product_id, symbol, side, size, current_price)
     if side == "buy":
         sl_price = current_price - 50.0
         tp_price = current_price + 100.0
-        exit_side = "sell"
     else:
         sl_price = current_price + 50.0
         tp_price = current_price - 100.0
-        exit_side = "buy"
 
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
     
+    # Passing Stop-Loss and Take-Profit directly inside the Market Order payload
     payload_data = {
         "product_id": int(product_id),
         "size": int(size),
         "side": side,
-        "order_type": "market_order"
+        "order_type": "market_order",
+        "bracket_stop_loss_price": round(sl_price, 1),
+        "bracket_take_profit_price": round(tp_price, 1)
     }
     
     payload = json.dumps(payload_data)
@@ -212,16 +177,9 @@ def execute_trade_with_fixed_risk(product_id, symbol, side, size, current_price)
     }
     
     try:
-        print(f"[Execution] Placing Market {side.upper()} order for {symbol} at {current_price}...", flush=True)
+        print(f"[Execution] Placing Market {side.upper()} order with built-in Bracket SL/TP for {symbol} at {current_price}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        print(f"[MARKET ENTRY] Status: {response.status_code} | Body: {response.text}", flush=True)
-        
-        if response.status_code == 200:
-            time.sleep(1)
-            # Correct order_type 'stop_order' and parameter 'limit_price'
-            place_native_order(product_id, size, exit_side, "stop_order", stop_price=sl_price)
-            place_native_order(product_id, size, exit_side, "limit_order", limit_price=tp_price)
-            
+        print(f"[BRACKET ENTRY RESPONSE] Status: {response.status_code} | Body: {response.text}", flush=True)
         last_trade_attempt_time = time.time()
     except Exception as e:
         print(f"Trade execution failed for {symbol}: {e}", flush=True)
@@ -237,14 +195,14 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("High-Speed Fixed Schema Bot Running...", flush=True)
+print("High-Speed Bracket Bot Running...", flush=True)
 
 while True:
     try:
         open_positions = get_open_positions()
         
         if len(open_positions) > 0:
-            print("Position active. Exchange server managing Fixed SL & TP...", flush=True)
+            print("Position active. Exchange server managing Bracket SL & TP...", flush=True)
             time.sleep(1)
             continue
 
@@ -272,12 +230,12 @@ while True:
             
             if is_strong_uptrend:
                 print(f"--> UPTREND DETECTED: Executing BUY on {symbol}!", flush=True)
-                execute_trade_with_fixed_risk(p_id, symbol, "buy", size=trade_size, current_price=current_price)
+                execute_trade_with_bracket(p_id, symbol, "buy", size=trade_size, current_price=current_price)
                 break
                 
             elif is_strong_downtrend:
                 print(f"--> DOWNTREND DETECTED: Executing SELL on {symbol}!", flush=True)
-                execute_trade_with_fixed_risk(p_id, symbol, "sell", size=trade_size, current_price=current_price)
+                execute_trade_with_bracket(p_id, symbol, "sell", size=trade_size, current_price=current_price)
                 break
                     
     except Exception as e:
