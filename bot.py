@@ -216,7 +216,6 @@ def execute_order_with_native_sl(product_id, symbol, side, size, current_price):
         print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
         return
 
-    # Initial Stop Loss (40 points away)
     if side == "buy":
         sl_price = current_price - 40.0
         exit_side = "sell"
@@ -270,64 +269,59 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Native Server-Side Trailing SL Bot Running...", flush=True)
+print("Native Server-Side Trailing SL Bot Running (Fixed Scope)...", flush=True)
 
 while True:
     try:
         open_positions = get_open_positions()
         
-        # ACTIVE POSITION MANAGEMENT & TRAILING STOP LOSS
-        for p_id, pos_info in open_positions.items():
-            symbol = pos_info["symbol"]
-            pos_side = pos_info["side"]
-            entry_price = pos_info["entry_price"]
-            size = pos_info["size"]
-            
-            market_data = get_live_market_data(symbol)
-            if not market_data:
-                continue
-            live_price = market_data["mark_price"]
+        if len(open_positions) > 0:
+            for p_id, pos_info in open_positions.items():
+                symbol = pos_info["symbol"]
+                pos_side = pos_info["side"]
+                entry_price = pos_info["entry_price"]
+                size = pos_info["size"]
                 
-            profit_points = 0
-            if pos_side == "buy":
-                profit_points = live_price - entry_price
-            elif pos_side == "sell":
-                profit_points = entry_price - live_price
-            
-            print(f"[{symbol}] LIVE TRAIL CHECK -> Side: {pos_side.upper()} | Entry: {entry_price} | Live: {live_price} | PnL: {round(profit_points, 2)} pts", flush=True)
-            
-            current_level = last_trailing_level.get(p_id, -40.0)
-            new_target_sl = None
-            exit_side = "sell" if pos_side == "buy" else "buy"
-            
-            # Dynamic Trailing Logic levels
-            if profit_points >= 600.0 and current_level < 550.0:
-                last_trailing_level[p_id] = 550.0
-                new_target_sl = (entry_price + 550.0) if pos_side == "buy" else (entry_price - 550.0)
-                print(f"--> DYNAMIC TRAIL: Profit crossed 600! Moving SL to +550.", flush=True)
-            elif profit_points >= 200.0 and current_level < 150.0:
-                last_trailing_level[p_id] = 150.0
-                new_target_sl = (entry_price + 150.0) if pos_side == "buy" else (entry_price - 150.0)
-                print(f"--> DYNAMIC TRAIL: Profit crossed 200! Moving SL to +150.", flush=True)
-            elif profit_points >= 100.0 and current_level < 50.0:
-                last_trailing_level[p_id] = 50.0
-                new_target_sl = (entry_price + 50.0) if pos_side == "buy" else (entry_price - 50.0)
-                print(f"--> DYNAMIC TRAIL: Profit crossed 100! Moving SL to +50.", flush=True)
-            elif profit_points >= 40.0 and current_level < 0.0:
-                last_trailing_level[p_id] = 0.0
-                new_target_sl = entry_price # Breakeven
-                print(f"--> DYNAMIC TRAIL: Profit crossed 40! Moving SL to Breakeven.", flush=True)
-            
-            # If a new trailing milestone is reached, update the native stop-loss on exchange
-            if new_target_sl is not None:
-                if active_sl_order_id:
-                    cancel_order(active_sl_order_id, p_id)
-                active_sl_order_id = place_native_stop_loss(p_id, size, exit_side, new_target_sl)
-
-        # If no positions, look for new entries
-        if len(open_positions) == 0:
-            if p_id in last_trailing_level:
-                del last_trailing_level[p_id]
+                market_data = get_live_market_data(symbol)
+                if not market_data:
+                    continue
+                live_price = market_data["mark_price"]
+                    
+                profit_points = 0
+                if pos_side == "buy":
+                    profit_points = live_price - entry_price
+                elif pos_side == "sell":
+                    profit_points = entry_price - live_price
+                
+                print(f"[{symbol}] LIVE TRAIL CHECK -> Side: {pos_side.upper()} | Entry: {entry_price} | Live: {live_price} | PnL: {round(profit_points, 2)} pts", flush=True)
+                
+                current_level = last_trailing_level.get(p_id, -40.0)
+                new_target_sl = None
+                exit_side = "sell" if pos_side == "buy" else "buy"
+                
+                if profit_points >= 600.0 and current_level < 550.0:
+                    last_trailing_level[p_id] = 550.0
+                    new_target_sl = (entry_price + 550.0) if pos_side == "buy" else (entry_price - 550.0)
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 600! Moving SL to +550.", flush=True)
+                elif profit_points >= 200.0 and current_level < 150.0:
+                    last_trailing_level[p_id] = 150.0
+                    new_target_sl = (entry_price + 150.0) if pos_side == "buy" else (entry_price - 150.0)
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 200! Moving SL to +150.", flush=True)
+                elif profit_points >= 100.0 and current_level < 50.0:
+                    last_trailing_level[p_id] = 50.0
+                    new_target_sl = (entry_price + 50.0) if pos_side == "buy" else (entry_price - 50.0)
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 100! Moving SL to +50.", flush=True)
+                elif profit_points >= 40.0 and current_level < 0.0:
+                    last_trailing_level[p_id] = 0.0
+                    new_target_sl = entry_price 
+                    print(f"--> DYNAMIC TRAIL: Profit crossed 40! Moving SL to Breakeven.", flush=True)
+                
+                if new_target_sl is not None:
+                    if active_sl_order_id:
+                        cancel_order(active_sl_order_id, p_id)
+                    active_sl_order_id = place_native_stop_loss(p_id, size, exit_side, new_target_sl)
+        else:
+            last_trailing_level.clear()
             active_sl_order_id = None
             
             if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
