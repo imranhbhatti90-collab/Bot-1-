@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"High-Speed Fixed Native SL & TP Bot is running!")
+        self.wfile.write(b"Fixed Schema Native SL & TP Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("High-Speed Bot Server Started & Port 10000 Bound...", flush=True)
+print("Fixed Schema Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,7 +32,7 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_attempt_time = 0
-COOLDOWN_SECONDS = 1800  # 30 minutes strict gap for quality setups
+COOLDOWN_SECONDS = 1800
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -136,7 +136,7 @@ def get_open_positions():
         print("Error fetching positions:", e, flush=True)
     return {}
 
-def place_native_order(product_id, size, side, order_type, price=None, stop_price=None):
+def place_native_order(product_id, size, side, order_type, limit_price=None, stop_price=None):
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
@@ -146,10 +146,10 @@ def place_native_order(product_id, size, side, order_type, price=None, stop_pric
         "size": int(size),
         "side": side,
         "order_type": order_type,
-        "reduce_only": True if order_type in ["stop_market", "limit_order"] else False
+        "reduce_only": True
     }
-    if price:
-        payload_data["price"] = round(price, 1)
+    if limit_price:
+        payload_data["limit_price"] = round(limit_price, 1)
     if stop_price:
         payload_data["stop_price"] = round(stop_price, 1)
         
@@ -218,8 +218,9 @@ def execute_trade_with_fixed_risk(product_id, symbol, side, size, current_price)
         
         if response.status_code == 200:
             time.sleep(1)
-            place_native_order(product_id, size, exit_side, "stop_market", stop_price=sl_price)
-            place_native_order(product_id, size, exit_side, "limit_order", price=tp_price)
+            # Correct order_type 'stop_order' and parameter 'limit_price'
+            place_native_order(product_id, size, exit_side, "stop_order", stop_price=sl_price)
+            place_native_order(product_id, size, exit_side, "limit_order", limit_price=tp_price)
             
         last_trade_attempt_time = time.time()
     except Exception as e:
@@ -236,7 +237,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("High-Speed 1-Second Polling Bot Running...", flush=True)
+print("High-Speed Fixed Schema Bot Running...", flush=True)
 
 while True:
     try:
@@ -244,11 +245,11 @@ while True:
         
         if len(open_positions) > 0:
             print("Position active. Exchange server managing Fixed SL & TP...", flush=True)
-            time.sleep(1)  # Fast check interval
+            time.sleep(1)
             continue
 
         if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
-            time.sleep(1)  # Fast check interval during cooldown
+            time.sleep(1)
             continue
 
         for symbol, info in product_data.items():
@@ -282,4 +283,4 @@ while True:
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
-    time.sleep(1)  # Loop speed set to 1 second
+    time.sleep(1)
