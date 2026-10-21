@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bulletproof Trend Scalping Bot is running!")
+        self.wfile.write(b"Smart Pro-Momentum Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Bulletproof Bot Server Started & Port 10000 Bound...", flush=True)
+print("Smart Momentum Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,7 +32,7 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_attempt_time = 0
-COOLDOWN_SECONDS = 900  # 15 minutes strict anti-spam gap
+COOLDOWN_SECONDS = 3600  # 1 hour strict gap so bot waits for the absolute best setup!
 last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -79,8 +79,8 @@ def get_live_market_data(symbol):
 def get_historical_candles(symbol):
     try:
         end_time = int(time.time())
-        start_time = end_time - (6 * 3600)
-        url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=5m&start={start_time}&end={end_time}"
+        start_time = end_time - (12 * 3600) # Look back 12 hours for solid trend data
+        url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=15m&start={start_time}&end={end_time}"
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -92,7 +92,7 @@ def get_historical_candles(symbol):
         closes = [float(c['close']) for c in candles if 'close' in c]
         return closes
     except Exception as e:
-        print(f"Error fetching 5m candles for {symbol}: {e}", flush=True)
+        print(f"Error fetching candles for {symbol}: {e}", flush=True)
     return []
 
 def get_account_balance():
@@ -217,7 +217,7 @@ def execute_order(product_id, symbol, side, size):
     }
     
     try:
-        print(f"[Execution] Sending {side.upper()} order for {symbol} (Size: {size})...", flush=True)
+        print(f"[Execution] Sending high-conviction {side.upper()} order for {symbol} (Size: {size})...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
         last_trade_attempt_time = time.time()
@@ -235,7 +235,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Bulletproof Trend-Following Bot Running...", flush=True)
+print("Smart Pro-Momentum Bot Running (1-Hour Cooldown Filter Active)...", flush=True)
 
 while True:
     try:
@@ -281,10 +281,10 @@ while True:
                 close_position(p_id, symbol, pos_side, pos_info["size"])
                 continue
 
-        # SECOND: Strict Trend-Following Entry (No trading against the market)
+        # SECOND: High-Conviction 15m Trend-Following Entry (Strict Filtering)
         if len(open_positions) == 0:
             if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
-                time.sleep(10)
+                time.sleep(15)
                 continue
 
             for symbol, info in product_data.items():
@@ -292,33 +292,31 @@ while True:
                 trade_size = info["min_size"]
                 
                 closes = get_historical_candles(symbol)
-                if len(closes) < 25:
+                if len(closes) < 30:
                     continue
                     
                 current_price = closes[-1]
-                ema_fast = calculate_ema(closes, 8)
-                ema_slow = calculate_ema(closes, 21)
+                ema_fast = calculate_ema(closes, 12) # 12 Period on 15m chart
+                ema_slow = calculate_ema(closes, 26) # 26 Period on 15m chart
                 
                 if ema_fast is None or ema_slow is None:
                     continue
                 
-                # Strict Directional Trend Filters
-                # BUY only if Fast EMA > Slow EMA AND current price is above Fast EMA
-                is_strict_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
-                # SELL only if Fast EMA < Slow EMA AND current price is below Fast EMA
-                is_strict_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
+                # High-Conviction Filters (Bade Trend par hi trade milegi)
+                is_strong_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
+                is_strong_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
                 
-                if is_strict_uptrend:
-                    print(f"--> STRICT UPTREND CONFIRMED: Executing BUY on {symbol}!", flush=True)
+                if is_strong_uptrend:
+                    print(f"--> HIGH-CONVICTION UPTREND: Executing BUY on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "buy", size=trade_size)
                     break
                     
-                elif is_strict_downtrend:
-                    print(f"--> STRICT DOWNTREND CONFIRMED: Executing SELL on {symbol}!", flush=True)
+                elif is_strong_downtrend:
+                    print(f"--> HIGH-CONVICTION DOWNTREND: Executing SELL on {symbol}!", flush=True)
                     execute_order(p_id, symbol, "sell", size=trade_size)
                     break
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
                 
-    time.sleep(10)
+    time.sleep(15)
