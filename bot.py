@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Built-in Bracket SL & TP Bot is running!")
+        self.wfile.write(b"Dynamic Trailing Bracket Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Bracket Bot Server Started & Port 10000 Bound...", flush=True)
+print("Dynamic Trailing Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -33,6 +33,7 @@ TARGET_COINS = ['BTCUSD']
 
 last_trade_attempt_time = 0
 COOLDOWN_SECONDS = 1800
+last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -61,6 +62,20 @@ def get_target_product_info():
         print("Error fetching products info:", e, flush=True)
     return product_info
 
+def get_live_market_data(symbol):
+    try:
+        url = f"{BASE_URL}/v2/tickers"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        for ticker in data.get('result', []):
+            if ticker.get('symbol') == symbol:
+                return {
+                    "mark_price": float(ticker.get('mark_price', ticker.get('close', 0)))
+                }
+    except Exception as e:
+        print(f"Error fetching live market data: {e}", flush=True)
+    return None
+
 def get_historical_candles(symbol):
     try:
         end_time = int(time.time())
@@ -77,7 +92,7 @@ def get_historical_candles(symbol):
         closes = [float(c['close']) for c in candles if 'close' in c]
         return closes
     except Exception as e:
-        print(f"Error fetching candles for {symbol}: {e}", flush=True)
+        print(f"Error fetching candles: {e}", flush=True)
     return []
 
 def get_account_balance():
@@ -101,7 +116,7 @@ def get_account_balance():
             if asset.get('asset_symbol') == 'USD':
                 return float(asset.get('available_balance', 0))
     except Exception as e:
-        print("Error fetching account balance:", e, flush=True)
+        print("Error fetching balance:", e, flush=True)
     return 0.0
 
 def get_open_positions():
@@ -136,6 +151,83 @@ def get_open_positions():
         print("Error fetching positions:", e, flush=True)
     return {}
 
+def get_open_orders(product_id):
+    path = f'/v2/orders?product_id={product_id}&state=open'
+    method = 'GET'
+    timestamp = str(int(time.time()))
+    signature = generate_signature(API_SECRET, method, timestamp, '/v2/orders', f'product_id={product_id}&state=open', '')
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    try:
+        response = requests.get(BASE_URL + path, headers=req_headers, timeout=10)
+        data = response.json()
+        return data.get('result', [])
+    except Exception as e:
+        print(f"Failed to fetch open orders: {e}", flush=True)
+    return []
+
+def cancel_order(order_id, product_id):
+    if not order_id:
+        return
+    path = f'/v2/orders?order_id={order_id}&product_id={product_id}'
+    method = 'DELETE'
+    timestamp = str(int(time.time()))
+    signature = generate_signature(API_SECRET, method, timestamp, '/v2/orders', f'order_id={order_id}&product_id={product_id}', '')
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    try:
+        response = requests.delete(BASE_URL + path, headers=req_headers, timeout=10)
+        print(f"[CANCEL ORDER] ID {order_id} -> Status: {response.status_code}", flush=True)
+    except Exception as e:
+        print(f"Failed to cancel order: {e}", flush=True)
+
+def place_new_stop_loss(product_id, size, exit_side, sl_price):
+    path = '/v2/orders'
+    method = 'POST'
+    timestamp = str(int(time.time()))
+    
+    payload_data = {
+        "product_id": int(product_id),
+        "size": int(size),
+        "side": exit_side,
+        "order_type": "stop_order",
+        "stop_price": round(sl_price, 1),
+        "reduce_only": True
+    }
+    
+    payload = json.dumps(payload_data)
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
+        data = response.json()
+        print(f"[NEW TRAILED SL] Placed at {round(sl_price, 1)} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+        if data.get('success'):
+            return data.get('result', {}).get('id')
+    except Exception as e:
+        print(f"Failed to place new stop loss: {e}", flush=True)
+    return None
+
 def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
     global last_trade_attempt_time
     
@@ -155,7 +247,6 @@ def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    # Passing Stop-Loss and Take-Profit directly inside the Market Order payload
     payload_data = {
         "product_id": int(product_id),
         "size": int(size),
@@ -177,12 +268,12 @@ def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
     }
     
     try:
-        print(f"[Execution] Placing Market {side.upper()} order with built-in Bracket SL/TP for {symbol} at {current_price}...", flush=True)
+        print(f"[Execution] Placing Market {side.upper()} order with Bracket for {symbol} at {current_price}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[BRACKET ENTRY RESPONSE] Status: {response.status_code} | Body: {response.text}", flush=True)
         last_trade_attempt_time = time.time()
     except Exception as e:
-        print(f"Trade execution failed for {symbol}: {e}", flush=True)
+        print(f"Trade execution failed: {e}", flush=True)
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -195,48 +286,93 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("High-Speed Bracket Bot Running...", flush=True)
+print("Dynamic Trailing Bracket Bot Running...", flush=True)
 
 while True:
     try:
         open_positions = get_open_positions()
         
         if len(open_positions) > 0:
-            print("Position active. Exchange server managing Bracket SL & TP...", flush=True)
-            time.sleep(1)
-            continue
-
-        if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
-            time.sleep(1)
-            continue
-
-        for symbol, info in product_data.items():
-            p_id = info["id"]
-            trade_size = info["min_size"]
-            
-            closes = get_historical_candles(symbol)
-            if len(closes) < 30:
-                continue
+            for p_id, pos_info in open_positions.items():
+                symbol = pos_info["symbol"]
+                pos_side = pos_info["side"]
+                entry_price = pos_info["entry_price"]
+                size = pos_info["size"]
                 
-            current_price = closes[-1]
-            ema_fast = calculate_ema(closes, 12)
-            ema_slow = calculate_ema(closes, 26)
-            
-            if ema_fast is None or ema_slow is None:
-                continue
-            
-            is_strong_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
-            is_strong_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
-            
-            if is_strong_uptrend:
-                print(f"--> UPTREND DETECTED: Executing BUY on {symbol}!", flush=True)
-                execute_trade_with_bracket(p_id, symbol, "buy", size=trade_size, current_price=current_price)
-                break
+                market_data = get_live_market_data(symbol)
+                if not market_data:
+                    continue
+                live_price = market_data["mark_price"]
                 
-            elif is_strong_downtrend:
-                print(f"--> DOWNTREND DETECTED: Executing SELL on {symbol}!", flush=True)
-                execute_trade_with_bracket(p_id, symbol, "sell", size=trade_size, current_price=current_price)
-                break
+                profit_points = 0
+                if pos_side == "buy":
+                    profit_points = live_price - entry_price
+                elif pos_side == "sell":
+                    profit_points = entry_price - live_price
+                
+                print(f"[{symbol}] ACTIVE PnL CHECK -> Entry: {entry_price} | Live: {live_price} | Profit: {round(profit_points, 2)} pts", flush=True)
+                
+                current_level = last_trailing_level.get(p_id, -50.0)
+                new_target_sl = None
+                exit_side = "sell" if pos_side == "buy" else "buy"
+                
+                # Trailing milestones
+                if profit_points >= 200.0 and current_level < 150.0:
+                    last_trailing_level[p_id] = 150.0
+                    new_target_sl = (entry_price + 150.0) if pos_side == "buy" else (entry_price - 150.0)
+                    print(f"--> TRAILING: Profit reached 200 pts! Shifting SL to +150 pts.", flush=True)
+                elif profit_points >= 100.0 and current_level < 50.0:
+                    last_trailing_level[p_id] = 50.0
+                    new_target_sl = (entry_price + 50.0) if pos_side == "buy" else (entry_price - 50.0)
+                    print(f"--> TRAILING: Profit reached 100 pts! Shifting SL to +50 pts.", flush=True)
+                elif profit_points >= 50.0 and current_level < 0.0:
+                    last_trailing_level[p_id] = 0.0
+                    new_target_sl = entry_price  # Breakeven
+                    print(f"--> TRAILING: Profit reached 50 pts! Moving SL to Breakeven.", flush=True)
+                
+                if new_target_sl is not None:
+                    # Find and cancel the existing stop loss order from open orders
+                    open_orders = get_open_orders(p_id)
+                    for order in open_orders:
+                        if order.get('order_type') == 'stop_order' or order.get('stop_price'):
+                            cancel_order(order.get('id'), p_id)
+                    
+                    # Place the updated trailed stop loss
+                    place_new_stop_loss(p_id, size, exit_side, new_target_sl)
+        else:
+            last_trailing_level.clear()
+
+            if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
+                time.sleep(1)
+                continue
+
+            for symbol, info in product_data.items():
+                p_id = info["id"]
+                trade_size = info["min_size"]
+                
+                closes = get_historical_candles(symbol)
+                if len(closes) < 30:
+                    continue
+                    
+                current_price = closes[-1]
+                ema_fast = calculate_ema(closes, 12)
+                ema_slow = calculate_ema(closes, 26)
+                
+                if ema_fast is None or ema_slow is None:
+                    continue
+                
+                is_strong_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
+                is_strong_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
+                
+                if is_strong_uptrend:
+                    print(f"--> UPTREND DETECTED: Executing BUY on {symbol}!", flush=True)
+                    execute_trade_with_bracket(p_id, symbol, "buy", size=trade_size, current_price=current_price)
+                    break
+                    
+                elif is_strong_downtrend:
+                    print(f"--> DOWNTREND DETECTED: Executing SELL on {symbol}!", flush=True)
+                    execute_trade_with_bracket(p_id, symbol, "sell", size=trade_size, current_price=current_price)
+                    break
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
