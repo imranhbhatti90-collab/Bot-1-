@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Native Stop-Loss Bot is running!")
+        self.wfile.write(b"Native Trailing Stop-Loss Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Native SL Bot Server Started & Port 10000 Bound...", flush=True)
+print("Native Trailing SL Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,7 +32,9 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_attempt_time = 0
-COOLDOWN_SECONDS = 1800  # 30 minutes strict gap to ensure high quality setups
+COOLDOWN_SECONDS = 1800  # 30 minutes strict gap
+active_sl_order_id = None
+last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -150,30 +152,82 @@ def get_open_positions():
         print("Error fetching positions:", e, flush=True)
     return {}
 
+def cancel_order(order_id, product_id):
+    if not order_id:
+        return
+    path = f'/v2/orders?order_id={order_id}&product_id={product_id}'
+    method = 'DELETE'
+    timestamp = str(int(time.time()))
+    signature = generate_signature(API_SECRET, method, timestamp, '/v2/orders', f'order_id={order_id}&product_id={product_id}', '')
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    try:
+        response = requests.delete(BASE_URL + f'/v2/orders?order_id={order_id}&product_id={product_id}', headers=req_headers, timeout=10)
+        print(f"[CANCEL SL] Old SL {order_id} cancelled -> Status: {response.status_code}", flush=True)
+    except Exception as e:
+        print(f"Failed to cancel order: {e}", flush=True)
+
+def place_native_stop_loss(product_id, size, exit_side, sl_price):
+    path = '/v2/orders'
+    method = 'POST'
+    timestamp = str(int(time.time()))
+    
+    payload_data = {
+        "product_id": int(product_id),
+        "size": int(size),
+        "side": exit_side,
+        "order_type": "stop_market",
+        "stop_price": round(sl_price, 1),
+        "reduce_only": True
+    }
+    
+    payload = json.dumps(payload_data)
+    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
+    
+    req_headers = {
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'User-Agent': 'python-rest-client',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
+        data = response.json()
+        print(f"[NATIVE STOP-LOSS] Placed at {round(sl_price, 1)} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+        if data.get('success'):
+            return data.get('result', {}).get('id')
+    except Exception as e:
+        print(f"Failed to place native stop loss: {e}", flush=True)
+    return None
+
 def execute_order_with_native_sl(product_id, symbol, side, size, current_price):
-    global last_trade_attempt_time
+    global last_trade_attempt_time, active_sl_order_id
     
     available_usd = get_account_balance()
     if available_usd < 40.0:
         print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
         return
 
-    # Calculate strict native stop loss (e.g., 40 points away from entry)
-    stop_loss_distance = 40.0
+    # Initial Stop Loss (40 points away)
     if side == "buy":
-        sl_price = current_price - stop_loss_distance
-        tp_price = current_price + 100.0
+        sl_price = current_price - 40.0
         exit_side = "sell"
     else:
-        sl_price = current_price + stop_loss_distance
-        tp_price = current_price - 100.0
+        sl_price = current_price + 40.0
         exit_side = "buy"
 
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
     
-    # Main Market Order Payload
     payload_data = {
         "product_id": int(product_id),
         "size": int(size),
@@ -198,30 +252,8 @@ def execute_order_with_native_sl(product_id, symbol, side, size, current_price):
         print(f"[{side.upper()}] API ORDER RESPONSE -> Status: {response.status_code} | Body: {response.text}", flush=True)
         
         if response.status_code == 200:
-            # Immediately place a Native Server-Side Stop-Loss Order on Exchange
-            time.sleep(1) # short buffer for position registration
-            sl_payload_data = {
-                "product_id": int(product_id),
-                "size": int(size),
-                "side": exit_side,
-                "order_type": "stop_market",
-                "stop_price": round(sl_price, 1),
-                "reduce_only": True
-            }
-            sl_payload = json.dumps(sl_payload_data)
-            sl_timestamp = str(int(time.time()))
-            sl_signature = generate_signature(API_SECRET, 'POST', sl_timestamp, path, '', sl_payload)
-            
-            sl_headers = {
-                'api-key': API_KEY,
-                'timestamp': sl_timestamp,
-                'signature': sl_signature,
-                'User-Agent': 'python-rest-client',
-                'Content-Type': 'application/json'
-            }
-            
-            sl_response = requests.post(BASE_URL + path, headers=sl_headers, data=sl_payload, timeout=10)
-            print(f"[NATIVE STOP-LOSS] Placed at {round(sl_price, 1)} -> Status: {sl_response.status_code} | Body: {sl_response.text}", flush=True)
+            time.sleep(1)
+            active_sl_order_id = place_native_stop_loss(product_id, size, exit_side, sl_price)
             
         last_trade_attempt_time = time.time()
     except Exception as e:
@@ -238,50 +270,97 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Native Server-Side SL Bot Running...", flush=True)
+print("Native Server-Side Trailing SL Bot Running...", flush=True)
 
 while True:
     try:
         open_positions = get_open_positions()
         
-        # If position is open, let exchange handle the native stop loss completely.
-        if len(open_positions) > 0:
-            print("Active position found. Managing via Exchange Native Server-Side Stop-Loss...", flush=True)
-            time.sleep(20)
-            continue
-
-        # Look for New High-Conviction Entries
-        if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
-            time.sleep(15)
-            continue
-
-        for symbol, info in product_data.items():
-            p_id = info["id"]
-            trade_size = info["min_size"]
+        # ACTIVE POSITION MANAGEMENT & TRAILING STOP LOSS
+        for p_id, pos_info in open_positions.items():
+            symbol = pos_info["symbol"]
+            pos_side = pos_info["side"]
+            entry_price = pos_info["entry_price"]
+            size = pos_info["size"]
             
-            closes = get_historical_candles(symbol)
-            if len(closes) < 30:
+            market_data = get_live_market_data(symbol)
+            if not market_data:
                 continue
+            live_price = market_data["mark_price"]
                 
-            current_price = closes[-1]
-            ema_fast = calculate_ema(closes, 12)
-            ema_slow = calculate_ema(closes, 26)
+            profit_points = 0
+            if pos_side == "buy":
+                profit_points = live_price - entry_price
+            elif pos_side == "sell":
+                profit_points = entry_price - live_price
             
-            if ema_fast is None or ema_slow is None:
+            print(f"[{symbol}] LIVE TRAIL CHECK -> Side: {pos_side.upper()} | Entry: {entry_price} | Live: {live_price} | PnL: {round(profit_points, 2)} pts", flush=True)
+            
+            current_level = last_trailing_level.get(p_id, -40.0)
+            new_target_sl = None
+            exit_side = "sell" if pos_side == "buy" else "buy"
+            
+            # Dynamic Trailing Logic levels
+            if profit_points >= 600.0 and current_level < 550.0:
+                last_trailing_level[p_id] = 550.0
+                new_target_sl = (entry_price + 550.0) if pos_side == "buy" else (entry_price - 550.0)
+                print(f"--> DYNAMIC TRAIL: Profit crossed 600! Moving SL to +550.", flush=True)
+            elif profit_points >= 200.0 and current_level < 150.0:
+                last_trailing_level[p_id] = 150.0
+                new_target_sl = (entry_price + 150.0) if pos_side == "buy" else (entry_price - 150.0)
+                print(f"--> DYNAMIC TRAIL: Profit crossed 200! Moving SL to +150.", flush=True)
+            elif profit_points >= 100.0 and current_level < 50.0:
+                last_trailing_level[p_id] = 50.0
+                new_target_sl = (entry_price + 50.0) if pos_side == "buy" else (entry_price - 50.0)
+                print(f"--> DYNAMIC TRAIL: Profit crossed 100! Moving SL to +50.", flush=True)
+            elif profit_points >= 40.0 and current_level < 0.0:
+                last_trailing_level[p_id] = 0.0
+                new_target_sl = entry_price # Breakeven
+                print(f"--> DYNAMIC TRAIL: Profit crossed 40! Moving SL to Breakeven.", flush=True)
+            
+            # If a new trailing milestone is reached, update the native stop-loss on exchange
+            if new_target_sl is not None:
+                if active_sl_order_id:
+                    cancel_order(active_sl_order_id, p_id)
+                active_sl_order_id = place_native_stop_loss(p_id, size, exit_side, new_target_sl)
+
+        # If no positions, look for new entries
+        if len(open_positions) == 0:
+            if p_id in last_trailing_level:
+                del last_trailing_level[p_id]
+            active_sl_order_id = None
+            
+            if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
+                time.sleep(15)
                 continue
-            
-            is_strong_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
-            is_strong_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
-            
-            if is_strong_uptrend:
-                print(f"--> NATIVE SL UPTREND: Executing BUY on {symbol} at {current_price}!", flush=True)
-                execute_order_with_native_sl(p_id, symbol, "buy", size=trade_size, current_price=current_price)
-                break
+
+            for symbol, info in product_data.items():
+                p_id = info["id"]
+                trade_size = info["min_size"]
                 
-            elif is_strong_downtrend:
-                print(f"--> NATIVE SL DOWNTREND: Executing SELL on {symbol} at {current_price}!", flush=True)
-                execute_order_with_native_sl(p_id, symbol, "sell", size=trade_size, current_price=current_price)
-                break
+                closes = get_historical_candles(symbol)
+                if len(closes) < 30:
+                    continue
+                    
+                current_price = closes[-1]
+                ema_fast = calculate_ema(closes, 12)
+                ema_slow = calculate_ema(closes, 26)
+                
+                if ema_fast is None or ema_slow is None:
+                    continue
+                
+                is_strong_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
+                is_strong_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
+                
+                if is_strong_uptrend:
+                    print(f"--> NATIVE TRAILING UPTREND: Executing BUY on {symbol} at {current_price}!", flush=True)
+                    execute_order_with_native_sl(p_id, symbol, "buy", size=trade_size, current_price=current_price)
+                    break
+                    
+                elif is_strong_downtrend:
+                    print(f"--> NATIVE TRAILING DOWNTREND: Executing SELL on {symbol} at {current_price}!", flush=True)
+                    execute_order_with_native_sl(p_id, symbol, "sell", size=trade_size, current_price=current_price)
+                    break
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
