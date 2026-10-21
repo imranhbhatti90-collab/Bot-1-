@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Smart Pro-Momentum Bot is running!")
+        self.wfile.write(b"Native Stop-Loss Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Smart Momentum Bot Server Started & Port 10000 Bound...", flush=True)
+print("Native SL Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,8 +32,7 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_attempt_time = 0
-COOLDOWN_SECONDS = 3600  # 1 hour strict gap so bot waits for the absolute best setup!
-last_trailing_level = {}
+COOLDOWN_SECONDS = 1800  # 30 minutes strict gap to ensure high quality setups
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
     message = method + timestamp + path + query_string + payload
@@ -79,7 +78,7 @@ def get_live_market_data(symbol):
 def get_historical_candles(symbol):
     try:
         end_time = int(time.time())
-        start_time = end_time - (12 * 3600) # Look back 12 hours for solid trend data
+        start_time = end_time - (12 * 3600)
         url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=15m&start={start_time}&end={end_time}"
         response = requests.get(url, timeout=10)
         data = response.json()
@@ -151,42 +150,7 @@ def get_open_positions():
         print("Error fetching positions:", e, flush=True)
     return {}
 
-def close_position(product_id, symbol, current_side, size):
-    global last_trailing_level
-    side = "sell" if current_side == "buy" else "buy"
-    path = '/v2/orders'
-    method = 'POST'
-    timestamp = str(int(time.time()))
-    
-    payload_data = {
-        "product_id": int(product_id),
-        "size": int(size),
-        "side": side,
-        "order_type": "market_order",
-        "reduce_only": True
-    }
-    
-    payload = json.dumps(payload_data)
-    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
-    
-    req_headers = {
-        'api-key': API_KEY,
-        'timestamp': timestamp,
-        'signature': signature,
-        'User-Agent': 'python-rest-client',
-        'Content-Type': 'application/json'
-    }
-    
-    try:
-        print(f"[Exit] Closing position for {symbol} via {side.upper()}...", flush=True)
-        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        print(f"[CLOSE RESPONSE] {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
-        if product_id in last_trailing_level:
-            del last_trailing_level[product_id]
-    except Exception as e:
-        print(f"Failed to close position for {symbol}: {e}", flush=True)
-
-def execute_order(product_id, symbol, side, size):
+def execute_order_with_native_sl(product_id, symbol, side, size, current_price):
     global last_trade_attempt_time
     
     available_usd = get_account_balance()
@@ -194,10 +158,22 @@ def execute_order(product_id, symbol, side, size):
         print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
         return
 
+    # Calculate strict native stop loss (e.g., 40 points away from entry)
+    stop_loss_distance = 40.0
+    if side == "buy":
+        sl_price = current_price - stop_loss_distance
+        tp_price = current_price + 100.0
+        exit_side = "sell"
+    else:
+        sl_price = current_price + stop_loss_distance
+        tp_price = current_price - 100.0
+        exit_side = "buy"
+
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
     
+    # Main Market Order Payload
     payload_data = {
         "product_id": int(product_id),
         "size": int(size),
@@ -217,12 +193,39 @@ def execute_order(product_id, symbol, side, size):
     }
     
     try:
-        print(f"[Execution] Sending high-conviction {side.upper()} order for {symbol} (Size: {size})...", flush=True)
+        print(f"[Execution] Placing Market {side.upper()} order for {symbol} (Size: {size})...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        print(f"[{side.upper()}] API ORDER RESPONSE for {symbol} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+        print(f"[{side.upper()}] API ORDER RESPONSE -> Status: {response.status_code} | Body: {response.text}", flush=True)
+        
+        if response.status_code == 200:
+            # Immediately place a Native Server-Side Stop-Loss Order on Exchange
+            time.sleep(1) # short buffer for position registration
+            sl_payload_data = {
+                "product_id": int(product_id),
+                "size": int(size),
+                "side": exit_side,
+                "order_type": "stop_market",
+                "stop_price": round(sl_price, 1),
+                "reduce_only": True
+            }
+            sl_payload = json.dumps(sl_payload_data)
+            sl_timestamp = str(int(time.time()))
+            sl_signature = generate_signature(API_SECRET, 'POST', sl_timestamp, path, '', sl_payload)
+            
+            sl_headers = {
+                'api-key': API_KEY,
+                'timestamp': sl_timestamp,
+                'signature': sl_signature,
+                'User-Agent': 'python-rest-client',
+                'Content-Type': 'application/json'
+            }
+            
+            sl_response = requests.post(BASE_URL + path, headers=sl_headers, data=sl_payload, timeout=10)
+            print(f"[NATIVE STOP-LOSS] Placed at {round(sl_price, 1)} -> Status: {sl_response.status_code} | Body: {sl_response.text}", flush=True)
+            
         last_trade_attempt_time = time.time()
     except Exception as e:
-        print(f"Order execution failed for {symbol}: {e}", flush=True)
+        print(f"Order/SL execution failed for {symbol}: {e}", flush=True)
 
 def calculate_ema(prices, period):
     if len(prices) < period:
@@ -235,86 +238,50 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Smart Pro-Momentum Bot Running (1-Hour Cooldown Filter Active)...", flush=True)
+print("Native Server-Side SL Bot Running...", flush=True)
 
 while True:
     try:
         open_positions = get_open_positions()
         
-        # FIRST: Real-time trailing stop-loss management
-        for p_id, pos_info in open_positions.items():
-            symbol = pos_info["symbol"]
-            pos_side = pos_info["side"]
-            entry_price = pos_info["entry_price"]
-            
-            market_data = get_live_market_data(symbol)
-            if not market_data:
-                continue
-            live_price = market_data["mark_price"]
-                
-            profit_points = 0
-            if pos_side == "buy":
-                profit_points = live_price - entry_price
-            elif pos_side == "sell":
-                profit_points = entry_price - live_price
-            
-            print(f"[{symbol}] LIVE CHECK -> Side: {pos_side.upper()} | Entry: {entry_price} | Live Mark: {live_price} | PnL: {round(profit_points, 2)} pts", flush=True)
-            
-            current_level = last_trailing_level.get(p_id, -60.0)
-            
-            if profit_points >= 600.0 and current_level < 550.0:
-                last_trailing_level[p_id] = 550.0
-                print(f"--> TRAIL: Locked SL at +550 pts profit.", flush=True)
-            elif profit_points >= 200.0 and current_level < 150.0:
-                last_trailing_level[p_id] = 150.0
-                print(f"--> TRAIL: Locked SL at +150 pts profit.", flush=True)
-            elif profit_points >= 100.0 and current_level < 50.0:
-                last_trailing_level[p_id] = 50.0
-                print(f"--> TRAIL: Locked SL at +50 pts profit.", flush=True)
-            elif profit_points >= 40.0 and current_level < 0.0:
-                last_trailing_level[p_id] = 0.0
-                print(f"--> TRAIL: Moved SL to Breakeven.", flush=True)
-            
-            active_sl_limit = last_trailing_level.get(p_id, -60.0)
-            if profit_points <= active_sl_limit:
-                print(f"--> STOP LOSS HIT! Exiting {symbol} safely at level {active_sl_limit}.", flush=True)
-                close_position(p_id, symbol, pos_side, pos_info["size"])
-                continue
+        # If position is open, let exchange handle the native stop loss completely.
+        if len(open_positions) > 0:
+            print("Active position found. Managing via Exchange Native Server-Side Stop-Loss...", flush=True)
+            time.sleep(20)
+            continue
 
-        # SECOND: High-Conviction 15m Trend-Following Entry (Strict Filtering)
-        if len(open_positions) == 0:
-            if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
-                time.sleep(15)
-                continue
+        # Look for New High-Conviction Entries
+        if time.time() - last_trade_attempt_time < COOLDOWN_SECONDS:
+            time.sleep(15)
+            continue
 
-            for symbol, info in product_data.items():
-                p_id = info["id"]
-                trade_size = info["min_size"]
+        for symbol, info in product_data.items():
+            p_id = info["id"]
+            trade_size = info["min_size"]
+            
+            closes = get_historical_candles(symbol)
+            if len(closes) < 30:
+                continue
                 
-                closes = get_historical_candles(symbol)
-                if len(closes) < 30:
-                    continue
-                    
-                current_price = closes[-1]
-                ema_fast = calculate_ema(closes, 12) # 12 Period on 15m chart
-                ema_slow = calculate_ema(closes, 26) # 26 Period on 15m chart
+            current_price = closes[-1]
+            ema_fast = calculate_ema(closes, 12)
+            ema_slow = calculate_ema(closes, 26)
+            
+            if ema_fast is None or ema_slow is None:
+                continue
+            
+            is_strong_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
+            is_strong_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
+            
+            if is_strong_uptrend:
+                print(f"--> NATIVE SL UPTREND: Executing BUY on {symbol} at {current_price}!", flush=True)
+                execute_order_with_native_sl(p_id, symbol, "buy", size=trade_size, current_price=current_price)
+                break
                 
-                if ema_fast is None or ema_slow is None:
-                    continue
-                
-                # High-Conviction Filters (Bade Trend par hi trade milegi)
-                is_strong_uptrend = (ema_fast > ema_slow) and (current_price > ema_fast)
-                is_strong_downtrend = (ema_fast < ema_slow) and (current_price < ema_fast)
-                
-                if is_strong_uptrend:
-                    print(f"--> HIGH-CONVICTION UPTREND: Executing BUY on {symbol}!", flush=True)
-                    execute_order(p_id, symbol, "buy", size=trade_size)
-                    break
-                    
-                elif is_strong_downtrend:
-                    print(f"--> HIGH-CONVICTION DOWNTREND: Executing SELL on {symbol}!", flush=True)
-                    execute_order(p_id, symbol, "sell", size=trade_size)
-                    break
+            elif is_strong_downtrend:
+                print(f"--> NATIVE SL DOWNTREND: Executing SELL on {symbol} at {current_price}!", flush=True)
+                execute_order_with_native_sl(p_id, symbol, "sell", size=trade_size, current_price=current_price)
+                break
                     
     except Exception as e:
         print(f"Error in main loop: {e}", flush=True)
