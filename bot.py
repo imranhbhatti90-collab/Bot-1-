@@ -1,120 +1,114 @@
-pos.get('product_id'))
-                positions[p_id] = {
-                    "symbol": pos.get('product_symbol', 'BTCUSD'),
-                    "side": pos.get('side'),
-                    "size": float(pos.get('size')),
-                    "entry_price": float(pos.get('entry_price', 0))
-                }
-        return positions
-    except Exception as e:
-        print("Error fetching positions:", e, flush=True)
-    return {}
+import os
+import time
+import hmac
+import hashlib
+import requests
+from flask import Flask
 
-def get_open_orders(product_id):
-    path = f'/v2/orders?product_id={product_id}&state=open'
-    method = 'GET'
-    timestamp = str(int(time.time()))
-    signature = generate_signature(API_SECRET, method, timestamp, '/v2/orders', f'product_id={product_id}&state=open', '')
+app = Flask(__name__)
+
+# --- CONFIGURATION ---
+API_KEY = os.environ.get("DELTA_API_KEY", "")
+API_SECRET = os.environ.get("DELTA_API_SECRET", "")
+BASE_URL = "https://testnet-api.delta.exchange"  # Testnet URL
+
+PRODUCT_ID = 84
+
+# Trailing Milestones & Offsets (in points)
+TRAILING_STEPS = [
+    {"trigger": 100, "lock": 0},
+    {"trigger": 200, "lock": 100},
+    {"trigger": 400, "lock": 300}
+]
+
+# Bot State Tracking
+current_sl_order_id = None
+last_triggered_step = -1
+
+@app.route('/')
+def home():
+    return "Independent Stop Order Trailing Bot Running..."
+
+def generate_signature(method, endpoint, query_string='', payload=''):
+    current_time = str(int(time.time() * 1000))
+    signature_data = method + current_time + endpoint + query_string + payload
+    signature = hmac.new(
+        API_SECRET.encode('utf-8'),
+        signature_data.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    return current_time, signature
+
+def send_request(method, endpoint, params=None, data=None):
+    import json
+    url = BASE_URL + endpoint
+    query_string = ''
+    if params:
+        query_string = '?' + '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
+        url += query_string
     
-    req_headers = {
+    payload_str = json.dumps(data) if data else ''
+    timestamp, signature = generate_signature(method, endpoint, query_string, payload_str)
+    
+    headers = {
         'api-key': API_KEY,
         'timestamp': timestamp,
         'signature': signature,
-        'User-Agent': 'python-rest-client',
-        'Content-Type': 'application/json'
-    }
-    try:
-        response = requests.get(BASE_URL + path, headers=req_headers, timeout=10)
-        data = response.json()
-        return data.get('result', [])
-    except Exception as e:
-        print(f"Failed to fetch open orders: {e}", flush=True)
-    return []
-
-def cancel_order(order_id, product_id):
-    if not order_id:
-        return
-    path = f'/v2/orders?order_id={order_id}&product_id={product_id}'
-    method = 'DELETE'
-    timestamp = str(int(time.time()))
-    signature = generate_signature(API_SECRET, method, timestamp, '/v2/orders', f'order_id={order_id}&product_id={product_id}', '')
-    
-    req_headers = {
-        'api-key': API_KEY,
-        'timestamp': timestamp,
-        'signature': signature,
-        'User-Agent': 'python-rest-client',
-        'Content-Type': 'application/json'
-    }
-    try:
-        response = requests.delete(BASE_URL + path, headers=req_headers, timeout=10)
-        print(f"[CANCEL ORDER] ID {order_id} -> Status: {response.status_code}", flush=True)
-    except Exception as e:
-        print(f"Failed to cancel order: {e}", flush=True)
-
-def place_stop_loss_order(product_id, size, exit_side, sl_price):
-    path = '/v2/orders'
-    method = 'POST'
-    timestamp = str(int(time.time()))
-    
-    payload_data = {
-        "product_id": int(product_id),
-        "size": int(size),
-        "side": exit_side,
-        "order_type": "stop_order",
-        "stop_order_type": "market_order",  # Added required parameter for Delta Exchange
-        "stop_price": round(sl_price, 1),
-        "reduce_only": True
-    }
-    
-    payload = json.dumps(payload_data)
-    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
-    
-    req_headers = {
-        'api-key': API_KEY,
-        'timestamp': timestamp,
-        'signature': signature,
-        'User-Agent': 'python-rest-client',
         'Content-Type': 'application/json'
     }
     
     try:
-        response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        data = response.json()
-        print(f"[STOP ORDER PLACED] SL at {round(sl_price, 1)} -> Status: {response.status_code} | Body: {response.text}", flush=True)
-        if data.get('success'):
-            return data.get('result', {}).get('id')
+        if method == 'GET':
+            response = requests.get(url, headers=headers)
+        elif method == 'POST':
+            response = requests.post(url, headers=headers, data=payload_str)
+        elif method == 'DELETE':
+            response = requests.delete(url, headers=headers, data=payload_str)
+        return response.json()
     except Exception as e:
-        print(f"Failed to place stop loss order: {e}", flush=True)
+        print(f"[API Error] {e}")
+        return None
+
+def get_market_price():
+    res = send_request('GET', f'/v2/products/{PRODUCT_ID}')
+    if res and res.get('success'):
+        result = res.get('result', {})
+        return float(result.get('spot_price', 0))
+    return 0.0
+
+def get_open_position():
+    res = send_request('GET', '/v2/positions', params={'product_id': PRODUCT_ID})
+    if res and res.get('success'):
+        positions = res.get('result', [])
+        for pos in positions:
+            if float(pos.get('size', 0)) != 0:
+                return pos
     return None
 
-def execute_trade_pure_market(product_id, symbol, side, size, current_price):
-    global last_trade_attempt_time
-    
-    available_usd = get_account_balance()
-    if available_usd < 40.0:
-        print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
-        return
-
-    path = '/v2/orders'
-    method = 'POST'
-    timestamp = str(int(time.time()))
-    
-    payload_data = {
-        "product_id": int(product_id),
-        "size": int(size),
-        "side": side,
-        "order_type": "market_order"
+def place_stop_loss_order(side, size, stop_price):
+    endpoint = '/v2/orders'
+    close_side = "buy" if side == "sell" else "sell"
+    payload = {
+        "product_id": PRODUCT_ID,
+        "size": int(abs(size)),
+        "side": close_side,
+        "order_type": "stop_order",
+        "stop_price": str(round(stop_price, 1)),
+        "stop_order_type": "market",
+        "reduce_only": True,
+        "time_in_force": "gtc"
     }
-    
-    payload = json.dumps(payload_data)
-    signature = generate_signature(API_SECRET, method, timestamp, path, '', payload)
-    
-    req_headers = {
-        'api-key': API_KEY,
-        'timestamp': timestamp,
-        'signature': signature,
-        'User-Agent': 'python-rest-client',
-        'Content-Type': 'application/json'
-    } e:
-        print(f"Error
+    res = send_request('POST', endpoint, data=payload)
+    return res
+
+def cancel_existing_orders():
+    res = send_request('GET', '/v2/orders', params={'product_id': PRODUCT_ID, 'state': 'open'})
+    if res and res.get('success'):
+        for order in res.get('result', []):
+            if order.get('order_type') == 'stop_order':
+                send_request('DELETE', '/v2/orders', data={'id': order['id'], 'product_id': PRODUCT_ID})
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Bot Server Started & Port {port} Bound...")
+    app.run(host='0.0.0.0', port=port)
