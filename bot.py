@@ -1,114 +1,228 @@
 import os
 import time
-import hmac
-import hashlib
+import threading
 import requests
 from flask import Flask
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
-API_KEY = os.environ.get("DELTA_API_KEY", "")
-API_SECRET = os.environ.get("DELTA_API_SECRET", "")
-BASE_URL = "https://testnet-api.delta.exchange"  # Testnet URL
+# =====================================
+# DELTA EXCHANGE DEMO / TESTNET
+# =====================================
 
-PRODUCT_ID = 84
+BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+SYMBOL = "BTCUSD"
+TIMEFRAME = "5m"
 
-# Trailing Milestones & Offsets (in points)
-TRAILING_STEPS = [
-    {"trigger": 100, "lock": 0},
-    {"trigger": 200, "lock": 100},
-    {"trigger": 400, "lock": 300}
-]
+CHECK_INTERVAL = 60
 
-# Bot State Tracking
-current_sl_order_id = None
-last_triggered_step = -1
+# SAFETY: Signal testing only.
+# Automatic trading is NOT implemented.
+ENABLE_TRADING = False
 
-@app.route('/')
+# =====================================
+# WEB SERVER
+# =====================================
+
+@app.route("/")
 def home():
-    return "Independent Stop Order Trailing Bot Running..."
+    return (
+        "BTC EMA Bot is running | "
+        "Mode: Signal Testing Only | "
+        "Automatic Trading: OFF"
+    )
 
-def generate_signature(method, endpoint, query_string='', payload=''):
-    current_time = str(int(time.time() * 1000))
-    signature_data = method + current_time + endpoint + query_string + payload
-    signature = hmac.new(
-        API_SECRET.encode('utf-8'),
-        signature_data.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    return current_time, signature
 
-def send_request(method, endpoint, params=None, data=None):
-    import json
-    url = BASE_URL + endpoint
-    query_string = ''
-    if params:
-        query_string = '?' + '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
-        url += query_string
-    
-    payload_str = json.dumps(data) if data else ''
-    timestamp, signature = generate_signature(method, endpoint, query_string, payload_str)
-    
-    headers = {
-        'api-key': API_KEY,
-        'timestamp': timestamp,
-        'signature': signature,
-        'Content-Type': 'application/json'
-    }
-    
+# =====================================
+# FETCH MARKET CANDLES
+# =====================================
+
+def get_candles():
     try:
-        if method == 'GET':
-            response = requests.get(url, headers=headers)
-        elif method == 'POST':
-            response = requests.post(url, headers=headers, data=payload_str)
-        elif method == 'DELETE':
-            response = requests.delete(url, headers=headers, data=payload_str)
-        return response.json()
-    except Exception as e:
-        print(f"[API Error] {e}")
+        now = int(time.time())
+
+        url = f"{BASE_URL}/v2/history/candles"
+
+        params = {
+            "resolution": TIMEFRAME,
+            "symbol": SYMBOL,
+            "start": now - (24 * 60 * 60),
+            "end": now
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            headers={"User-Agent": "BTC-EMA-Demo-Bot/1.0"},
+            timeout=15
+        )
+
+        print(
+            f"[API] HTTP status: {response.status_code}",
+            flush=True
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("success"):
+            print(f"[API ERROR] {data}", flush=True)
+            return []
+
+        candles = data.get("result", [])
+
+        candles = sorted(
+            candles,
+            key=lambda candle: candle["time"]
+        )
+
+        print(
+            f"[MARKET] Received {len(candles)} candles",
+            flush=True
+        )
+
+        return candles
+
+    except Exception as error:
+        print(f"[MARKET DATA ERROR] {error}", flush=True)
+        return []
+
+
+# =====================================
+# EMA CALCULATION
+# =====================================
+
+def calculate_ema(values, period):
+    if len(values) < period:
         return None
 
-def get_market_price():
-    res = send_request('GET', f'/v2/products/{PRODUCT_ID}')
-    if res and res.get('success'):
-        result = res.get('result', {})
-        return float(result.get('spot_price', 0))
-    return 0.0
+    multiplier = 2 / (period + 1)
 
-def get_open_position():
-    res = send_request('GET', '/v2/positions', params={'product_id': PRODUCT_ID})
-    if res and res.get('success'):
-        positions = res.get('result', [])
-        for pos in positions:
-            if float(pos.get('size', 0)) != 0:
-                return pos
-    return None
+    result = sum(values[:period]) / period
 
-def place_stop_loss_order(side, size, stop_price):
-    endpoint = '/v2/orders'
-    close_side = "buy" if side == "sell" else "sell"
-    payload = {
-        "product_id": PRODUCT_ID,
-        "size": int(abs(size)),
-        "side": close_side,
-        "order_type": "stop_order",
-        "stop_price": str(round(stop_price, 1)),
-        "stop_order_type": "market",
-        "reduce_only": True,
-        "time_in_force": "gtc"
-    }
-    res = send_request('POST', endpoint, data=payload)
-    return res
+    for value in values[period:]:
+        result = (
+            value * multiplier
+            + result * (1 - multiplier)
+        )
 
-def cancel_existing_orders():
-    res = send_request('GET', '/v2/orders', params={'product_id': PRODUCT_ID, 'state': 'open'})
-    if res and res.get('success'):
-        for order in res.get('result', []):
-            if order.get('order_type') == 'stop_order':
-                send_request('DELETE', '/v2/orders', data={'id': order['id'], 'product_id': PRODUCT_ID})
+    return result
 
-if __name__ == '__main__':
+
+# =====================================
+# EMA STRATEGY
+# =====================================
+
+def check_signal():
+    candles = get_candles()
+
+    if len(candles) < 200:
+        print(
+            f"[WAIT] Need at least 200 candles. "
+            f"Available: {len(candles)}",
+            flush=True
+        )
+        return
+
+    try:
+        closes = [
+            float(candle["close"])
+            for candle in candles
+        ]
+
+        price = closes[-1]
+
+        ema9 = calculate_ema(closes, 9)
+        ema21 = calculate_ema(closes, 21)
+        ema200 = calculate_ema(closes, 200)
+
+        if None in (ema9, ema21, ema200):
+            print("[WAIT] EMA data is incomplete.", flush=True)
+            return
+
+        print("=" * 40, flush=True)
+        print(f"Symbol : {SYMBOL}", flush=True)
+        print(f"Price  : {price:.2f}", flush=True)
+        print(f"EMA 9  : {ema9:.2f}", flush=True)
+        print(f"EMA 21 : {ema21:.2f}", flush=True)
+        print(f"EMA 200: {ema200:.2f}", flush=True)
+
+        if ema9 > ema21 and price > ema200:
+            print(
+                "[SIGNAL] BUY BIAS — no order placed",
+                flush=True
+            )
+
+        elif ema9 < ema21 and price < ema200:
+            print(
+                "[SIGNAL] SELL BIAS — no order placed",
+                flush=True
+            )
+
+        else:
+            print(
+                "[SIGNAL] WAIT — no order placed",
+                flush=True
+            )
+
+        print("=" * 40, flush=True)
+
+    except (KeyError, TypeError, ValueError) as error:
+        print(
+            f"[CANDLE FORMAT ERROR] {error}",
+            flush=True
+        )
+
+
+# =====================================
+# CONTINUOUS MONITORING LOOP
+# =====================================
+
+def trading_loop():
+    print(
+        "[BOT] EMA monitoring loop started.",
+        flush=True
+    )
+
+    while True:
+        try:
+            check_signal()
+
+        except Exception as error:
+            print(
+                f"[BOT ERROR] {error}",
+                flush=True
+            )
+
+        time.sleep(CHECK_INTERVAL)
+
+
+# =====================================
+# START BOT + RENDER SERVER
+# =====================================
+
+if __name__ == "__main__":
+
+    print("[BOT] Starting BTC EMA monitoring...", flush=True)
+
+    bot_thread = threading.Thread(
+        target=trading_loop,
+        daemon=True
+    )
+
+    bot_thread.start()
+
     port = int(os.environ.get("PORT", 10000))
-    print(f"Bot Server Started & Port {port} Bound...")
-    app.run(host='0.0.0.0', port=port),
+
+    print(
+        f"[SERVER] Starting on port {port}",
+        flush=True
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
