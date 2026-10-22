@@ -203,6 +203,7 @@ def place_stop_loss_order(product_id, size, exit_side, sl_price):
         "size": int(size),
         "side": exit_side,
         "order_type": "stop_order",
+        "stop_order_type": "market_order",  # Added required parameter for Delta Exchange
         "stop_price": round(sl_price, 1),
         "reduce_only": True
     }
@@ -264,7 +265,7 @@ def execute_trade_pure_market(product_id, symbol, side, size, current_price):
         print(f"[ENTRY RESPONSE] Status: {response.status_code} | Body: {response.text}", flush=True)
         
         if response.status_code == 200:
-            time.sleep(1) # Brief pause for position to register
+            time.sleep(1.5) # Brief pause for position registration
             positions = get_open_positions()
             if product_id in positions:
                 actual_entry = positions[product_id]["entry_price"]
