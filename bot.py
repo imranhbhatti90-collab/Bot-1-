@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Pure Dynamic Trailing Bot is running!")
+        self.wfile.write(b"Optimized Trailing Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Pure Dynamic Trailing Bot Server Started & Port 10000 Bound...", flush=True)
+print("Optimized Trailing Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,7 +32,7 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_attempt_time = 0
-COOLDOWN_SECONDS = 1800
+COOLDOWN_SECONDS = 3600  # Increased cooldown to 1 hour to avoid choppy losses
 last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -80,7 +80,6 @@ def get_historical_candles(symbol):
     try:
         end_time = int(time.time())
         start_time = end_time - (12 * 3600)
-        # 5m resolution for fast trend tracking
         url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=5m&start={start_time}&end={end_time}"
         response = requests.get(url, timeout=10)
         data = response.json()
@@ -237,7 +236,6 @@ def execute_trade_without_tp(product_id, symbol, side, size, current_price):
         print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
         return
 
-    # Initial 100 points Stop-Loss, NO Take-Profit
     if side == "buy":
         sl_price = current_price - 100.0
     else:
@@ -285,7 +283,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Pure Dynamic Trailing Bot Running...", flush=True)
+print("Optimized Trailing Bot Running...", flush=True)
 
 while True:
     try:
@@ -315,7 +313,7 @@ while True:
                 new_target_sl = None
                 exit_side = "sell" if pos_side == "buy" else "buy"
                 
-                # Aggressive Dynamic Trailing Milestones
+                # Precise Trailing Milestones
                 if profit_points >= 400.0 and current_level < 300.0:
                     last_trailing_level[p_id] = 300.0
                     new_target_sl = (entry_price + 300.0) if pos_side == "buy" else (entry_price - 300.0)
