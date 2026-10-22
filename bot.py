@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Dynamic Trailing Bracket Bot is running!")
+        self.wfile.write(b"100-Point Dynamic Trailing Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Dynamic Trailing Bot Server Started & Port 10000 Bound...", flush=True)
+print("100-Point Trailing Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -80,7 +80,8 @@ def get_historical_candles(symbol):
     try:
         end_time = int(time.time())
         start_time = end_time - (12 * 3600)
-        url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=15m&start={start_time}&end={end_time}"
+        # 5m resolution for faster trade detection
+        url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=5m&start={start_time}&end={end_time}"
         response = requests.get(url, timeout=10)
         data = response.json()
         
@@ -236,12 +237,13 @@ def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
         print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
         return
 
+    # 100 points initial Stop-Loss, 200 points Take-Profit
     if side == "buy":
-        sl_price = current_price - 50.0
-        tp_price = current_price + 100.0
+        sl_price = current_price - 100.0
+        tp_price = current_price + 200.0
     else:
-        sl_price = current_price + 50.0
-        tp_price = current_price - 100.0
+        sl_price = current_price + 100.0
+        tp_price = current_price - 200.0
 
     path = '/v2/orders'
     method = 'POST'
@@ -268,7 +270,7 @@ def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
     }
     
     try:
-        print(f"[Execution] Placing Market {side.upper()} order with Bracket for {symbol} at {current_price}...", flush=True)
+        print(f"[Execution] Placing Market {side.upper()} order with 100pt SL for {symbol} at {current_price}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[BRACKET ENTRY RESPONSE] Status: {response.status_code} | Body: {response.text}", flush=True)
         last_trade_attempt_time = time.time()
@@ -286,7 +288,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Dynamic Trailing Bracket Bot Running...", flush=True)
+print("100-Point Trailing Bot Running...", flush=True)
 
 while True:
     try:
@@ -312,32 +314,30 @@ while True:
                 
                 print(f"[{symbol}] ACTIVE PnL CHECK -> Entry: {entry_price} | Live: {live_price} | Profit: {round(profit_points, 2)} pts", flush=True)
                 
-                current_level = last_trailing_level.get(p_id, -50.0)
+                current_level = last_trailing_level.get(p_id, -100.0)
                 new_target_sl = None
                 exit_side = "sell" if pos_side == "buy" else "buy"
                 
-                # Trailing milestones
-                if profit_points >= 200.0 and current_level < 150.0:
-                    last_trailing_level[p_id] = 150.0
-                    new_target_sl = (entry_price + 150.0) if pos_side == "buy" else (entry_price - 150.0)
-                    print(f"--> TRAILING: Profit reached 200 pts! Shifting SL to +150 pts.", flush=True)
-                elif profit_points >= 100.0 and current_level < 50.0:
-                    last_trailing_level[p_id] = 50.0
-                    new_target_sl = (entry_price + 50.0) if pos_side == "buy" else (entry_price - 50.0)
-                    print(f"--> TRAILING: Profit reached 100 pts! Shifting SL to +50 pts.", flush=True)
-                elif profit_points >= 50.0 and current_level < 0.0:
+                # Dynamic Trailing Milestones for 100pt SL setup
+                if profit_points >= 400.0 and current_level < 300.0:
+                    last_trailing_level[p_id] = 300.0
+                    new_target_sl = (entry_price + 300.0) if pos_side == "buy" else (entry_price - 300.0)
+                    print(f"--> TRAILING: Profit reached 400 pts! Shifting SL to +300 pts.", flush=True)
+                elif profit_points >= 200.0 and current_level < 100.0:
+                    last_trailing_level[p_id] = 100.0
+                    new_target_sl = (entry_price + 100.0) if pos_side == "buy" else (entry_price - 100.0)
+                    print(f"--> TRAILING: Profit reached 200 pts! Shifting SL to +100 pts.", flush=True)
+                elif profit_points >= 100.0 and current_level < 0.0:
                     last_trailing_level[p_id] = 0.0
                     new_target_sl = entry_price  # Breakeven
-                    print(f"--> TRAILING: Profit reached 50 pts! Moving SL to Breakeven.", flush=True)
+                    print(f"--> TRAILING: Profit reached 100 pts! Moving SL to Breakeven.", flush=True)
                 
                 if new_target_sl is not None:
-                    # Find and cancel the existing stop loss order from open orders
                     open_orders = get_open_orders(p_id)
                     for order in open_orders:
                         if order.get('order_type') == 'stop_order' or order.get('stop_price'):
                             cancel_order(order.get('id'), p_id)
                     
-                    # Place the updated trailed stop loss
                     place_new_stop_loss(p_id, size, exit_side, new_target_sl)
         else:
             last_trailing_level.clear()
