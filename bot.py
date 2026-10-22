@@ -1,4 +1,4 @@
-  = str(pos.get('product_id'))
+pos.get('product_id'))
                 positions[p_id] = {
                     "symbol": pos.get('product_symbol', 'BTCUSD'),
                     "side": pos.get('side'),
@@ -117,4 +117,4 @@ def execute_trade_pure_market(product_id, symbol, side, size, current_price):
         'User-Agent': 'python-rest-client',
         'Content-Type': 'application/json'
     } e:
-        print(f"Error in 
+        print(f"Error
