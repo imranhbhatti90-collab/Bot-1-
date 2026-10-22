@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Optimized Trailing Bot is running!")
+        self.wfile.write(b"Independent Stop Order Trailing Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("Optimized Trailing Bot Server Started & Port 10000 Bound...", flush=True)
+print("Independent Stop Order Trailing Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -32,7 +32,7 @@ BASE_URL = 'https://cdn-ind.testnet.deltaex.org'
 TARGET_COINS = ['BTCUSD']
 
 last_trade_attempt_time = 0
-COOLDOWN_SECONDS = 3600  # Increased cooldown to 1 hour to avoid choppy losses
+COOLDOWN_SECONDS = 3600
 last_trailing_level = {}
 
 def generate_signature(secret, method, timestamp, path, query_string='', payload=''):
@@ -193,7 +193,7 @@ def cancel_order(order_id, product_id):
     except Exception as e:
         print(f"Failed to cancel order: {e}", flush=True)
 
-def place_new_stop_loss(product_id, size, exit_side, sl_price):
+def place_stop_loss_order(product_id, size, exit_side, sl_price):
     path = '/v2/orders'
     method = 'POST'
     timestamp = str(int(time.time()))
@@ -221,25 +221,20 @@ def place_new_stop_loss(product_id, size, exit_side, sl_price):
     try:
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         data = response.json()
-        print(f"[NEW TRAILED SL] Placed at {round(sl_price, 1)} -> Status: {response.status_code} | Body: {response.text}", flush=True)
+        print(f"[STOP ORDER PLACED] SL at {round(sl_price, 1)} -> Status: {response.status_code} | Body: {response.text}", flush=True)
         if data.get('success'):
             return data.get('result', {}).get('id')
     except Exception as e:
-        print(f"Failed to place new stop loss: {e}", flush=True)
+        print(f"Failed to place stop loss order: {e}", flush=True)
     return None
 
-def execute_trade_without_tp(product_id, symbol, side, size, current_price):
+def execute_trade_pure_market(product_id, symbol, side, size, current_price):
     global last_trade_attempt_time
     
     available_usd = get_account_balance()
     if available_usd < 40.0:
         print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
         return
-
-    if side == "buy":
-        sl_price = current_price - 100.0
-    else:
-        sl_price = current_price + 100.0
 
     path = '/v2/orders'
     method = 'POST'
@@ -249,8 +244,7 @@ def execute_trade_without_tp(product_id, symbol, side, size, current_price):
         "product_id": int(product_id),
         "size": int(size),
         "side": side,
-        "order_type": "market_order",
-        "bracket_stop_loss_price": round(sl_price, 1)
+        "order_type": "market_order"
     }
     
     payload = json.dumps(payload_data)
@@ -265,9 +259,19 @@ def execute_trade_without_tp(product_id, symbol, side, size, current_price):
     }
     
     try:
-        print(f"[Execution] Placing Market {side.upper()} order with 100pt SL (No TP) for {symbol} at {current_price}...", flush=True)
+        print(f"[Execution] Placing Pure Market {side.upper()} order for {symbol} at {current_price}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
         print(f"[ENTRY RESPONSE] Status: {response.status_code} | Body: {response.text}", flush=True)
+        
+        if response.status_code == 200:
+            time.sleep(1) # Brief pause for position to register
+            positions = get_open_positions()
+            if product_id in positions:
+                actual_entry = positions[product_id]["entry_price"]
+                exit_side = "sell" if side == "buy" else "buy"
+                initial_sl = (actual_entry - 100.0) if side == "buy" else (actual_entry + 100.0)
+                place_stop_loss_order(product_id, size, exit_side, initial_sl)
+                
         last_trade_attempt_time = time.time()
     except Exception as e:
         print(f"Trade execution failed: {e}", flush=True)
@@ -283,7 +287,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("Optimized Trailing Bot Running...", flush=True)
+print("Independent Stop Order Trailing Bot Running...", flush=True)
 
 while True:
     try:
@@ -333,7 +337,7 @@ while True:
                         if order.get('order_type') == 'stop_order' or order.get('stop_price'):
                             cancel_order(order.get('id'), p_id)
                     
-                    place_new_stop_loss(p_id, size, exit_side, new_target_sl)
+                    place_stop_loss_order(p_id, size, exit_side, new_target_sl)
         else:
             last_trailing_level.clear()
 
@@ -361,12 +365,12 @@ while True:
                 
                 if is_strong_uptrend:
                     print(f"--> UPTREND DETECTED: Executing BUY on {symbol}!", flush=True)
-                    execute_trade_without_tp(p_id, symbol, "buy", size=trade_size, current_price=current_price)
+                    execute_trade_pure_market(p_id, symbol, "buy", size=trade_size, current_price=current_price)
                     break
                     
                 elif is_strong_downtrend:
                     print(f"--> DOWNTREND DETECTED: Executing SELL on {symbol}!", flush=True)
-                    execute_trade_without_tp(p_id, symbol, "sell", size=trade_size, current_price=current_price)
+                    execute_trade_pure_market(p_id, symbol, "sell", size=trade_size, current_price=current_price)
                     break
                     
     except Exception as e:
