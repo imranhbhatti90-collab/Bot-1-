@@ -10,7 +10,7 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"100-Point Dynamic Trailing Bot is running!")
+        self.wfile.write(b"Pure Dynamic Trailing Bot is running!")
 
     def do_HEAD(self):
         self.send_response(200)
@@ -24,7 +24,7 @@ server_thread = threading.Thread(target=run_server)
 server_thread.daemon = True
 server_thread.start()
 
-print("100-Point Trailing Bot Server Started & Port 10000 Bound...", flush=True)
+print("Pure Dynamic Trailing Bot Server Started & Port 10000 Bound...", flush=True)
 
 API_KEY = 'pmrlBdmD2K0ylmLinDvSbOqRJJG0DV'
 API_SECRET = 'kxd2Gy0S8eoDyqGWS19wMCjlAJ6DuYijasUShtjARumOwggADJXSaNkbqUQO'
@@ -80,7 +80,7 @@ def get_historical_candles(symbol):
     try:
         end_time = int(time.time())
         start_time = end_time - (12 * 3600)
-        # 5m resolution for faster trade detection
+        # 5m resolution for fast trend tracking
         url = f"{BASE_URL}/v2/history/candles?symbol={symbol}&resolution=5m&start={start_time}&end={end_time}"
         response = requests.get(url, timeout=10)
         data = response.json()
@@ -229,7 +229,7 @@ def place_new_stop_loss(product_id, size, exit_side, sl_price):
         print(f"Failed to place new stop loss: {e}", flush=True)
     return None
 
-def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
+def execute_trade_without_tp(product_id, symbol, side, size, current_price):
     global last_trade_attempt_time
     
     available_usd = get_account_balance()
@@ -237,13 +237,11 @@ def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
         print(f"--> RISK GUARD: Available balance ({available_usd} USD) is too low. Aborting.", flush=True)
         return
 
-    # 100 points initial Stop-Loss, 200 points Take-Profit
+    # Initial 100 points Stop-Loss, NO Take-Profit
     if side == "buy":
         sl_price = current_price - 100.0
-        tp_price = current_price + 200.0
     else:
         sl_price = current_price + 100.0
-        tp_price = current_price - 200.0
 
     path = '/v2/orders'
     method = 'POST'
@@ -254,8 +252,7 @@ def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
         "size": int(size),
         "side": side,
         "order_type": "market_order",
-        "bracket_stop_loss_price": round(sl_price, 1),
-        "bracket_take_profit_price": round(tp_price, 1)
+        "bracket_stop_loss_price": round(sl_price, 1)
     }
     
     payload = json.dumps(payload_data)
@@ -270,9 +267,9 @@ def execute_trade_with_bracket(product_id, symbol, side, size, current_price):
     }
     
     try:
-        print(f"[Execution] Placing Market {side.upper()} order with 100pt SL for {symbol} at {current_price}...", flush=True)
+        print(f"[Execution] Placing Market {side.upper()} order with 100pt SL (No TP) for {symbol} at {current_price}...", flush=True)
         response = requests.post(BASE_URL + path, headers=req_headers, data=payload, timeout=10)
-        print(f"[BRACKET ENTRY RESPONSE] Status: {response.status_code} | Body: {response.text}", flush=True)
+        print(f"[ENTRY RESPONSE] Status: {response.status_code} | Body: {response.text}", flush=True)
         last_trade_attempt_time = time.time()
     except Exception as e:
         print(f"Trade execution failed: {e}", flush=True)
@@ -288,7 +285,7 @@ def calculate_ema(prices, period):
 
 product_data = get_target_product_info()
 print(f"Loaded Target Products & Sizes: {product_data}", flush=True)
-print("100-Point Trailing Bot Running...", flush=True)
+print("Pure Dynamic Trailing Bot Running...", flush=True)
 
 while True:
     try:
@@ -318,7 +315,7 @@ while True:
                 new_target_sl = None
                 exit_side = "sell" if pos_side == "buy" else "buy"
                 
-                # Dynamic Trailing Milestones for 100pt SL setup
+                # Aggressive Dynamic Trailing Milestones
                 if profit_points >= 400.0 and current_level < 300.0:
                     last_trailing_level[p_id] = 300.0
                     new_target_sl = (entry_price + 300.0) if pos_side == "buy" else (entry_price - 300.0)
@@ -366,12 +363,12 @@ while True:
                 
                 if is_strong_uptrend:
                     print(f"--> UPTREND DETECTED: Executing BUY on {symbol}!", flush=True)
-                    execute_trade_with_bracket(p_id, symbol, "buy", size=trade_size, current_price=current_price)
+                    execute_trade_without_tp(p_id, symbol, "buy", size=trade_size, current_price=current_price)
                     break
                     
                 elif is_strong_downtrend:
                     print(f"--> DOWNTREND DETECTED: Executing SELL on {symbol}!", flush=True)
-                    execute_trade_with_bracket(p_id, symbol, "sell", size=trade_size, current_price=current_price)
+                    execute_trade_without_tp(p_id, symbol, "sell", size=trade_size, current_price=current_price)
                     break
                     
     except Exception as e:
