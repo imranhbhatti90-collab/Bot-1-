@@ -177,7 +177,7 @@ def get_candles(product_id):
         "GET",
         "/v2/history/candles",
         params={
-            "resolution": "5",
+            "resolution": "5m",
             "symbol": SYMBOL,
             "start": int(time.time()) - 200 * 5 * 60,
             "end": int(time.time()),
