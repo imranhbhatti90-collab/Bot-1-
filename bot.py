@@ -1,483 +1,200 @@
 import os
 import time
-import json
 import hmac
 import hashlib
-import threading
 import requests
-from urllib.parse import urlencode
 from flask import Flask
 
 app = Flask(__name__)
 
-# ============== SETTINGS ==============
-
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+# --- CONFIGURATION ---
+API_KEY = os.environ.get("DELTA_API_KEY", "apki_api_key")
+API_SECRET = os.environ.get("DELTA_API_SECRET", "apki_api_secret")
+BASE_URL = "https://testnet-api.delta.exchange"  # Testnet URL
 
 SYMBOL = "BTCUSD"
-TIMEFRAME = "5m"
+PRODUCT_ID = 84
+SIZE = 40  # Base order size
 
-ORDER_SIZE = 40
-LEVERAGE = 50
+# Trailing Milestones & Offsets (in points)
+# Milestone 1: +100 pts -> Move SL to Entry (Breakeven)
+# Milestone 2: +200 pts -> Move SL to Entry + 100 pts
+# Milestone 3: +400 pts -> Move SL to Entry + 300 pts
+TRAILING_STEPS = [
+    {"trigger": 100, "lock": 0},
+    {"trigger": 200, "lock": 100},
+    {"trigger": 400, "lock": 300}
+]
 
-CHECK_INTERVAL = 60
+# Bot State Tracking
+current_sl_order_id = None
+last_triggered_step = -1
 
-# Keep OFF until API access and order flow are verified.
-# Enable through Render Environment Variable:
-# ENABLE_TRADING=true
-ENABLE_TRADING = (
-    os.getenv("ENABLE_TRADING", "false").lower() == "true"
-)
-
-# Trailing-stop distance in USD.
-TRAIL_AMOUNT_USD = 100
-
-API_KEY = os.getenv("DELTA_API_KEY", "")
-API_SECRET = os.getenv("DELTA_API_SECRET", "")
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "python-requests-delta-testnet-bot",
-    "Accept": "application/json",
-})
-
-last_candle_time = None
-last_signal = None
-
-lock = threading.Lock()
-
-
-# ============== WEB STATUS ==============
-
-@app.route("/")
+@app.route('/')
 def home():
-    mode = "AUTO TRADING ON" if ENABLE_TRADING else "AUTO TRADING OFF"
+    return "Independent Stop Order Trailing Bot Running..."
 
-    return (
-        f"Delta Testnet EMA Bot | {mode} | "
-        f"{SYMBOL} | {TIMEFRAME} | "
-        f"Size={ORDER_SIZE} | Leverage={LEVERAGE}x"
-    )
-
-
-# ============== API REQUESTS ==============
-
-def api_request(method, path, params=None, payload=None):
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError(
-            "Missing DELTA_API_KEY or DELTA_API_SECRET in Render."
-        )
-
-    method = method.upper()
-    params = params or {}
-
-    # Keep query string identical to the one sent in the URL.
-    query_string = urlencode(params)
-    query_part = f"?{query_string}" if query_string else ""
-
-    # Send exactly the same compact JSON that is signed.
-    body = (
-        json.dumps(payload, separators=(",", ":"))
-        if payload is not None
-        else ""
-    )
-
-    timestamp = str(int(time.time()))
-
-    signature_data = (
-        method
-        + timestamp
-        + path
-        + query_part
-        + body
-    )
-
+def generate_signature(method, endpoint, query_string='', payload=''):
+    current_time = str(int(time.time() * 1000))
+    signature_data = method + current_time + endpoint + query_string + payload
     signature = hmac.new(
-        API_SECRET.encode("utf-8"),
-        signature_data.encode("utf-8"),
+        API_SECRET.encode('utf-8'),
+        signature_data.encode('utf-8'),
         hashlib.sha256
     ).hexdigest()
+    return current_time, signature
 
+def send_request(method, endpoint, params=None, data=None):
+    import json
+    url = BASE_URL + endpoint
+    query_string = ''
+    if params:
+        query_string = '?' + '&'.join([f"{k}={v}" for k, v in sorted(params.items())])
+        url += query_string
+    
+    payload_str = json.dumps(data) if data else ''
+    timestamp, signature = generate_signature(method, endpoint, query_string, payload_str)
+    
     headers = {
-        "api-key": API_KEY,
-        "timestamp": timestamp,
-        "signature": signature,
-        "Content-Type": "application/json",
+        'api-key': API_KEY,
+        'timestamp': timestamp,
+        'signature': signature,
+        'Content-Type': 'application/json'
     }
-
-    response = session.request(
-        method=method,
-        url=BASE_URL + path,
-        params=params or None,
-        data=body if body else None,
-        headers=headers,
-        timeout=15
-    )
-
-    if not response.ok:
-        raise RuntimeError(
-            f"HTTP {response.status_code}: {response.text[:700]}"
-        )
-
-    data = response.json()
-
-    if not data.get("success"):
-        raise RuntimeError(f"Delta API error: {data}")
-
-    return data.get("result")
-
-
-# ============== MARKET DATA ==============
-
-def get_candles():
-    now = int(time.time())
-
-    response = session.get(
-        BASE_URL + "/v2/history/candles",
-        params={
-            "resolution": TIMEFRAME,
-            "symbol": SYMBOL,
-            "start": now - 86400,
-            "end": now,
-        },
-        timeout=15
-    )
-
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("success"):
-        raise RuntimeError(f"Candle API error: {data}")
-
-    return sorted(
-        data.get("result", []),
-        key=lambda candle: candle["time"]
-    )
-
-
-def calculate_ema(values, period):
-    if len(values) < period:
+    
+    try:
+        if method == 'GET':
+            response = requests.get(url, headers=headers)
+        elif method == 'POST':
+            response = requests.post(url, headers=headers, data=payload_str)
+        elif method == 'DELETE':
+            response = requests.delete(url, headers=headers, data=payload_str)
+        return response.json()
+    except Exception as e:
+        print(f"[API Error] {e}")
         return None
 
-    ema = sum(values[:period]) / period
-    alpha = 2 / (period + 1)
+def get_market_price():
+    res = send_request('GET', f'/v2/products/{PRODUCT_ID}')
+    if res and res.get('success'):
+        result = res.get('result', {})
+        return float(result.get('spot_price', 0))
+    return 0.0
 
-    for value in values[period:]:
-        ema = alpha * value + (1 - alpha) * ema
-
-    return ema
-
-
-# ============== PRODUCT ==============
-
-def get_product():
-    response = session.get(
-        BASE_URL + "/v2/products",
-        params={"page_size": 100},
-        timeout=15
-    )
-
-    response.raise_for_status()
-    data = response.json()
-
-    if not data.get("success"):
-        raise RuntimeError(f"Product API error: {data}")
-
-    products = data.get("result", [])
-
-    for product in products:
-        if product.get("symbol") == SYMBOL:
-            print(
-                "[PRODUCT]",
-                {
-                    "symbol": product.get("symbol"),
-                    "id": product.get("id"),
-                    "contract_value": product.get("contract_value"),
-                },
-                flush=True
-            )
-
-            if not product.get("id"):
-                raise RuntimeError("Product ID missing.")
-
-            return product
-
-    raise RuntimeError(
-        f"{SYMBOL} was not found in the returned products."
-    )
-
-
-# ============== LEVERAGE ==============
-
-def set_leverage(product_id):
-    result = api_request(
-        "POST",
-        f"/v2/products/{product_id}/orders/leverage",
-        payload={"leverage": LEVERAGE}
-    )
-
-    print("[LEVERAGE RESPONSE]", result, flush=True)
-    return result
-
-
-# ============== POSITIONS ==============
-
-def get_positions(product_id):
-    result = api_request(
-        "GET",
-        "/v2/positions/margined",
-        params={"product_ids": str(product_id)}
-    )
-
-    if isinstance(result, dict):
-        result = result.get("positions", [])
-
-    return result or []
-
-
-def find_open_position(positions):
-    for position in positions:
-        size = float(position.get("size") or 0)
-
-        if size != 0:
-            return position
-
+def get_open_position():
+    res = send_request('GET', '/v2/positions', params={'product_id': PRODUCT_ID})
+    if res and res.get('success'):
+        positions = res.get('result', [])
+        for pos in positions:
+            if float(pos.get('size', 0)) != 0:
+                return pos
     return None
 
-
-# ============== MARKET ORDER ==============
-
-def place_market_order(product_id, side):
+def place_market_order(side, size):
+    endpoint = '/v2/orders'
     payload = {
-        "product_id": product_id,
-        "size": ORDER_SIZE,
+        "product_id": PRODUCT_ID,
+        "size": int(size),
         "side": side,
         "order_type": "market_order",
-        "time_in_force": "ioc",
-        "client_order_id": f"ema_{int(time.time())}",
+        "time_in_force": "ioc"
     }
+    print(f"[Execution] Placing Pure Market {side.upper()} order for BTCUSD with size {size}...")
+    res = send_request('POST', endpoint, data=payload)
+    print(f"[ENTRY RESPONSE] {res}")
+    return res
 
-    result = api_request(
-        "POST",
-        "/v2/orders",
-        payload=payload
-    )
-
-    print("[ENTRY RESPONSE]", result, flush=True)
-
-    if not isinstance(result, dict):
-        raise RuntimeError("Unexpected order response.")
-
-    return result
-
-
-# ============== TRAILING STOP ==============
-
-def place_trailing_stop(product_id):
-    """
-    Submit a reduce-only trailing stop for the open position.
-
-    This is a trailing stop, not a separate fixed-price stop.
-    Confirm the returned order on the Testnet before relying on it.
-    """
-
+def place_stop_loss_order(side, size, stop_price):
+    endpoint = '/v2/orders'
+    # For a SELL position, stop-loss order to close is BUY. For a BUY position, it is SELL.
+    close_side = "buy" if side == "sell" else "sell"
     payload = {
-        "product_id": product_id,
-        "stop_loss_order": {
-            "order_type": "market_order",
-            "trail_amount": str(TRAIL_AMOUNT_USD),
-        },
-        "bracket_stop_trigger_method": "mark_price",
+        "product_id": PRODUCT_ID,
+        "size": int(abs(size)),
+        "side": close_side,
+        "order_type": "stop_order",
+        "stop_price": str(round(stop_price, 1)),
+        "stop_order_type": "market",
+        "reduce_only": True,
+        "time_in_force": "gtc"
     }
+    res = send_request('POST', endpoint, data=payload)
+    return res
 
-    result = api_request(
-        "POST",
-        "/v2/orders/bracket",
-        payload=payload
-    )
+def cancel_existing_orders():
+    # Cancel open stop orders if any
+    res = send_request('GET', '/v2/orders', params={'product_id': PRODUCT_ID, 'state': 'open'})
+    if res and res.get('success'):
+        for order in res.get('result', []):
+            if order.get('order_type') == 'stop_order':
+                send_request('DELETE', '/v2/orders', data={'id': order['id'], 'product_id': PRODUCT_ID})
 
-    print("[TRAILING STOP RESPONSE]", result, flush=True)
-    return result
-
-
-# ============== SIGNAL PROCESSING ==============
-
-def process_signal():
-    global last_candle_time, last_signal
-
-    candles = get_candles()
-
-    if len(candles) < 201:
-        print(
-            f"[WAIT] Need 201 candles; got {len(candles)}",
-            flush=True
-        )
+def check_strategy_and_manage():
+    global current_sl_order_id, last_triggered_step
+    
+    position = get_open_position()
+    current_price = get_market_price()
+    
+    if not position:
+        # No position open, reset tracking state
+        if current_sl_order_id is not None:
+            cancel_existing_orders()
+            current_sl_order_id = None
+            last_triggered_step = -1
+            print("[State Reset] Position closed. Resetting TSL states.")
+        
+        # Simple entry logic simulation (e.g. DOWNTREND signal example or your EMA condition)
+        # Yahan aap apna EMA crossover condition laga sakte hain. Filhal bot ready state mein hai.
         return
 
-    # Ignore the current unfinished candle.
-    completed = candles[:-1]
+    # If position exists
+    pos_size = float(position.get('size', 0))
+    entry_price = float(position.get('entry_price', 0))
+    side = "sell" if pos_size < 0 else "buy"
+    abs_size = abs(pos_size)
 
-    if not completed:
+    if current_price == 0 or entry_price == 0:
         return
 
-    candle = completed[-1]
-    candle_time = candle["time"]
-
-    if candle_time == last_candle_time:
-        return
-
-    closes = [float(c["close"]) for c in completed]
-
-    price = closes[-1]
-    ema9 = calculate_ema(closes, 9)
-    ema21 = calculate_ema(closes, 21)
-    ema200 = calculate_ema(closes, 200)
-
-    if any(value is None for value in (ema9, ema21, ema200)):
-        print("[WAIT] EMA data incomplete.", flush=True)
-        return
-
-    # Process each completed candle once.
-    last_candle_time = candle_time
-
-    print(
-        f"[MARKET] {SYMBOL} "
-        f"price={price:.2f} "
-        f"EMA9={ema9:.2f} "
-        f"EMA21={ema21:.2f} "
-        f"EMA200={ema200:.2f}",
-        flush=True
-    )
-
-    if ema9 > ema21 and price > ema200:
-        signal = "buy"
-    elif ema9 < ema21 and price < ema200:
-        signal = "sell"
+    # Calculate profit in points
+    if side == "sell":
+        profit_pts = entry_price - current_price
     else:
-        signal = "wait"
+        profit_pts = current_price - entry_price
 
-    print(f"[SIGNAL] {signal.upper()}", flush=True)
+    print(f"[Position Active] Side: {side.upper()} | Size: {abs_size} | Entry: {entry_price} | LTP: {current_price} | Profit Pts: {profit_pts:.1f}")
 
-    if signal == "wait":
-        return
+    # Check Trailing Milestones
+    matched_step_index = -1
+    lock_offset = 0
 
-    if signal == last_signal:
-        print(
-            "[SKIP] Same signal as the previous processed signal.",
-            flush=True
-        )
-        return
+    for i, step in enumerate(TRAILING_STEPS):
+        if profit_pts >= step["trigger"]:
+            matched_step_index = i
+            lock_offset = step["lock"]
 
-    if not ENABLE_TRADING:
-        print(
-            "[SAFE MODE] Trading is OFF. No order placed.",
-            flush=True
-        )
-        return
+    # If a new milestone is reached
+    if matched_step_index > last_triggered_step:
+        # Calculate new stop price
+        if side == "sell":
+            new_stop_price = entry_price - lock_offset
+        else:
+            new_stop_price = entry_price + lock_offset
 
-    if not lock.acquire(blocking=False):
-        print("[SKIP] Another operation is running.", flush=True)
-        return
+        print(f"[TSL Triggered] Milestone {matched_step_index} reached! Updating Stop Loss to {new_stop_price}")
+        
+        # Cancel old stop orders and place new updated stop order
+        cancel_existing_orders()
+        res = place_stop_loss_order(side, abs_size, new_stop_price)
+        
+        if res and res.get('success'):
+            last_triggered_step = matched_step_index
+            print(f"[TSL Success] Stop Loss successfully updated on exchange.")
+        else:
+            print(f"[TSL Error] Failed to update stop loss: {res}")
 
-    try:
-        product = get_product()
-        product_id = int(product["id"])
-
-        # Set requested leverage.
-        set_leverage(product_id)
-
-        # Do not add a second position to an existing position.
-        positions = get_positions(product_id)
-        existing = find_open_position(positions)
-
-        if existing:
-            print(
-                "[SKIP] Existing position found; no new entry.",
-                existing,
-                flush=True
-            )
-            return
-
-        # Submit the entry order.
-        order = place_market_order(product_id, signal)
-
-        state = str(order.get("state", "")).lower()
-        filled_size = abs(int(order.get("size") or 0))
-        entry_price = order.get("average_fill_price")
-
-        # Only proceed when the API confirms a complete fill.
-        if state != "closed" or not entry_price or filled_size == 0:
-            print(
-                "[WARNING] Fill not confirmed. "
-                "No trailing stop submitted automatically. "
-                "Check Testnet orders and positions.",
-                flush=True
-            )
-            return
-
-        print(
-            f"[ENTRY CONFIRMED] side={signal} "
-            f"price={entry_price} size={filled_size}",
-            flush=True
-        )
-
-        # Add trailing protection after confirmed entry.
-        try:
-            place_trailing_stop(product_id)
-        except Exception as stop_error:
-            print(
-                "[CRITICAL] Entry may be open, but trailing stop "
-                "could not be confirmed. Check the position and "
-                "orders immediately:",
-                str(stop_error),
-                flush=True
-            )
-            return
-
-        last_signal = signal
-
-    except Exception as exc:
-        print("[TRADE ERROR]", str(exc), flush=True)
-
-    finally:
-        lock.release()
-
-
-# ============== MAIN LOOP ==============
-
-def trading_loop():
-    print(
-        "[BOT] Started | "
-        f"Symbol={SYMBOL} | "
-        f"Timeframe={TIMEFRAME} | "
-        f"Size={ORDER_SIZE} | "
-        f"Leverage={LEVERAGE}x | "
-        f"Trading={'ON' if ENABLE_TRADING else 'OFF'}",
-        flush=True
-    )
-
-    while True:
-        try:
-            process_signal()
-        except Exception as exc:
-            print("[BOT ERROR]", str(exc), flush=True)
-
-        time.sleep(CHECK_INTERVAL)
-
-
-# ============== START SERVER ==============
-
-if __name__ == "__main__":
-    threading.Thread(
-        target=trading_loop,
-        daemon=True
-    ).start()
-
-    port = int(os.environ.get("PORT", "10000"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
-    )
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Bot Server Started & Port {port} Bound...")
+    # Background loop ya periodic check ke liye yahan app run hoti hai
+    app.run(host='0.0.0.0', port=port)
