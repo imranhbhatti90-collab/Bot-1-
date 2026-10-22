@@ -4,7 +4,6 @@ import json
 import hmac
 import hashlib
 import logging
-from decimal import Decimal, ROUND_HALF_UP
 from threading import Thread, Lock
 
 import requests
@@ -12,7 +11,7 @@ import pandas as pd
 from flask import Flask, jsonify
 
 # =====================================================
-# SETTINGS
+# CONFIGURATION — TESTNET ONLY
 # =====================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
@@ -25,9 +24,10 @@ ENABLE_TRADING = (
 )
 
 SYMBOL = "BTCUSD"
-TIMEFRAME_MINUTES = 5
+RESOLUTION = "5m"
+
 ORDER_SIZE = 40
-LEVERAGE = 50
+LEVERAGE_DISPLAY = 50
 
 EMA_FAST = 9
 EMA_MID = 21
@@ -35,7 +35,7 @@ EMA_SLOW = 200
 
 INITIAL_SL_PCT = 0.20
 
-# Profit milestones in BTCUSD price points.
+# Profit points -> minimum profit to lock
 TRAILING_STEPS = [
     (100, 0),
     (200, 100),
@@ -45,7 +45,7 @@ TRAILING_STEPS = [
 POLL_SECONDS = 15
 
 # =====================================================
-# LOGGING / WEB SERVER
+# LOGGING
 # =====================================================
 
 logging.basicConfig(
@@ -54,56 +54,59 @@ logging.basicConfig(
 )
 
 app = Flask(__name__)
-
 session = requests.Session()
 state_lock = Lock()
 
+bot_status = "STARTING"
+last_error = None
 last_processed_candle = None
 last_signal = None
 last_entry_order_id = None
-last_trailing_lock = -1
-last_stop_price = None
-bot_status = "STARTING"
-last_error = None
-
 
 # =====================================================
-# SIGNED API REQUEST
-# Delta REST signing: METHOD + timestamp + path + query + body
+# API REQUEST
 # =====================================================
 
 def api_request(method, path, params=None, payload=None, auth=True):
     params = params or {}
     payload = payload or {}
 
-    query = requests.models.Request(
-        "GET", BASE_URL + path, params=params
-    ).prepare().url
+    prepared = requests.Request(
+        method.upper(),
+        BASE_URL + path,
+        params=params
+    ).prepare()
 
     query_string = ""
-    if query and "?" in query:
-        query_string = query.split("?", 1)[1]
+    if prepared.url and "?" in prepared.url:
+        query_string = prepared.url.split("?", 1)[1]
 
-    body = json.dumps(payload, separators=(",", ":")) if payload else ""
+    body = (
+        json.dumps(payload, separators=(",", ":"))
+        if payload else ""
+    )
 
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
+        "User-Agent": "BTCUSD-Testnet-Bot"
     }
 
     if auth:
         if not API_KEY or not API_SECRET:
             raise RuntimeError(
-                "DELTA_API_KEY / DELTA_API_SECRET Render Environment mein missing hain"
+                "Render Environment mein API keys missing hain."
             )
 
         timestamp = str(int(time.time()))
-        signature_data = method.upper() + timestamp + path
 
-        if query_string:
-            signature_data += "?" + query_string
-
-        signature_data += body
+        signature_data = (
+            method.upper()
+            + timestamp
+            + path
+            + ("?" + query_string if query_string else "")
+            + body
+        )
 
         signature = hmac.new(
             API_SECRET.encode(),
@@ -132,23 +135,24 @@ def api_request(method, path, params=None, payload=None, auth=True):
     try:
         result = response.json()
     except ValueError:
-        result = {"raw_response": response.text[:500]}
+        result = {"response": response.text[:500]}
 
     if response.status_code >= 400:
         raise RuntimeError(
-            f"HTTP {response.status_code}: {json.dumps(result)[:800]}"
+            f"HTTP {response.status_code}: "
+            f"{json.dumps(result)[:700]}"
         )
 
     if isinstance(result, dict) and result.get("success") is False:
         raise RuntimeError(
-            f"Delta API error: {json.dumps(result)[:800]}"
+            f"API error: {json.dumps(result)[:700]}"
         )
 
     return result
 
 
 # =====================================================
-# MARKET DATA
+# PRODUCT
 # =====================================================
 
 def get_product():
@@ -160,6 +164,7 @@ def get_product():
     )
 
     products = data.get("result", [])
+
     if isinstance(products, dict):
         products = [products]
 
@@ -168,162 +173,103 @@ def get_product():
             return product
 
     raise RuntimeError(
-        f"{SYMBOL} product nahi mila: {json.dumps(data)[:500]}"
+        f"Product {SYMBOL} nahi mila: "
+        f"{json.dumps(data)[:400]}"
     )
 
 
-def get_candles(product_id):
+# =====================================================
+# CANDLES + INDICATORS
+# =====================================================
+
+def get_candles():
+    now = int(time.time())
+
     data = api_request(
         "GET",
         "/v2/history/candles",
         params={
-            "resolution": "5m",
+            "resolution": RESOLUTION,
             "symbol": SYMBOL,
-            "start": int(time.time()) - 200 * 5 * 60,
-            "end": int(time.time()),
+            "start": now - 250 * 5 * 60,
+            "end": now,
         },
         auth=False
     )
 
     candles = data.get("result", [])
+
     if not candles:
-        raise RuntimeError(
-            f"Candle data empty: {json.dumps(data)[:500]}"
-        )
+        raise RuntimeError("API se candle data empty mila.")
 
     df = pd.DataFrame(candles)
 
-    required = {"open", "high", "low", "close"}
-    if not required.issubset(set(df.columns)):
+    required = {"open", "high", "low", "close", "time"}
+
+    if not required.issubset(df.columns):
         raise RuntimeError(
-            f"Unexpected candle format: {list(df.columns)}"
+            f"Candle columns unexpected: {list(df.columns)}"
         )
 
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df = df.dropna(subset=["close"]).sort_values(
-        "time" if "time" in df.columns else df.index.name or df.columns[0]
+    for col in ["open", "high", "low", "close", "time"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(
+        subset=["time", "open", "high", "low", "close"]
     )
 
-    df["ema9"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=EMA_MID, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+    # Oldest candle first, newest candle last.
+    df = df.sort_values("time").drop_duplicates(
+        subset=["time"], keep="last"
+    ).reset_index(drop=True)
 
-    return df.reset_index(drop=True)
+    if len(df) < EMA_SLOW + 3:
+        raise RuntimeError(
+            f"EMA200 ke liye candles kam hain: {len(df)}"
+        )
 
+    df["ema9"] = df["close"].ewm(
+        span=EMA_FAST, adjust=False
+    ).mean()
 
-def get_open_positions(product_id):
-    data = api_request(
-        "GET",
-        "/v2/positions",
-        params={"product_id": product_id},
-        auth=True
-    )
+    df["ema21"] = df["close"].ewm(
+        span=EMA_MID, adjust=False
+    ).mean()
 
-    positions = data.get("result", [])
-    if isinstance(positions, dict):
-        positions = [positions]
+    df["ema200"] = df["close"].ewm(
+        span=EMA_SLOW, adjust=False
+    ).mean()
 
-    return [
-        p for p in positions
-        if p.get("product_id") == product_id
-        and float(p.get("size", 0) or 0) != 0
-    ]
-
-
-def get_open_orders(product_id):
-    data = api_request(
-        "GET",
-        "/v2/orders",
-        params={
-            "product_id": product_id,
-            "state": "open",
-        },
-        auth=True
-    )
-
-    orders = data.get("result", [])
-    return orders if isinstance(orders, list) else []
+    return df
 
 
 # =====================================================
-# ORDER MANAGEMENT
-# =====================================================
-
-def place_market_order(product_id, side, size):
-    payload = {
-        "product_id": product_id,
-        "product_symbol": SYMBOL,
-        "size": size,
-        "side": side,
-        "order_type": "market_order",
-        "time_in_force": "ioc",
-        "reduce_only": False,
-    }
-
-    result = api_request("POST", "/v2/orders", payload=payload)
-    logging.info("ORDER RESPONSE: %s", json.dumps(result)[:1000])
-    return result.get("result", {})
-
-
-def place_stop_order(product_id, side, size, stop_price):
-    payload = {
-        "product_id": product_id,
-        "product_symbol": SYMBOL,
-        "size": size,
-        "side": side,
-        "order_type": "market_order",
-        "stop_order_type": "stop_loss_order",
-        "stop_price": str(stop_price),
-        "stop_trigger_method": "last_traded_price",
-        "time_in_force": "gtc",
-        "reduce_only": True,
-    }
-
-    result = api_request("POST", "/v2/orders", payload=payload)
-    logging.info("STOP RESPONSE: %s", json.dumps(result)[:1000])
-    return result.get("result", {})
-
-
-def cancel_order(order_id):
-    return api_request("DELETE", f"/v2/orders/{order_id}")
-
-
-def cancel_bot_stop_orders(product_id):
-    orders = get_open_orders(product_id)
-
-    for order in orders:
-        if (
-            order.get("stop_order_type") == "stop_loss_order"
-            and order.get("reduce_only") is True
-        ):
-            order_id = order.get("id")
-            if order_id:
-                try:
-                    cancel_order(order_id)
-                    logging.info("Cancelled old stop order id=%s", order_id)
-                except Exception as exc:
-                    logging.error("Could not cancel stop %s: %s", order_id, exc)
-
-
-# =====================================================
-# EMA SIGNAL
+# SIGNAL
 # =====================================================
 
 def get_signal(df):
-    if len(df) < EMA_SLOW + 3:
-        return None
-
-    # Use the last fully closed candle.
+    # Last candle may still be forming.
     candle = df.iloc[-2]
 
-    bullish = (
-        candle["ema9"] > candle["ema21"]
-        and candle["close"] > candle["ema200"]
-    )
+    close = float(candle["close"])
+    ema9 = float(candle["ema9"])
+    ema21 = float(candle["ema21"])
+    ema200 = float(candle["ema200"])
 
-    bearish = (
-        candle["ema9"] < candle["ema21"]
-        and candle["close"] < candle["ema200"]
+    bullish = ema9 > ema21 and close > ema200
+    bearish = ema9 < ema21 and close < ema200
+
+    logging.info(
+        "[SIGNAL CHECK] candle=%s close=%.2f "
+        "EMA9=%.2f EMA21=%.2f EMA200=%.2f "
+        "BUY=%s SELL=%s",
+        int(candle["time"]),
+        close,
+        ema9,
+        ema21,
+        ema200,
+        bullish,
+        bearish
     )
 
     if bullish:
@@ -336,186 +282,282 @@ def get_signal(df):
 
 
 # =====================================================
-# STOP LOSS / TRAILING STOP
+# POSITIONS
+# =====================================================
+
+def get_open_positions(product_id):
+    data = api_request(
+        "GET",
+        "/v2/positions",
+        params={"product_id": product_id},
+        auth=True
+    )
+
+    positions = data.get("result", [])
+
+    if isinstance(positions, dict):
+        positions = [positions]
+
+    result = []
+
+    for position in positions:
+        if position.get("product_id") is not None:
+            if int(position["product_id"]) != int(product_id):
+                continue
+
+        size = float(position.get("size", 0) or 0)
+
+        if size != 0:
+            result.append(position)
+
+    return result
+
+
+def position_side(position):
+    # Prefer the exchange's explicit side when available.
+    side = str(position.get("side", "")).lower()
+
+    if side in ("buy", "sell", "long", "short"):
+        return "buy" if side in ("buy", "long") else "sell"
+
+    size = float(position.get("size", 0) or 0)
+
+    if size > 0:
+        return "buy"
+
+    if size < 0:
+        return "sell"
+
+    return None
+
+
+# =====================================================
+# ORDERS
+# =====================================================
+
+def place_market_order(product_id, side, size):
+    if not ENABLE_TRADING:
+        raise RuntimeError("Trading disabled; order blocked.")
+
+    payload = {
+        "product_id": int(product_id),
+        "size": int(size),
+        "side": side,
+        "order_type": "market_order",
+        "time_in_force": "ioc",
+        "reduce_only": False,
+    }
+
+    logging.warning(
+        "[ORDER ATTEMPT] symbol=%s side=%s size=%s",
+        SYMBOL, side, size
+    )
+
+    response = api_request(
+        "POST",
+        "/v2/orders",
+        payload=payload,
+        auth=True
+    )
+
+    order = response.get("result", {})
+
+    logging.info(
+        "[ORDER RESPONSE] %s",
+        json.dumps(response)[:1000]
+    )
+
+    if not order or not order.get("id"):
+        raise RuntimeError(
+            "Order response mein ID nahi mili; "
+            "execution verify karein."
+        )
+
+    return order
+
+
+def place_stop_order(product_id, side, size, stop_price):
+    payload = {
+        "product_id": int(product_id),
+        "size": int(size),
+        "side": side,
+        "order_type": "market_order",
+        "stop_order_type": "stop_loss_order",
+        "stop_price": str(round(float(stop_price), 1)),
+        "stop_trigger_method": "last_traded_price",
+        "time_in_force": "gtc",
+        "reduce_only": True,
+    }
+
+    response = api_request(
+        "POST",
+        "/v2/orders",
+        payload=payload,
+        auth=True
+    )
+
+    order = response.get("result", {})
+
+    logging.info(
+        "[STOP RESPONSE] %s",
+        json.dumps(response)[:1000]
+    )
+
+    if not order or not order.get("id"):
+        raise RuntimeError(
+            "Stop order response mein ID nahi mili."
+        )
+
+    return order
+
+
+# =====================================================
+# POSITION / STOP MONITOR
 # =====================================================
 
 def manage_position(product_id, position, price):
-    global last_trailing_lock, last_stop_price
+    side = position_side(position)
 
-    raw_size = float(position.get("size", 0) or 0)
+    if side is None:
+        logging.error("Position side identify nahi hui: %s", position)
+        return
+
     entry = float(position.get("entry_price", 0) or 0)
+    raw_size = abs(float(position.get("size", 0) or 0))
+    size = int(raw_size)
 
-    if raw_size == 0 or entry <= 0:
+    if entry <= 0 or size <= 0:
+        logging.error(
+            "Invalid position details: %s",
+            json.dumps(position)[:500]
+        )
         return
 
-    side = "buy" if raw_size > 0 else "sell"
     close_side = "sell" if side == "buy" else "buy"
-    size = int(abs(raw_size))
-
-    if size <= 0:
-        return
 
     profit_points = (
         price - entry if side == "buy"
         else entry - price
     )
 
-    # Initial SL.
     if side == "buy":
         stop_price = entry * (1 - INITIAL_SL_PCT / 100)
     else:
         stop_price = entry * (1 + INITIAL_SL_PCT / 100)
 
-    lock_points = -1
+    lock_points = None
 
     for trigger, lock in TRAILING_STEPS:
         if profit_points >= trigger:
             lock_points = lock
 
-    if lock_points >= 0:
+    if lock_points is not None:
         if side == "buy":
             stop_price = max(stop_price, entry + lock_points)
         else:
             stop_price = min(stop_price, entry - lock_points)
 
-    # Avoid repeatedly replacing the same stop.
-    rounded_stop = round(stop_price, 1)
-
-    if (
-        last_stop_price is not None
-        and rounded_stop == last_stop_price
-        and lock_points == last_trailing_lock
-    ):
-        return
-
     logging.info(
-        "POSITION side=%s entry=%.2f price=%.2f profit_points=%.2f stop=%.2f",
-        side, entry, price, profit_points, rounded_stop
+        "[POSITION] side=%s entry=%.2f price=%.2f "
+        "profit_points=%.2f proposed_stop=%.2f",
+        side, entry, price, profit_points, stop_price
     )
 
-    # Cancel existing stop only when replacement is ready to be attempted.
-    try:
-        new_order = place_stop_order(
-            product_id, close_side, size, rounded_stop
-        )
-    except Exception as exc:
-        logging.error("STOP PLACEMENT FAILED: %s", exc)
-        return
-
-    new_order_id = new_order.get("id")
-    if not new_order_id:
-        logging.error("Stop API response mein order ID nahi mila.")
-        return
-
-    # Only after new stop is accepted, cancel older stops.
-    orders = get_open_orders(product_id)
-    for order in orders:
-        if (
-            order.get("id") != new_order_id
-            and order.get("stop_order_type") == "stop_loss_order"
-            and order.get("reduce_only") is True
-        ):
-            try:
-                cancel_order(order["id"])
-            except Exception as exc:
-                logging.error("Old stop cancel failed: %s", exc)
-
-    last_stop_price = rounded_stop
-    last_trailing_lock = lock_points
+    logging.warning(
+        "[STOP CHECK ONLY] Proposed stop is logged. "
+        "Existing stop orders are not automatically replaced."
+    )
 
 
 # =====================================================
-# MAIN BOT LOOP
+# BOT LOOP
 # =====================================================
 
 def bot_loop():
-    global last_processed_candle, last_signal, bot_status, last_error
+    global bot_status, last_error
+    global last_processed_candle, last_signal, last_entry_order_id
 
     while True:
         try:
             if not API_KEY or not API_SECRET:
                 bot_status = "WAITING_FOR_API_KEYS"
-                logging.error(
-                    "Render Environment mein DELTA_API_KEY aur "
-                    "DELTA_API_SECRET set karein."
+                raise RuntimeError(
+                    "Render Environment mein API keys missing hain."
                 )
-                time.sleep(15)
-                continue
 
             product = get_product()
             product_id = int(product["id"])
 
-            candles = get_candles(product_id)
-            price = float(candles.iloc[-1]["close"])
+            candles = get_candles()
 
-            # Prevent repeated entries during the same candle.
-            closed_candle = candles.iloc[-2]
-            candle_time = str(
-                closed_candle["time"]
-                if "time" in candles.columns
-                else len(candles) - 2
-            )
+            # Latest price is informational; signal uses closed candle.
+            price = float(candles.iloc[-1]["close"])
+            signal_candle = candles.iloc[-2]
+            candle_time = int(signal_candle["time"])
 
             signal = get_signal(candles)
 
             logging.info(
-                "[MARKET] %s price=%.2f EMA9=%.2f EMA21=%.2f EMA200=%.2f",
+                "[MARKET] %s price=%.2f "
+                "EMA9=%.2f EMA21=%.2f EMA200=%.2f",
                 SYMBOL,
                 price,
-                candles.iloc[-2]["ema9"],
-                candles.iloc[-2]["ema21"],
-                candles.iloc[-2]["ema200"]
+                float(signal_candle["ema9"]),
+                float(signal_candle["ema21"]),
+                float(signal_candle["ema200"])
             )
 
             positions = get_open_positions(product_id)
 
             if positions:
-                # Manage an existing position first; don't open another.
+                bot_status = "POSITION_OPEN"
                 manage_position(product_id, positions[0], price)
-                bot_status = "POSITION_MANAGED"
 
-            elif signal:
-                logging.info("[SIGNAL] %s", signal.upper())
-
-                if not ENABLE_TRADING:
-                    bot_status = "SAFE_MODE"
-                    logging.warning(
-                        "[SAFE MODE] Trading is OFF. No order placed."
-                    )
-
-                elif candle_time != last_processed_candle:
-                    # Only one entry attempt per closed candle.
-                    last_processed_candle = candle_time
-                    last_signal = signal
-
-                    order = place_market_order(
-                        product_id, signal, ORDER_SIZE
-                    )
-
-                    if order:
-                        last_entry_order_id = order.get("id")
-                        bot_status = "ORDER_SENT"
-                        logging.info(
-                            "ENTRY ORDER SENT id=%s side=%s",
-                            last_entry_order_id, signal
-                        )
-                    else:
-                        bot_status = "ORDER_RESPONSE_EMPTY"
-                        logging.error("Order response empty: %s", order)
-
-                else:
-                    bot_status = "WAITING_NEXT_CANDLE"
-
-            else:
+            elif signal is None:
                 bot_status = "NO_SIGNAL"
                 logging.info("[SIGNAL] No trade")
+
+            elif not ENABLE_TRADING:
+                bot_status = "SAFE_MODE"
+                logging.warning(
+                    "[SAFE MODE] %s signal hai, lekin trading disabled hai.",
+                    signal.upper()
+                )
+
+            elif candle_time == last_processed_candle:
+                bot_status = "WAITING_NEXT_CANDLE"
+                logging.info(
+                    "[ENTRY SKIPPED] Is candle par entry pehle attempt hui."
+                )
+
+            else:
+                # Record attempt before sending to avoid duplicate entries
+                # if the request times out after the exchange accepted it.
+                last_processed_candle = candle_time
+                last_signal = signal
+
+                order = place_market_order(
+                    product_id,
+                    signal,
+                    ORDER_SIZE
+                )
+
+                last_entry_order_id = order["id"]
+                bot_status = "ORDER_ACCEPTED"
+
+                logging.warning(
+                    "[ORDER ACCEPTED] id=%s side=%s. "
+                    "Check Testnet positions to verify fill.",
+                    last_entry_order_id,
+                    signal
+                )
 
             last_error = None
 
         except Exception as exc:
             last_error = str(exc)
             bot_status = "ERROR"
-            logging.exception("BOT LOOP ERROR: %s", exc)
+            logging.exception("[BOT LOOP ERROR] %s", exc)
 
         time.sleep(POLL_SECONDS)
 
@@ -528,11 +570,13 @@ def bot_loop():
 def home():
     return jsonify({
         "bot": "BTCUSD EMA Bot",
-        "timeframe": "5m",
+        "timeframe": RESOLUTION,
         "size": ORDER_SIZE,
-        "leverage_setting": LEVERAGE,
+        "leverage_setting_display_only": LEVERAGE_DISPLAY,
         "trading_enabled": ENABLE_TRADING,
         "status": bot_status,
+        "last_signal": last_signal,
+        "last_entry_order_id": last_entry_order_id,
         "last_error": last_error,
     })
 
@@ -549,9 +593,12 @@ def health():
 
 if __name__ == "__main__":
     logging.info(
-        "[BOT] Starting | BTCUSD | 5m | Size=%s | Leverage=%sx | Trading=%s",
+        "[BOT] Starting | %s | %s | Size=%s | "
+        "Leverage display=%sx | Trading=%s",
+        SYMBOL,
+        RESOLUTION,
         ORDER_SIZE,
-        LEVERAGE,
+        LEVERAGE_DISPLAY,
         "ON" if ENABLE_TRADING else "OFF"
     )
 
