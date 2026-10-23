@@ -297,7 +297,7 @@ def get_signal(df):
 
 
 # ==================================================
-# POSITION CHECK
+# POSITION CHECK (FIXED)
 # ==================================================
 
 def get_positions():
@@ -312,11 +312,11 @@ def get_positions():
 
     positions = result.get("result", [])
 
-    # API may return one position object or a list.
     if isinstance(positions, dict):
         positions = [positions]
 
     return positions
+
 
 def get_open_position():
     for position in get_positions():
@@ -458,7 +458,6 @@ def place_entry(product, side):
 
     logging.info("[ENTRY RESPONSE] %s", result)
 
-    # Wait briefly for the market order to fill and position to appear.
     position = None
 
     for _ in range(10):
@@ -486,7 +485,6 @@ def place_entry(product, side):
 
     stop = initial_stop(actual_side, entry, product)
 
-    # Save state before creating the protective stop.
     state["position"] = {
         "entry_order_id": order_id,
         "side": actual_side,
@@ -530,12 +528,8 @@ def place_entry(product, side):
 
     except Exception:
         logging.exception(
-            "CRITICAL: protective stop order failed after entry. "
-            "Do not assume the position is protected."
+            "CRITICAL: protective stop order failed after entry."
         )
-        # Do not automatically open another trade.
-        # Inspect the exchange account and close/secure the position
-        # manually if necessary.
         raise
 
 
@@ -562,8 +556,6 @@ def initial_stop(side, entry, product):
 
 def place_stop_order(product, side, size, stop_price):
     product_id = int(product["id"])
-
-    # Stop order must be on the opposite side of the position.
     stop_side = "sell" if side == "buy" else "buy"
 
     body = {
@@ -649,9 +641,7 @@ def manage_trailing_stop(product):
 
     if not saved:
         logging.error(
-            "An open exchange position exists but bot state is missing. "
-            "Automatic trailing is paused; inspect the position and "
-            "protective orders manually."
+            "An open exchange position exists but bot state is missing."
         )
         return
 
@@ -685,7 +675,6 @@ def manage_trailing_stop(product):
 
     desired_stop = round_price(desired_stop, product)
 
-    # Never loosen the stop.
     if side == "buy":
         new_stop = max(old_stop, desired_stop)
         improves = new_stop > old_stop
@@ -752,7 +741,6 @@ def bot_main_loop():
                     product.get("tick_size"),
                 )
 
-            # Manage an existing position on every polling cycle.
             if ENABLE_TRADING:
                 with trade_lock:
                     manage_trailing_stop(product)
