@@ -7,9 +7,20 @@ import logging
 import requests
 import pandas as pd
 from decimal import Decimal
+from threading import Thread
+from flask import Flask
 
 # ==========================================
-# BTCUSD EMA 9/21 BOT - DELTA TESTNET
+# FLASK WEB SERVER (For Render Free Tier)
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "BTCUSD EMA 9/21 Trading Bot is Live and Running!"
+
+# ==========================================
+# BTCUSD EMA 9/21 BOT - CONFIGURATION
 # ==========================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
@@ -223,51 +234,10 @@ def has_open_position():
 
 
 # ==========================================
-# STOP-LOSS PRICE CALCULATION
-# ==========================================
-
-def initial_stop_loss(entry_price, side):
-    entry = Decimal(str(entry_price))
-    pct = INITIAL_SL_PERCENT / Decimal("100")
-
-    if side == "buy":
-        return entry * (Decimal("1") - pct)
-
-    return entry * (Decimal("1") + pct)
-
-
-def trailing_stop_price(entry_price, side, profit_points):
-    """
-    Returns a stop price only when one of the configured
-    profit milestones is reached.
-    """
-    entry = Decimal(str(entry_price))
-    locked_points = None
-
-    for trigger, lock in TRAILING_STEPS:
-        if profit_points >= trigger:
-            locked_points = lock
-
-    if locked_points is None:
-        return None
-
-    locked = Decimal(str(locked_points))
-
-    if side == "buy":
-        return entry + locked
-
-    return entry - locked
-
-
-# ==========================================
 # SAFE ORDER PLACEHOLDER
 # ==========================================
 
 def place_entry_order(product, side):
-    """
-    Trading is deliberately blocked until the actual
-    exchange stop-loss and leverage handling are verified.
-    """
     if not ENABLE_TRADING:
         logging.warning(
             "[SAFE MODE] ENABLE_TRADING=false. "
@@ -284,10 +254,10 @@ def place_entry_order(product, side):
 
 
 # ==========================================
-# MAIN LOOP
+# TRADING BOT BACKGROUND LOOP
 # ==========================================
 
-def main():
+def bot_main_loop():
     logging.info("BTCUSD EMA BOT STARTED")
     logging.info("Trading enabled: %s", ENABLE_TRADING)
     logging.info("Symbol: %s | Timeframe: 5 minutes", SYMBOL)
@@ -327,14 +297,21 @@ def main():
 
             time.sleep(15)
 
-        except KeyboardInterrupt:
-            logging.info("Bot stopped")
-            break
-
         except Exception as exc:
             logging.exception("[BOT ERROR] %s", exc)
             time.sleep(15)
 
 
+# ==========================================
+# START WEB SERVER & THREAD
+# ==========================================
+
 if __name__ == "__main__":
-    main()
+    # Start the trading bot in a separate background thread
+    bot_thread = Thread(target=bot_main_loop, daemon=True)
+    bot_thread.start()
+
+    # Start Flask on main thread to keep Render happy with port binding
+    port = int(os.environ.get("PORT", 10000))
+    logging.info("Starting Flask web server on port %s...", port)
+    app.run(host="0.0.0.0", port=port)
