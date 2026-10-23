@@ -301,9 +301,22 @@ def get_signal(df):
 # ==================================================
 
 def get_positions():
-    result = api_request("GET", "/v2/positions")
-    return result.get("result", [])
+    product = get_product()
+    product_id = int(product["id"])
 
+    result = api_request(
+        "GET",
+        "/v2/positions",
+        params={"product_id": product_id},
+    )
+
+    positions = result.get("result", [])
+
+    # API may return one position object or a list.
+    if isinstance(positions, dict):
+        positions = [positions]
+
+    return positions
 
 def get_open_position():
     for position in get_positions():
