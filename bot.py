@@ -4,457 +4,337 @@ import json
 import hmac
 import hashlib
 import logging
-from threading import Thread, Lock
-
 import requests
 import pandas as pd
-from flask import Flask, jsonify
+from decimal import Decimal
 
 # ==========================================
-# BTCUSD EMA 9/21 CROSSOVER BOT
-# DELTA EXCHANGE TESTNET
+# BTCUSD EMA 9/21 BOT - DELTA TESTNET
 # ==========================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 
-API_KEY = os.getenv("DELTA_API_KEY", "").strip()
-API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
+API_KEY = os.getenv("DELTA_API_KEY", "")
+API_SECRET = os.getenv("DELTA_API_SECRET", "")
 
 ENABLE_TRADING = (
-    os.getenv("ENABLE_TRADING", "false").lower().strip() == "true"
+    os.getenv("ENABLE_TRADING", "false").lower() == "true"
 )
 
 SYMBOL = "BTCUSD"
-RESOLUTION = "5m"
-
-ORDER_SIZE = 40
-LEVERAGE_DISPLAY = 50
+TIMEFRAME_MINUTES = 5
 
 EMA_FAST = 9
 EMA_SLOW = 21
 
-POLL_SECONDS = 15
+ORDER_SIZE = 40
+LEVERAGE = 50
+
+INITIAL_SL_PERCENT = Decimal("0.20")
+
+# Profit milestones in BTCUSD price points
+TRAILING_STEPS = [
+    (100, 0),
+    (200, 100),
+    (400, 300),
+]
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
 
-app = Flask(__name__)
 session = requests.Session()
-state_lock = Lock()
-
-bot_status = "STARTING"
-last_error = None
-last_signal = None
-last_candle = None
-last_order_id = None
 
 
 # ==========================================
-# API REQUEST
+# SIGNED DELTA API REQUEST
 # ==========================================
 
-def api_request(method, path, params=None, payload=None, auth=True):
+def api_request(method, path, params=None, body=None):
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("Delta API credentials missing")
+
+    method = method.upper()
     params = params or {}
-    payload = payload or {}
 
-    request = requests.Request(
-        method.upper(),
-        BASE_URL + path,
-        params=params
-    ).prepare()
+    query = requests.compat.urlencode(params)
+    request_path = path + (f"?{query}" if query else "")
 
-    query = ""
-    if request.url and "?" in request.url:
-        query = request.url.split("?", 1)[1]
+    body_text = json.dumps(body, separators=(",", ":")) if body else ""
+    timestamp = str(int(time.time()))
 
-    body = json.dumps(
-        payload, separators=(",", ":")
-    ) if payload else ""
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "BTCUSD-EMA-Testnet-Bot"
-    }
-
-    if auth:
-        if not API_KEY or not API_SECRET:
-            raise RuntimeError(
-                "DELTA_API_KEY ya DELTA_API_SECRET missing hai."
-            )
-
-        timestamp = str(int(time.time()))
-
-        signature_data = (
-            method.upper()
-            + timestamp
-            + path
-            + ("?" + query if query else "")
-            + body
-        )
-
-        signature = hmac.new(
-            API_SECRET.encode(),
-            signature_data.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-        headers.update({
-            "api-key": API_KEY,
-            "timestamp": timestamp,
-            "signature": signature
-        })
-
-    url = BASE_URL + path
-    if query:
-        url += "?" + query
-
-    response = session.request(
-        method.upper(),
-        url,
-        headers=headers,
-        data=body if body else None,
-        timeout=15
+    message = (
+        method + timestamp + request_path + body_text
     )
 
-    try:
-        result = response.json()
-    except ValueError:
-        result = {"response": response.text[:500]}
+    signature = hmac.new(
+        API_SECRET.encode(),
+        message.encode(),
+        hashlib.sha256
+    ).hexdigest()
 
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"HTTP {response.status_code}: "
-            f"{json.dumps(result)[:500]}"
-        )
+    headers = {
+        "api-key": API_KEY,
+        "timestamp": timestamp,
+        "signature": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
-    if isinstance(result, dict) and result.get("success") is False:
-        raise RuntimeError(f"API error: {json.dumps(result)[:500]}")
+    response = session.request(
+        method,
+        BASE_URL + path,
+        params=params,
+        data=body_text if body else None,
+        headers=headers,
+        timeout=15,
+    )
+
+    response.raise_for_status()
+    result = response.json()
+
+    if result.get("success") is False:
+        raise RuntimeError(f"Delta API error: {result}")
 
     return result
 
 
 # ==========================================
-# PRODUCT
+# MARKET DATA
 # ==========================================
 
 def get_product():
-    data = api_request(
-        "GET",
-        "/v2/products",
-        params={"symbol": SYMBOL},
-        auth=False
+    response = session.get(
+        BASE_URL + "/v2/products",
+        timeout=15,
     )
+    response.raise_for_status()
 
-    products = data.get("result", [])
-
-    if isinstance(products, dict):
-        products = [products]
+    products = response.json().get("result", [])
 
     for product in products:
         if product.get("symbol") == SYMBOL:
             return product
 
-    raise RuntimeError(f"{SYMBOL} product nahi mila.")
-
-
-# ==========================================
-# CANDLES AND EMA
-# ==========================================
-
-def get_candles():
-    now = int(time.time())
-
-    data = api_request(
-        "GET",
-        "/v2/history/candles",
-        params={
-            "resolution": RESOLUTION,
-            "symbol": SYMBOL,
-            "start": now - 250 * 300,
-            "end": now
-        },
-        auth=False
+    raise RuntimeError(
+        f"{SYMBOL} product not found on Testnet"
     )
 
-    candles = data.get("result", [])
 
-    if not candles:
-        raise RuntimeError("Candle data empty hai.")
+def get_candles():
+    product = get_product()
+
+    response = session.get(
+        BASE_URL + "/v2/history/candles",
+        params={
+            "symbol": SYMBOL,
+            "resolution": "5m",
+            "start": int(time.time()) - 60 * 60 * 8,
+            "end": int(time.time()),
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+
+    candles = response.json().get("result", [])
+
+    if len(candles) < EMA_SLOW + 5:
+        raise RuntimeError("Not enough candle data")
 
     df = pd.DataFrame(candles)
 
-    required = {"time", "open", "high", "low", "close"}
-
-    if not required.issubset(df.columns):
+    if "close" not in df.columns:
         raise RuntimeError(
-            f"Unexpected candle columns: {list(df.columns)}"
+            f"Unexpected candle response: {df.columns.tolist()}"
         )
 
-    for col in required:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(
-        subset=["time", "open", "high", "low", "close"]
-    )
-
-    df = (
-        df.sort_values("time")
-        .drop_duplicates("time", keep="last")
-        .reset_index(drop=True)
-    )
-
-    if len(df) < 30:
-        raise RuntimeError("EMA calculate karne ke liye candles kam hain.")
+    df["close"] = pd.to_numeric(df["close"])
+    df = df.sort_values("time").reset_index(drop=True)
 
     df["ema9"] = df["close"].ewm(
-        span=EMA_FAST, adjust=False
+        span=EMA_FAST,
+        adjust=False,
     ).mean()
 
     df["ema21"] = df["close"].ewm(
-        span=EMA_SLOW, adjust=False
+        span=EMA_SLOW,
+        adjust=False,
     ).mean()
 
-    return df
+    # Use fully closed candles only.
+    return product, df
 
 
 # ==========================================
-# TRUE EMA CROSSOVER
+# CROSSOVER SIGNAL
 # ==========================================
 
 def get_signal(df):
-    # -2 = latest fully closed candle
-    # -3 = previous fully closed candle
-
     previous = df.iloc[-3]
     current = df.iloc[-2]
 
-    bullish_cross = (
+    buy = (
         previous["ema9"] <= previous["ema21"]
         and current["ema9"] > current["ema21"]
     )
 
-    bearish_cross = (
+    sell = (
         previous["ema9"] >= previous["ema21"]
         and current["ema9"] < current["ema21"]
     )
 
     logging.info(
-        "[CROSSOVER CHECK] candle=%s close=%.2f "
+        "[CROSSOVER CHECK] "
         "previous_EMA9=%.2f previous_EMA21=%.2f "
         "EMA9=%.2f EMA21=%.2f BUY=%s SELL=%s",
-        int(current["time"]),
-        float(current["close"]),
-        float(previous["ema9"]),
-        float(previous["ema21"]),
-        float(current["ema9"]),
-        float(current["ema21"]),
-        bullish_cross,
-        bearish_cross
+        previous["ema9"],
+        previous["ema21"],
+        current["ema9"],
+        current["ema21"],
+        buy,
+        sell,
     )
 
-    if bullish_cross:
-        return "buy"
-
-    if bearish_cross:
-        return "sell"
-
-    return None
+    return "buy" if buy else "sell" if sell else None
 
 
 # ==========================================
-# OPEN POSITIONS
+# POSITION CHECK
 # ==========================================
 
-def get_open_positions(product_id):
-    data = api_request(
-        "GET",
-        "/v2/positions",
-        params={"product_id": product_id},
-        auth=True
-    )
+def get_positions():
+    result = api_request("GET", "/v2/positions")
+    return result.get("result", [])
 
-    positions = data.get("result", [])
 
-    if isinstance(positions, dict):
-        positions = [positions]
+def has_open_position():
+    for position in get_positions():
+        if (
+            position.get("product_symbol") == SYMBOL
+            or position.get("symbol") == SYMBOL
+        ):
+            size = float(position.get("size", 0) or 0)
 
-    return [
-        p for p in positions
-        if int(p.get("product_id", product_id)) == product_id
-        and float(p.get("size", 0) or 0) != 0
-    ]
+            if size != 0:
+                return True
+
+    return False
 
 
 # ==========================================
-# MARKET ORDER
+# STOP-LOSS PRICE CALCULATION
 # ==========================================
 
-def place_market_order(product_id, side, size):
+def initial_stop_loss(entry_price, side):
+    entry = Decimal(str(entry_price))
+    pct = INITIAL_SL_PERCENT / Decimal("100")
+
+    if side == "buy":
+        return entry * (Decimal("1") - pct)
+
+    return entry * (Decimal("1") + pct)
+
+
+def trailing_stop_price(entry_price, side, profit_points):
+    """
+    Returns a stop price only when one of the configured
+    profit milestones is reached.
+    """
+    entry = Decimal(str(entry_price))
+    locked_points = None
+
+    for trigger, lock in TRAILING_STEPS:
+        if profit_points >= trigger:
+            locked_points = lock
+
+    if locked_points is None:
+        return None
+
+    locked = Decimal(str(locked_points))
+
+    if side == "buy":
+        return entry + locked
+
+    return entry - locked
+
+
+# ==========================================
+# SAFE ORDER PLACEHOLDER
+# ==========================================
+
+def place_entry_order(product, side):
+    """
+    Trading is deliberately blocked until the actual
+    exchange stop-loss and leverage handling are verified.
+    """
     if not ENABLE_TRADING:
-        raise RuntimeError("Trading disabled hai.")
-
-    payload = {
-        "product_id": int(product_id),
-        "size": int(size),
-        "side": side,
-        "order_type": "market_order",
-        "time_in_force": "ioc",
-        "reduce_only": False
-    }
-
-    logging.warning(
-        "[ORDER ATTEMPT] %s %s size=%s",
-        SYMBOL, side, size
-    )
-
-    response = api_request(
-        "POST",
-        "/v2/orders",
-        payload=payload,
-        auth=True
-    )
-
-    order = response.get("result", {})
-
-    logging.info("[ORDER RESPONSE] %s", json.dumps(response)[:800])
-
-    if not order or not order.get("id"):
-        raise RuntimeError(
-            "Order ID nahi mili. Order execution verify karein."
+        logging.warning(
+            "[SAFE MODE] ENABLE_TRADING=false. "
+            "No order sent. Signal=%s",
+            side.upper(),
         )
+        return
 
-    return order
+    raise RuntimeError(
+        "Trading blocked: exchange-side stop-loss, "
+        "trailing-stop updates, and leverage are not "
+        "yet verified. No entry order was sent."
+    )
 
 
 # ==========================================
-# BOT LOOP
+# MAIN LOOP
 # ==========================================
 
-def bot_loop():
-    global bot_status, last_error
-    global last_signal, last_candle, last_order_id
+def main():
+    logging.info("BTCUSD EMA BOT STARTED")
+    logging.info("Trading enabled: %s", ENABLE_TRADING)
+    logging.info("Symbol: %s | Timeframe: 5 minutes", SYMBOL)
+    logging.info("Order size setting: %s", ORDER_SIZE)
+    logging.info("Leverage target: %sx (not configured)", LEVERAGE)
+
+    last_candle = None
 
     while True:
         try:
-            if not API_KEY or not API_SECRET:
-                bot_status = "WAITING_FOR_API_KEYS"
-                raise RuntimeError("Render API keys missing hain.")
+            product, df = get_candles()
 
-            product = get_product()
-            product_id = int(product["id"])
-
-            df = get_candles()
-            current = df.iloc[-2]
-
-            candle_time = int(current["time"])
-            price = float(current["close"])
-
-            signal = get_signal(df)
+            candle_time = int(df.iloc[-2]["time"])
+            price = float(df.iloc[-2]["close"])
 
             logging.info(
                 "[MARKET] %s price=%.2f EMA9=%.2f EMA21=%.2f",
                 SYMBOL,
                 price,
-                float(current["ema9"]),
-                float(current["ema21"])
+                df.iloc[-2]["ema9"],
+                df.iloc[-2]["ema21"],
             )
 
-            positions = get_open_positions(product_id)
-
-            if positions:
-                bot_status = "POSITION_OPEN"
-                logging.warning(
-                    "[POSITION OPEN] Automatic stop-loss configured nahi hai. "
-                    "Koi naya order nahi bheja jayega."
-                )
-
-            elif signal is None:
-                bot_status = "NO_CROSSOVER"
-
-            elif candle_time == last_candle:
-                bot_status = "CANDLE_ALREADY_PROCESSED"
-
-            else:
+            if candle_time != last_candle:
                 last_candle = candle_time
-                last_signal = signal
+                signal = get_signal(df)
 
-                if not ENABLE_TRADING:
-                    bot_status = "SAFE_MODE"
-                    logging.warning(
-                        "[SAFE MODE] %s crossover mila; order nahi bheja.",
-                        signal.upper()
-                    )
-                else:
-                    order = place_market_order(
-                        product_id,
-                        signal,
-                        ORDER_SIZE
-                    )
+                if signal:
+                    logging.info("[SIGNAL] %s", signal.upper())
 
-                    last_order_id = order["id"]
-                    bot_status = "ORDER_ACCEPTED"
+                    if has_open_position():
+                        logging.info(
+                            "[NO TRADE] Position already open"
+                        )
+                    else:
+                        place_entry_order(product, signal)
 
-                    logging.warning(
-                        "[ORDER ACCEPTED] id=%s. Fill status verify karein.",
-                        last_order_id
-                    )
+            time.sleep(15)
 
-            last_error = None
+        except KeyboardInterrupt:
+            logging.info("Bot stopped")
+            break
 
         except Exception as exc:
-            last_error = str(exc)
-            bot_status = "ERROR"
             logging.exception("[BOT ERROR] %s", exc)
+            time.sleep(15)
 
-        time.sleep(POLL_SECONDS)
-
-
-# ==========================================
-# HEALTH ENDPOINTS
-# ==========================================
-
-@app.route("/")
-def home():
-    return jsonify({
-        "bot": "BTCUSD EMA 9/21 Crossover",
-        "timeframe": RESOLUTION,
-        "order_size": ORDER_SIZE,
-        "leverage_display_only": LEVERAGE_DISPLAY,
-        "trading_enabled": ENABLE_TRADING,
-        "status": bot_status,
-        "last_signal": last_signal,
-        "last_order_id": last_order_id,
-        "last_error": last_error
-    })
-
-
-@app.route("/health")
-def health():
-    return jsonify({
-        "status": "ok",
-        "bot_status": bot_status,
-        "trading_enabled": ENABLE_TRADING,
-        "last_error": last_error
-    })
-
-
-# ==========================================
-# START
-# ==========================================
 
 if __name__ == "__main__":
-    logging.info(
-        "[BOT START] %s | %s | Size=%s | Trading=%s",
-        SYMBOL,
-        RESOLUTION,
-        ORDER_SIZE,
-        ENABLE_TRADING
-    )
-
-    Thread(target=bot_loop, daemon=True).start()
-
-    port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    main()
