@@ -251,7 +251,7 @@ if __name__ == "__main__":
     # Main Trading Bot Loop
     while True:
         try:
-            global state
+            
             if state and state.get("position"):
                 # check_and_update_dynamic_trailing(product, state["position"])
                 pass
