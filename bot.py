@@ -227,24 +227,33 @@ def place_entry(product, side):
 
 
 # ==================================================
-# 4. FLASK HEALTH-CHECK SERVER (For Render Port Binding)
+# 4. FETCH MARKET CANDLES FUNCTION
 # ==================================================
-app = Flask(__name__)
-
-@app.route("/")
-def health_check():
-    return "EMA 9/21 Trading Bot is running!", 200
-
-def run_web_server():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+def fetch_market_candles(symbol):
+    try:
+        # Agar aapka exchange Binance ya similar public API use karta hai:
+        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&limit=50"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 
+                'volume', 'close_time', 'qav', 'num_trades', 
+                'taker_base_vol', 'taker_quote_vol', 'ignore'
+            ])
+            df['close'] = df['close'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            return df
+    except Exception as e:
+        logging.error(f"Failed to fetch candles: {e}")
+    return None
 
 
 # ==================================================
-# 5. MAIN EXECUTION (Flask + Trailing + EMA Crossover)
+# 5. MAIN EXECUTION (Active Trailing + EMA Crossover)
 # ==================================================
 if __name__ == "__main__":
-    logging.info("Initializing EMA 9/21 Trading Bot services...")
+    logging.info("Initializing EMA 9/21 Trading Bot & Live Market Scanner...")
 
     # Start Flask web server in a background thread so Render's port check passes
     server_thread = threading.Thread(target=run_web_server, daemon=True)
@@ -260,9 +269,9 @@ if __name__ == "__main__":
             if state and state.get("position"):
                 logging.info("[POSITION ACTIVE] Running Dynamic Trailing Stop-Loss check...")
                 
-                current_exchange_pos = get_open_position()
+                current_exchange_pos = get_open_position() if 'get_open_position' in globals() else None
                 if not current_exchange_pos:
-                    logging.info("[POSITION CLOSED] Exchange position closed (Stop-loss hit). Resetting state.")
+                    logging.info("[POSITION CLOSED] Exchange position closed. Resetting state.")
                     state["position"] = None
                     save_state(state)
                 else:
