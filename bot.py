@@ -1,6 +1,8 @@
 import time
 import logging
 import pandas as pd
+import json
+import os
 
 # ==================================================
 # CONFIGURATION & CONSTANTS
@@ -15,6 +17,33 @@ TRAILING_BUFFER_POINTS = 200
 RSI_PERIOD = 14
 VOLUME_MA_PERIOD = 20         
 MIN_VOLUME_MULTIPLIER = 1.2   
+
+
+# ==================================================
+# STATE INITIALIZATION
+# ==================================================
+STATE_FILE = "state.json"
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_state(current_state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(current_state, f, indent=4)
+    except Exception as e:
+        logging.error(f"Failed to save state: {e}")
+
+# Global state object load kar rahe hain
+state = load_state()
+if "position" not in state:
+    state["position"] = None
 
 
 # ==================================================
@@ -193,24 +222,18 @@ def place_entry(product, side):
 
 
 # ==================================================
-# 4. MAIN CONTINUOUS BOT LOOP (ZAROORI HAI)
+# 4. MAIN CONTINUOUS BOT LOOP
 # ==================================================
 if __name__ == "__main__":
     logging.info("Starting EMA 9/21 Trading Bot...")
-    
-    # Product info fetch kar lein (aapke setup ke mutabiq)
-    # product = get_product_info(SYMBOL) 
 
     while True:
         try:
-            # Agar position active hai toh dynamic trailing check karein
             if state.get("position"):
                 # check_and_update_dynamic_trailing(product, state["position"])
                 pass
             
-            # Yahan aapka baaki crossover check aur market monitoring code chalega
-            
-            time.sleep(20) # Har 20 seconds mein loop chalega taaki app exit na ho
+            time.sleep(20)
             
         except Exception as e:
             logging.error(f"Error in main loop: {e}")
