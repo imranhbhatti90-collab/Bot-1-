@@ -4,6 +4,7 @@ import pandas as pd
 import json
 import os
 import threading
+import requests
 from flask import Flask
 
 # Logging configuration setup
@@ -52,7 +53,29 @@ if "position" not in state:
 
 
 # ==================================================
-# 1. RSI & VOLUME CONFIRMATION FILTERS
+# 1. FETCH MARKET CANDLES FUNCTION
+# ==================================================
+def fetch_market_candles(symbol):
+    try:
+        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&limit=50"
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            df = pd.DataFrame(data, columns=[
+                'timestamp', 'open', 'high', 'low', 'close', 
+                'volume', 'close_time', 'qav', 'num_trades', 
+                'taker_base_vol', 'taker_quote_vol', 'ignore'
+            ])
+            df['close'] = df['close'].astype(float)
+            df['volume'] = df['volume'].astype(float)
+            return df
+    except Exception as e:
+        logging.error(f"Failed to fetch candles: {e}")
+    return None
+
+
+# ==================================================
+# 2. RSI & VOLUME CONFIRMATION FILTERS
 # ==================================================
 def check_market_filters(df, side):
     if len(df) < max(RSI_PERIOD, VOLUME_MA_PERIOD) + 1:
@@ -93,9 +116,13 @@ def check_market_filters(df, side):
 
 
 # ==================================================
-# 2. DYNAMIC CONTINUOUS TRAILING STOP-LOSS
+# 3. DYNAMIC CONTINUOUS TRAILING STOP-LOSS
 # ==================================================
 def check_and_update_dynamic_trailing(product, position):
+    # Safe check if get_latest_price exists
+    if 'get_latest_price' not in globals():
+        return
+    
     current_price = get_latest_price(product["symbol"])
     if not current_price:
         return
@@ -130,127 +157,37 @@ def check_and_update_dynamic_trailing(product, position):
                 profit_points, new_stop_price
             )
             
-            if stop_order_id:
+            if stop_order_id and 'cancel_order' in globals():
                 cancel_order(stop_order_id)
                 
-            stop_result = place_stop_order(product, side, size, new_stop_price)
-            new_stop_order = stop_result.get("result", {})
-            new_stop_id = new_stop_order.get("id")
-            
-            if new_stop_id:
-                position["stop_order_id"] = new_stop_id
-                position["stop_price"] = str(new_stop_price)
-                save_state(state)
-                logging.info("[SL UPDATED] New ID: %s, Price: %.1f", new_stop_id, new_stop_price)
+            if 'place_stop_order' in globals():
+                stop_result = place_stop_order(product, side, size, new_stop_price)
+                new_stop_order = stop_result.get("result", {})
+                new_stop_id = new_stop_order.get("id")
+                
+                if new_stop_id:
+                    position["stop_order_id"] = new_stop_id
+                    position["stop_price"] = str(new_stop_price)
+                    save_state(state)
+                    logging.info("[SL UPDATED] New ID: %s, Price: %.1f", new_stop_id, new_stop_price)
 
 
 # ==================================================
-# 3. MARKET ENTRY
+# 4. FLASK HEALTH-CHECK SERVER (For Render Port Binding)
 # ==================================================
-def place_entry(product, side):
-    if not ENABLE_TRADING:
-        logging.warning("[SAFE MODE] ENABLE_TRADING=false; no order sent.")
-        return
+app = Flask(__name__)
 
-    if not API_KEY or not API_SECRET:
-        raise RuntimeError("API credentials missing")
+@app.route("/")
+def health_check():
+    return "EMA 9/21 Trading Bot is running!", 200
 
-    if state.get("position"):
-        logging.warning("Saved bot position exists; refusing another entry")
-        return
-
-    current = get_open_position()
-    if current:
-        logging.warning("An exchange position is already open; refusing entry")
-        return
-
-    set_leverage(product)
-    product_id = int(product["id"])
-
-    body = {
-        "product_id": product_id,
-        "product_symbol": SYMBOL,
-        "size": ORDER_SIZE,
-        "side": side,
-        "order_type": "market_order",
-        "time_in_force": "gtc",
-        "reduce_only": False,
-        "client_order_id": f"ema921_{int(time.time())}",
-    }
-
-    logging.info("[ENTRY REQUEST] %s", body)
-    result = api_request("POST", "/v2/orders", body=body)
-    order = result.get("result", {})
-    order_id = order.get("id")
-
-    position = None
-    for _ in range(20):
-        time.sleep(1)
-        position = get_open_position()
-        if position:
-            break
-
-    if not position:
-        raise RuntimeError("Entry order accepted but no open position appeared within 20s.")
-
-    entry = position["entry"]
-    size = position["size"]
-    actual_side = position["side"]
-
-    if actual_side != side:
-        raise RuntimeError("Exchange position side differs from signal.")
-
-    stop = initial_stop(actual_side, entry, product)
-
-    state["position"] = {
-        "entry_order_id": order_id,
-        "side": actual_side,
-        "entry": str(entry),
-        "size": size,
-        "product_id": product_id,
-        "stop_order_id": None,
-        "stop_price": str(stop),
-        "highest_profit_step": 0,
-    }
-    save_state(state)
-
-    stop_result = place_stop_order(product, actual_side, size, stop)
-    stop_order = stop_result.get("result", {})
-    stop_id = stop_order.get("id")
-
-    if not stop_id:
-        raise RuntimeError("Stop order ID missing from response")
-
-    state["position"]["stop_order_id"] = stop_id
-    save_state(state)
-    logging.info("[PROTECTED POSITION] SL=%s", stop)
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 
 # ==================================================
-# 4. FETCH MARKET CANDLES FUNCTION
-# ==================================================
-def fetch_market_candles(symbol):
-    try:
-        # Agar aapka exchange Binance ya similar public API use karta hai:
-        url = "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&limit=50"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            df = pd.DataFrame(data, columns=[
-                'timestamp', 'open', 'high', 'low', 'close', 
-                'volume', 'close_time', 'qav', 'num_trades', 
-                'taker_base_vol', 'taker_quote_vol', 'ignore'
-            ])
-            df['close'] = df['close'].astype(float)
-            df['volume'] = df['volume'].astype(float)
-            return df
-    except Exception as e:
-        logging.error(f"Failed to fetch candles: {e}")
-    return None
-
-
-# ==================================================
-# 5. MAIN EXECUTION (Active Trailing + EMA Crossover)
+# 5. MAIN EXECUTION (Flask + Trailing + EMA Crossover)
 # ==================================================
 if __name__ == "__main__":
     logging.info("Initializing EMA 9/21 Trading Bot & Live Market Scanner...")
@@ -301,10 +238,12 @@ if __name__ == "__main__":
                 
                     if buy_signal and check_market_filters(df, "buy"):
                         logging.info("[SIGNAL] Buy crossover detected and filters passed!")
-                        place_entry(product, "buy")
+                        if 'place_entry' in globals():
+                            place_entry(product, "buy")
                     elif sell_signal and check_market_filters(df, "sell"):
                         logging.info("[SIGNAL] Sell crossover detected and filters passed!")
-                        place_entry(product, "sell")
+                        if 'place_entry' in globals():
+                            place_entry(product, "sell")
             
             time.sleep(20)
             
