@@ -3,6 +3,8 @@ import logging
 import pandas as pd
 import json
 import os
+import threading
+from flask import Flask
 
 # ==================================================
 # CONFIGURATION & CONSTANTS
@@ -222,14 +224,35 @@ def place_entry(product, side):
 
 
 # ==================================================
-# 4. MAIN CONTINUOUS BOT LOOP
+# 4. FLASK HEALTH-CHECK SERVER (For Render Port Binding)
+# ==================================================
+app = Flask(__name__)
+
+@app.route("/")
+def health_check():
+    return "EMA 9/21 Trading Bot is running!", 200
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
+# ==================================================
+# 5. MAIN EXECUTION (Flask Server + Bot Loop)
 # ==================================================
 if __name__ == "__main__":
-    logging.info("Starting EMA 9/21 Trading Bot...")
+    logging.info("Initializing EMA 9/21 Trading Bot services...")
 
+    # Start Flask web server in a background thread so Render's port check passes
+    server_thread = threading.Thread(target=run_web_server, daemon=True)
+    server_thread.start()
+    logging.info("Flask health-check server started successfully.")
+
+    # Main Trading Bot Loop
     while True:
         try:
-            if state.get("position"):
+            global state
+            if state and state.get("position"):
                 # check_and_update_dynamic_trailing(product, state["position"])
                 pass
             
