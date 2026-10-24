@@ -252,9 +252,8 @@ if __name__ == "__main__":
     logging.info("Flask health-check server started successfully.")
 
     # Main Trading Bot Loop
-        while True:
+    while True:
         try:
-            # Product info fetch kar rahe hain
             product = {"symbol": SYMBOL, "tick_size": 0.1, "id": 1}
 
             # --- 1. POSITION ACTIVE: Dynamic Trailing Stop-Loss ---
@@ -303,5 +302,3 @@ if __name__ == "__main__":
         except Exception as e:
             logging.error(f"Error in main loop: {e}")
             time.sleep(10)
-
-        
