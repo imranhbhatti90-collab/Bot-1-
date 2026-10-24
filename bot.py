@@ -1,7 +1,137 @@
-# ==================================================
-# MARKET ENTRY
-# ==================================================
+import time
+import logging
+import pandas as pd
 
+# ==================================================
+# CONFIGURATION & CONSTANTS
+# ==================================================
+ENABLE_TRADING = True
+SYMBOL = "BTCUSD"
+ORDER_SIZE = 40
+LEVERAGE = 50
+
+# Dynamic Trailing & Filter Constants
+TRAILING_BUFFER_POINTS = 200  # Stop-loss hamesha best peak price se itne points piche trail karega
+RSI_PERIOD = 14
+VOLUME_MA_PERIOD = 20         # Average volume calculate karne ke liye periods
+MIN_VOLUME_MULTIPLIER = 1.2   # Current volume average ka kam se kam itna guna hona chahiye
+
+
+# ==================================================
+# 1. RSI & VOLUME CONFIRMATION FILTERS
+# ==================================================
+def check_market_filters(df, side):
+    """
+    Checks both RSI momentum and Volume strength to block fake/low-momentum crossover entries.
+    For BUY: RSI >= 50 and Volume > Average Volume * multiplier
+    For SELL: RSI <= 50 and Volume > Average Volume * multiplier
+    """
+    if len(df) < max(RSI_PERIOD, VOLUME_MA_PERIOD) + 1:
+        return True  # Fallback agar data kam ho
+
+    # --- RSI Calculation ---
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    current_rsi = df['rsi'].iloc[-1]
+
+    # --- Volume Calculation ---
+    df['vol_ma'] = df['volume'].rolling(window=VOLUME_MA_PERIOD).mean()
+    current_volume = df['volume'].iloc[-1]
+    avg_volume = df['vol_ma'].iloc[-1]
+
+    logging.info(
+        "[FILTER CHECK] Side: %s | RSI: %.2f | Vol: %.1f (Avg: %.1f)",
+        side.upper(), current_rsi, current_volume, avg_volume
+    )
+
+    # Check RSI Condition
+    if side == "buy" and current_rsi < 50:
+        logging.info("[FILTER BLOCKED] Buy signal rejected: RSI (%.2f) is below 50", current_rsi)
+        return False
+    if side == "sell" and current_rsi > 50:
+        logging.info("[FILTER BLOCKED] Sell signal rejected: RSI (%.2f) is above 50", current_rsi)
+        return False
+
+    # Check Volume Condition
+    if current_volume < (avg_volume * MIN_VOLUME_MULTIPLIER):
+        logging.info(
+            "[FILTER BLOCKED] %s signal rejected: Volume (%.1f) is too low compared to average (%.1f)",
+            side.upper(), current_volume, avg_volume
+        )
+        return False
+
+    logging.info("[FILTER PASSED] %s signal approved by RSI & Volume filters!", side.upper())
+    return True
+
+
+# ==================================================
+# 2. DYNAMIC CONTINUOUS TRAILING STOP-LOSS
+# ==================================================
+def check_and_update_dynamic_trailing(product, position):
+    """
+    Continuously trails the stop loss based on TRAILING_BUFFER_POINTS 
+    from peak profit, seamlessly supporting 1000+ to 2000+ point moves.
+    """
+    current_price = get_latest_price(product["symbol"])
+    if not current_price:
+        return
+
+    side = position["side"]
+    entry_price = float(position["entry"])
+    size = position["size"]
+    stop_order_id = position.get("stop_order_id")
+    current_stop_price = float(position.get("stop_price", 0))
+
+    # Calculate profit in points and determine new dynamic stop price
+    if side == "buy":
+        profit_points = current_price - entry_price
+        new_stop_price = current_price - TRAILING_BUFFER_POINTS
+    else:  # sell / short
+        profit_points = entry_price - current_price
+        new_stop_price = current_price + TRAILING_BUFFER_POINTS
+
+    # Start trailing only if profit exceeds the buffer distance
+    if profit_points > TRAILING_BUFFER_POINTS:
+        should_update = False
+        
+        # For long: new stop must be higher than current stop
+        if side == "buy" and new_stop_price > current_stop_price:
+            should_update = True
+        # For short: new stop must be lower than current stop
+        elif side == "sell" and (current_stop_price == 0 or new_stop_price < current_stop_price):
+            should_update = True
+
+        if should_update:
+            tick_size = float(product["tick_size"])
+            new_stop_price = round(new_stop_price / tick_size) * tick_size
+            
+            logging.info(
+                "[DYNAMIC TRAIL] Profit: %.1f pts | Moving SL from %.1f to %.1f",
+                profit_points, current_stop_price, new_stop_price
+            )
+            
+            # Cancel existing stop order if present
+            if stop_order_id:
+                cancel_order(stop_order_id)
+                
+            # Place new updated trailing stop order
+            stop_result = place_stop_order(product, side, size, new_stop_price)
+            new_stop_order = stop_result.get("result", {})
+            new_stop_id = new_stop_order.get("id")
+            
+            if new_stop_id:
+                position["stop_order_id"] = new_stop_id
+                position["stop_price"] = str(new_stop_price)
+                save_state(state)
+                logging.info("[SL UPDATED SUCCESSFULLY] New ID: %s, Price: %.1f", new_stop_id, new_stop_price)
+
+
+# ==================================================
+# 3. MARKET ENTRY (Your robust implementation)
+# ==================================================
 def place_entry(product, side):
     if not ENABLE_TRADING:
         logging.warning(
