@@ -6,6 +6,9 @@ import os
 import threading
 from flask import Flask
 
+# Logging configuration setup
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(message)s")
+
 # ==================================================
 # CONFIGURATION & CONSTANTS
 # ==================================================
@@ -238,7 +241,7 @@ def run_web_server():
 
 
 # ==================================================
-# 5. MAIN EXECUTION (Flask Server + Bot Loop)
+# 5. MAIN EXECUTION (Flask + Trailing + EMA Crossover)
 # ==================================================
 if __name__ == "__main__":
     logging.info("Initializing EMA 9/21 Trading Bot services...")
@@ -251,9 +254,47 @@ if __name__ == "__main__":
     # Main Trading Bot Loop
     while True:
         try:
-            
+            # Product info fetch (product details like tick_size, id)
+            # product = get_product_info(SYMBOL)
+
+            # --- 1. POSITION ACTIVE: Dynamic Trailing Check ---
             if state and state.get("position"):
-                # check_and_update_dynamic_trailing(product, state["position"])
+                # Check if position still exists on exchange (agar SL hit ho gaya ho toh state clear karein)
+                current_exchange_pos = get_open_position()
+                if not current_exchange_pos:
+                    logging.info("[POSITION CLOSED] Exchange position closed (Stop-loss hit). Resetting state.")
+                    state["position"] = None
+                    save_state(state)
+                else:
+                    # Run dynamic trailing stop updater
+                    # check_and_update_dynamic_trailing(product, state["position"])
+                    pass
+            
+            # --- 2. NO POSITION: Scan Market for EMA 9/21 Crossover ---
+            else:
+                # Fetch candles data
+                # df = fetch_market_candles(SYMBOL)
+                # if df is not None and not df.empty:
+                #     df['ema9'] = df['close'].ewm(span=9, adjust=False).mean()
+                #     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
+                
+                #     price = df['close'].iloc[-1]
+                #     ema9 = df['ema9'].iloc[-1]
+                #     ema21 = df['ema21'].iloc[-1]
+                
+                #     logging.info("[MARKET] price=%.1f EMA9=%.2f EMA21=%.2f", price, ema9, ema21)
+                
+                #     # Crossover detection logic
+                #     prev_ema9 = df['ema9'].iloc[-2]
+                #     prev_ema21 = df['ema21'].iloc[-2]
+                
+                #     buy_signal = (prev_ema9 <= prev_ema21) and (ema9 > ema21)
+                #     sell_signal = (prev_ema9 >= prev_ema21) and (ema9 < ema21)
+                
+                #     if buy_signal and check_market_filters(df, "buy"):
+                #         place_entry(product, "buy")
+                #     elif sell_signal and check_market_filters(df, "sell"):
+                #         place_entry(product, "sell")
                 pass
             
             time.sleep(20)
