@@ -196,7 +196,7 @@ def fetch_market_candles(symbol=SYMBOL):
     start_time = end_time - (24 * 60 * 60)
 
     params = {
-        "resolution": str(TIMEFRAME_MINUTES),
+        "resolution": "5m",
         "symbol": SYMBOL,
         "start": start_time,
         "end": end_time,
