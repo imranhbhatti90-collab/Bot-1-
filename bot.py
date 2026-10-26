@@ -463,44 +463,26 @@ def check():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
-# ==================================================
-# START
-# ==================================================
+==================================================
+
+START
+
+==================================================
 
 load_state()
 
-if __name__ == "__main__":
-    threading.Thread(
-        target=bot_loop,
-        daemon=True,
-        name="delta-multicoin-bot",
-    ).start()
+if name == "main":
+threading.Thread(
+target=bot_loop,
+daemon=True,
+name="delta-multicoin-bot",
+).start()
 
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False
+port = int(os.environ.get("PORT", "10000"))
 
-# =========================================================
-# START
-# =========================================================
-
-load_state()
-
-if __name__ == "__main__":
-    threading.Thread(
-        target=bot_loop,
-        daemon=True,
-        name="delta-multicoin-bot",
-    ).start()
-
-    port = int(os.environ.get("PORT", "10000"))
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False,
-    )
+app.run(
+    host="0.0.0.0",
+    port=port,
+    debug=False,
+    use_reloader=False,
+)
