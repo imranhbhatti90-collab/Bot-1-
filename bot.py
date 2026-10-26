@@ -31,9 +31,10 @@ TRAILING_BUFFER_POINTS = 200
 
 RSI_PERIOD = 14
 VOLUME_MA_PERIOD = 20
-MIN_VOLUME_MULTIPLIER = 1.2
+# Filters ko flexible banaya gaya hai taaki zyaada trades mil sakein
+MIN_VOLUME_MULTIPLIER = 1.0 
 
-# Trading is now enabled!
+# Trading is enabled!
 ENABLE_TRADING = True
 
 POLL_SECONDS = 20
@@ -259,14 +260,10 @@ def fetch_market_candles(symbol=SYMBOL):
 
 
 # ==================================================
-# RSI AND VOLUME FILTERS
+# FLEXIBLE RSI AND VOLUME FILTERS
 # ==================================================
 
 def check_market_filters(df, side):
-    if "volume" not in df.columns:
-        log.warning("Volume data missing; signal rejected.")
-        return False
-
     if len(df) < max(RSI_PERIOD, VOLUME_MA_PERIOD) + 2:
         log.warning("Insufficient candles for filters.")
         return False
@@ -286,42 +283,22 @@ def check_market_filters(df, side):
     rsi = 100 - (100 / (1 + rs))
 
     current_rsi = rsi.iloc[-1]
-
-    volume_ma = volume.rolling(
-        VOLUME_MA_PERIOD
-    ).mean()
-
-    current_volume = volume.iloc[-1]
-    average_volume = volume_ma.iloc[-1]
-
-    values = [current_rsi, current_volume, average_volume]
-
-    if any(pd.isna(value) for value in values):
-        log.warning("RSI/volume values invalid; signal rejected.")
-        return False
+    current_volume = volume.iloc[-1] if "volume" in df.columns else 0
 
     log.info(
-        "[FILTER] Side=%s RSI=%.2f Volume=%.2f AvgVolume=%.2f",
+        "[FILTER CHECK] Side=%s RSI=%.2f Volume=%.2f",
         side.upper(),
         current_rsi,
         current_volume,
-        average_volume,
     )
 
-    if side == "buy" and current_rsi < 50:
-        log.info("[FILTER BLOCKED] BUY: RSI below 50.")
+    # Flexible RSI limits: Buy allowed if RSI > 40, Sell allowed if RSI < 60
+    if side == "buy" and current_rsi < 40:
+        log.info("[FILTER BLOCKED] BUY: RSI too low (< 40).")
         return False
 
-    if side == "sell" and current_rsi > 50:
-        log.info("[FILTER BLOCKED] SELL: RSI above 50.")
-        return False
-
-    if average_volume <= 0:
-        log.warning("Average volume invalid; signal rejected.")
-        return False
-
-    if current_volume < average_volume * MIN_VOLUME_MULTIPLIER:
-        log.info("[FILTER BLOCKED] Volume confirmation failed.")
+    if side == "sell" and current_rsi > 60:
+        log.info("[FILTER BLOCKED] SELL: RSI too high (> 60).")
         return False
 
     log.info("[FILTER PASSED] %s", side.upper())
@@ -423,13 +400,11 @@ def handle_signal(df, signal):
     side = signal["side"]
 
     if not side:
-        log.info("[SIGNAL] No new EMA crossover.")
         return
 
     candle_id = signal["candle_id"]
 
     if candle_id == state.get("last_processed_candle"):
-        log.info("[SIGNAL] Candle already processed.")
         return
 
     state["last_processed_candle"] = candle_id
@@ -448,7 +423,6 @@ def handle_signal(df, signal):
         log.info("[SAFE MODE] Trading is disabled.")
         return
 
-    # Execute market order on Delta Exchange
     place_order(side)
 
 
@@ -457,12 +431,7 @@ def handle_signal(df, signal):
 # ==================================================
 
 def bot_loop():
-    log.info("Delta BTCUSD EMA bot started (LIVE TRADING ENABLED).")
-    log.info(
-        "Trading=%s | Order size=%s | Leverage setting=%sx",
-        ENABLE_TRADING, ORDER_SIZE, LEVERAGE
-    )
-
+    log.info("Delta BTCUSD EMA bot started (FLEXIBLE FILTERS & LIVE TRADING).")
     while True:
         try:
             df, signal = scan_signal()
@@ -492,7 +461,6 @@ def health_check():
         "service": "Delta BTCUSD EMA Bot",
         "status": "running",
         "symbol": SYMBOL,
-        "timeframe_minutes": TIMEFRAME_MINUTES,
         "trading_enabled": ENABLE_TRADING,
     })
 
@@ -506,18 +474,16 @@ def status():
 def check():
     try:
         df, signal = scan_signal()
-
         return jsonify({
             "ok": True,
             "signal": signal,
             "candles": len(df),
         })
-
     except Exception as exc:
         return jsonify({
             "ok": False,
             "error": str(exc),
-        }, 500)
+        }), 500
 
 
 # ==================================================
