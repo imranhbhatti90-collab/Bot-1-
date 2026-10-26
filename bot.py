@@ -28,6 +28,9 @@ RSI_PERIOD = 14
 VOLUME_MA_PERIOD = 20
 MIN_VOLUME_MULTIPLIER = 1.0 
 
+# Trailing Stop-Loss Settings
+TRAILING_STOP_PERCENT = 0.5  # Price ke against 0.5% move hone par trail karega
+
 ENABLE_TRADING = True
 POLL_SECONDS = 20
 STATE_FILE = "state.json"
@@ -44,11 +47,11 @@ log = logging.getLogger("delta-multicoin-bot")
 session = requests.Session()
 app = Flask(__name__)
 
-# State ab multiple coins ke liye track karega
+# State multiple coins aur trailing track karega
 state = {
-    "positions": {},          # symbol -> position details
+    "positions": {},             # symbol -> position details
     "last_processed_candle": {}, # symbol -> candle_id
-    "best_price": {},         # symbol -> best price for trailing
+    "best_price": {},            # symbol -> best price for trailing
 }
 
 bot_status = {
@@ -282,7 +285,6 @@ def scan_symbol(symbol):
     ema21 = float(latest["ema21"])
     candle_id = str(latest["time"])
 
-    # Har coin ka live price aur EMA logs mein print hoga
     log.info(
         "[MARKET] %s price=%.2f EMA9=%.2f EMA21=%.2f",
         symbol, price, ema9, ema21
@@ -316,7 +318,7 @@ def scan_symbol(symbol):
 
 
 # ==================================================
-# ORDER EXECUTION
+# ORDER EXECUTION & DYNAMIC TRAILING
 # ==================================================
 
 def place_order(product_id, symbol, side, entry_price):
@@ -336,7 +338,8 @@ def place_order(product_id, symbol, side, entry_price):
         state["positions"][symbol] = {
             "side": side,
             "entry": entry_price,
-            "size": ORDER_SIZE
+            "size": ORDER_SIZE,
+            "product_id": product_id
         }
         state["best_price"][symbol] = entry_price
         save_state()
@@ -352,28 +355,83 @@ def check_and_manage_positions():
             return
 
         for sym in tracked_symbols:
+            pos_info = state["positions"][sym]
+            side = pos_info["side"]
+            
             asset = sym.replace("USD", "").replace("USDT", "")
             params = {"underlying_asset_symbol": asset}
             
             res = api_request("GET", "/v2/positions", params=params, signed=True)
             positions = res.get("result", [])
             
-            has_position = False
+            active_exchange_pos = None
             for p in positions:
                 p_sym = p.get("product_symbol") or p.get("symbol")
                 size = float(p.get("size", 0))
                 if p_sym == sym and size != 0:
-                    has_position = True
+                    active_exchange_pos = p
                     break
             
-            if not has_position:
+            if not active_exchange_pos:
                 log.info("[POSITION] Position for %s closed on exchange.", sym)
                 state["positions"].pop(sym, None)
                 state["best_price"].pop(sym, None)
                 save_state()
+                continue
+
+            # Dynamic Trailing Stop-Loss Logic
+            current_price = float(active_exchange_pos.get("mark_price") or active_exchange_pos.get("entry_price", 0))
+            if current_price <= 0:
+                continue
+
+            best_price = state["best_price"].get(sym, pos_info["entry"])
+
+            if side == "buy":
+                if current_price > best_price:
+                    state["best_price"][sym] = current_price
+                    best_price = current_price
+                    save_state()
+                    log.info("[TRAILING] New best price for BUY %s: %.2f", sym, best_price)
+                
+                # Check trail trigger
+                drop_from_best = ((best_price - current_price) / best_price) * 100
+                if drop_from_best >= TRAILING_STOP_PERCENT:
+                    log.warning("[TRAILING STOP] BUY trailing stop hit for %s at price %.2f! Closing position...", sym, current_price)
+                    close_position(pos_info["product_id"], sym, "sell")
+
+            elif side == "sell":
+                if current_price < best_price:
+                    state["best_price"][sym] = current_price
+                    best_price = current_price
+                    save_state()
+                    log.info("[TRAILING] New best price for SELL %s: %.2f", sym, best_price)
+                
+                rise_from_best = ((current_price - best_price) / best_price) * 100
+                if rise_from_best >= TRAILING_STOP_PERCENT:
+                    log.warning("[TRAILING STOP] SELL trailing stop hit for %s at price %.2f! Closing position...", sym, current_price)
+                    close_position(pos_info["product_id"], sym, "buy")
 
     except Exception as exc:
-        log.error("Positions management error: %s", exc)
+        log.error("Positions management & trailing error: %s", exc)
+
+
+def close_position(product_id, symbol, close_side):
+    try:
+        body = {
+            "product_id": product_id,
+            "size": ORDER_SIZE,
+            "side": close_side,
+            "order_type": "market_order",
+            "reduce_only": True
+        }
+        res = api_request("POST", "/v2/orders", body=body, signed=True)
+        log.info("[CLOSE SUCCESS][%s] Position closed via market order: %s", symbol, res)
+        
+        state["positions"].pop(symbol, None)
+        state["best_price"].pop(symbol, None)
+        save_state()
+    except Exception as exc:
+        log.error("[CLOSE FAILED][%s] Error closing position: %s", symbol, exc)
 
 
 # ==================================================
@@ -411,7 +469,7 @@ def handle_signal(product, df, signal):
 # ==================================================
 
 def bot_loop():
-    log.info("Delta Multi-Coin EMA Bot started successfully.")
+    log.info("Delta Multi-Coin EMA Bot with Dynamic Trailing started successfully.")
     while True:
         try:
             check_and_manage_positions()
@@ -444,7 +502,7 @@ def bot_loop():
 @app.route("/")
 def health_check():
     return jsonify({
-        "service": "Delta Multi-Coin EMA Bot",
+        "service": "Delta Multi-Coin EMA Bot + Trailing",
         "status": "running",
         "trading_enabled": ENABLE_TRADING,
     })
