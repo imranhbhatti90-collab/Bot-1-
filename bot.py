@@ -470,14 +470,7 @@ def check():
 # =================================================
 
 load_state()
-
-if name == "main":
-threading.Thread(
-target=bot_loop,
-daemon=True,
-name="delta-multicoin-bot",
-).start()
-
+if name == "main": threading.Thread( target=bot_loop, daemon=True, name="delta-multicoin-bot", ).start()
 port = int(os.environ.get("PORT", "10000"))
 
 app.run(
