@@ -282,6 +282,12 @@ def scan_symbol(symbol):
     ema21 = float(latest["ema21"])
     candle_id = str(latest["time"])
 
+    # Har coin ka live price aur EMA logs mein print hoga
+    log.info(
+        "[MARKET] %s price=%.2f EMA9=%.2f EMA21=%.2f",
+        symbol, price, ema9, ema21
+    )
+
     buy_signal = (
         previous["ema9"] <= previous["ema21"]
         and latest["ema9"] > latest["ema21"]
@@ -345,18 +351,22 @@ def check_and_manage_positions():
         if not tracked_symbols:
             return
 
-        res = api_request("GET", "/v2/positions", signed=True)
-        positions = res.get("result", [])
-        
-        active_symbols_in_exchange = set()
-        for p in positions:
-            sym = p.get("product_symbol") or p.get("symbol")
-            size = float(p.get("size", 0))
-            if sym and size != 0:
-                active_symbols_in_exchange.add(sym)
-        
         for sym in tracked_symbols:
-            if sym not in active_symbols_in_exchange:
+            asset = sym.replace("USD", "").replace("USDT", "")
+            params = {"underlying_asset_symbol": asset}
+            
+            res = api_request("GET", "/v2/positions", params=params, signed=True)
+            positions = res.get("result", [])
+            
+            has_position = False
+            for p in positions:
+                p_sym = p.get("product_symbol") or p.get("symbol")
+                size = float(p.get("size", 0))
+                if p_sym == sym and size != 0:
+                    has_position = True
+                    break
+            
+            if not has_position:
                 log.info("[POSITION] Position for %s closed on exchange.", sym)
                 state["positions"].pop(sym, None)
                 state["best_price"].pop(sym, None)
