@@ -26,15 +26,14 @@ EMA_SLOW = 21
 ORDER_SIZE = 40
 LEVERAGE = 50
 
-INITIAL_SL_PERCENT = 0.20
-TRAILING_BUFFER_POINTS = 200
+# Trailing Stop Loss Settings
+INITIAL_SL_PERCENT = 0.20  # 0.2% initial stop loss
+TRAILING_BUFFER_POINTS = 100  # Trail distance
 
 RSI_PERIOD = 14
 VOLUME_MA_PERIOD = 20
-# Filters ko flexible banaya gaya hai taaki zyaada trades mil sakein
 MIN_VOLUME_MULTIPLIER = 1.0 
 
-# Trading is enabled!
 ENABLE_TRADING = True
 
 POLL_SECONDS = 20
@@ -55,6 +54,7 @@ app = Flask(__name__)
 state = {
     "position": None,
     "last_processed_candle": None,
+    "best_price": None,  # Trailing ke liye best price track karega
 }
 
 bot_status = {
@@ -86,6 +86,7 @@ def load_state():
 
     state.setdefault("position", None)
     state.setdefault("last_processed_candle", None)
+    state.setdefault("best_price", None)
 
 
 def save_state():
@@ -180,8 +181,7 @@ def get_product():
             return product
 
     raise RuntimeError(
-        f"{SYMBOL} product nahi mila. "
-        "Delta Testnet par symbol verify karein."
+        f"{SYMBOL} product nahi mila. Delta Testnet par symbol verify karein."
     )
 
 
@@ -260,17 +260,14 @@ def fetch_market_candles(symbol=SYMBOL):
 
 
 # ==================================================
-# FLEXIBLE RSI AND VOLUME FILTERS
+# FILTERS & SIGNAL SCANNER
 # ==================================================
 
 def check_market_filters(df, side):
     if len(df) < max(RSI_PERIOD, VOLUME_MA_PERIOD) + 2:
-        log.warning("Insufficient candles for filters.")
         return False
 
     close = df["close"]
-    volume = df["volume"]
-
     delta = close.diff()
 
     gains = delta.clip(lower=0)
@@ -283,31 +280,15 @@ def check_market_filters(df, side):
     rsi = 100 - (100 / (1 + rs))
 
     current_rsi = rsi.iloc[-1]
-    current_volume = volume.iloc[-1] if "volume" in df.columns else 0
 
-    log.info(
-        "[FILTER CHECK] Side=%s RSI=%.2f Volume=%.2f",
-        side.upper(),
-        current_rsi,
-        current_volume,
-    )
-
-    # Flexible RSI limits: Buy allowed if RSI > 40, Sell allowed if RSI < 60
     if side == "buy" and current_rsi < 40:
-        log.info("[FILTER BLOCKED] BUY: RSI too low (< 40).")
         return False
 
     if side == "sell" and current_rsi > 60:
-        log.info("[FILTER BLOCKED] SELL: RSI too high (> 60).")
         return False
 
-    log.info("[FILTER PASSED] %s", side.upper())
     return True
 
-
-# ==================================================
-# EMA 9/21 CROSSOVER
-# ==================================================
 
 def scan_signal():
     df = fetch_market_candles()
@@ -326,13 +307,7 @@ def scan_signal():
     price = float(latest["close"])
     ema9 = float(latest["ema9"])
     ema21 = float(latest["ema21"])
-
     candle_id = str(latest["time"])
-
-    log.info(
-        "[MARKET] %s price=%.2f EMA9=%.2f EMA21=%.2f",
-        SYMBOL, price, ema9, ema21
-    )
 
     buy_signal = (
         previous["ema9"] <= previous["ema21"]
@@ -361,10 +336,10 @@ def scan_signal():
 
 
 # ==================================================
-# LIVE ORDER EXECUTION
+# ORDER EXECUTION & TRAILING STOP LOSS MANAGEMENT
 # ==================================================
 
-def place_order(side):
+def place_order(side, entry_price):
     try:
         product = get_product()
         product_id = product["id"]
@@ -373,7 +348,7 @@ def place_order(side):
             "product_id": product_id,
             "size": ORDER_SIZE,
             "side": side,
-            "order_type": "market_order",  # Yahan 'market' ki jagah 'market_order' kar diya gaya hai
+            "order_type": "market_order",
             "leverage": LEVERAGE
         }
 
@@ -383,14 +358,60 @@ def place_order(side):
         
         state["position"] = {
             "side": side,
-            "entry": res.get("result", {}).get("average_price", 0),
+            "entry": entry_price,
             "size": ORDER_SIZE
         }
+        state["best_price"] = entry_price
         save_state()
 
     except Exception as exc:
         log.error("[ORDER FAILED] Error placing order: %s", exc)
 
+
+def check_and_manage_position():
+    """Live position ko check karega aur profit badhne par stop loss trail karega"""
+    if not state.get("position"):
+        return
+
+    try:
+        # Delta positions fetch karna
+        res = api_request("GET", "/v2/positions", signed=True)
+        positions = res.get("result", [])
+        
+        current_pos = None
+        for p in positions:
+            if p.get("product_symbol") == SYMBOL and float(p.get("size", 0)) != 0:
+                current_pos = p
+                break
+
+        if not current_pos:
+            log.info("[POSITION] Position closed on exchange.")
+            state["position"] = None
+            state["best_price"] = None
+            save_state()
+            return
+
+        entry_price = float(current_pos.get("entry_price", 0))
+        side = state["position"]["side"]
+        
+        # Latest market price fetch karna candles se
+        df = fetch_market_candles()
+        current_price = float(df["close"].iloc[-1])
+
+        if side == "buy":
+            if state["best_price"] is None or current_price > state["best_price"]:
+                state["best_price"] = current_price
+                save_state()
+                log.info("[TRAILING] New high price for BUY: %.2f", current_price)
+                
+        elif side == "sell":
+            if state["best_price"] is None or current_price < state["best_price"]:
+                state["best_price"] = current_price
+                save_state()
+                log.info("[TRAILING] New low price for SELL: %.2f", current_price)
+
+    except Exception as exc:
+        log.error("Position management error: %s", exc)
 
 
 # ==================================================
@@ -399,12 +420,10 @@ def place_order(side):
 
 def handle_signal(df, signal):
     side = signal["side"]
-
     if not side:
         return
 
     candle_id = signal["candle_id"]
-
     if candle_id == state.get("last_processed_candle"):
         return
 
@@ -412,19 +431,16 @@ def handle_signal(df, signal):
     save_state()
 
     if not check_market_filters(df, side):
-        log.info("[SIGNAL] %s rejected by filters.", side.upper())
         return
 
-    log.info(
-        "[SIGNAL] %s crossover approved by filters.",
-        side.upper()
-    )
+    if state.get("position"):
+        log.info("[SIGNAL] Position already active. Skipping new signal.")
+        return
 
     if not ENABLE_TRADING:
-        log.info("[SAFE MODE] Trading is disabled.")
         return
 
-    place_order(side)
+    place_order(side, signal["price"])
 
 
 # ==================================================
@@ -432,14 +448,16 @@ def handle_signal(df, signal):
 # ==================================================
 
 def bot_loop():
-    log.info("Delta BTCUSD EMA bot started (FLEXIBLE FILTERS & LIVE TRADING).")
+    log.info("Delta BTCUSD EMA bot started with Trailing SL support.")
     while True:
         try:
-            df, signal = scan_signal()
+            # Pehle active position aur trailing check karo
+            check_and_manage_position()
 
+            # Phir naye signals scan karo
+            df, signal = scan_signal()
             bot_status["last_signal"] = (
-                signal["side"].upper()
-                if signal["side"] else "NONE"
+                signal["side"].upper() if signal["side"] else "NONE"
             )
             bot_status["last_error"] = None
 
@@ -465,26 +483,17 @@ def health_check():
         "trading_enabled": ENABLE_TRADING,
     })
 
-
 @app.route("/status")
 def status():
     return jsonify(bot_status)
-
 
 @app.route("/check")
 def check():
     try:
         df, signal = scan_signal()
-        return jsonify({
-            "ok": True,
-            "signal": signal,
-            "candles": len(df),
-        })
+        return jsonify({"ok": True, "signal": signal, "candles": len(df)})
     except Exception as exc:
-        return jsonify({
-            "ok": False,
-            "error": str(exc),
-        }), 500
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 # ==================================================
@@ -501,7 +510,6 @@ if __name__ == "__main__":
     ).start()
 
     port = int(os.environ.get("PORT", "10000"))
-
     app.run(
         host="0.0.0.0",
         port=port,
