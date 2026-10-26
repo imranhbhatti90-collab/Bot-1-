@@ -29,7 +29,7 @@ VOLUME_MA_PERIOD = 20
 MIN_VOLUME_MULTIPLIER = 1.0 
 
 # Trailing Stop-Loss Settings
-TRAILING_STOP_PERCENT = 0.5  # Price ke against 0.5% move hone par trail karega
+TRAILING_STOP_PERCENT = 0.5  # 0.5% move hone par trail karega
 
 ENABLE_TRADING = True
 POLL_SECONDS = 20
@@ -379,7 +379,6 @@ def check_and_manage_positions():
                 save_state()
                 continue
 
-            # Dynamic Trailing Stop-Loss Logic
             current_price = float(active_exchange_pos.get("mark_price") or active_exchange_pos.get("entry_price", 0))
             if current_price <= 0:
                 continue
@@ -393,10 +392,9 @@ def check_and_manage_positions():
                     save_state()
                     log.info("[TRAILING] New best price for BUY %s: %.2f", sym, best_price)
                 
-                # Check trail trigger
                 drop_from_best = ((best_price - current_price) / best_price) * 100
                 if drop_from_best >= TRAILING_STOP_PERCENT:
-                    log.warning("[TRAILING STOP] BUY trailing stop hit for %s at price %.2f! Closing position...", sym, current_price)
+                    log.warning("[TRAILING STOP] BUY trailing stop hit for %s at price %.2f! Closing...", sym, current_price)
                     close_position(pos_info["product_id"], sym, "sell")
 
             elif side == "sell":
@@ -408,7 +406,7 @@ def check_and_manage_positions():
                 
                 rise_from_best = ((current_price - best_price) / best_price) * 100
                 if rise_from_best >= TRAILING_STOP_PERCENT:
-                    log.warning("[TRAILING STOP] SELL trailing stop hit for %s at price %.2f! Closing position...", sym, current_price)
+                    log.warning("[TRAILING STOP] SELL trailing stop hit for %s at price %.2f! Closing...", sym, current_price)
                     close_position(pos_info["product_id"], sym, "buy")
 
     except Exception as exc:
@@ -425,7 +423,7 @@ def close_position(product_id, symbol, close_side):
             "reduce_only": True
         }
         res = api_request("POST", "/v2/orders", body=body, signed=True)
-        log.info("[CLOSE SUCCESS][%s] Position closed via market order: %s", symbol, res)
+        log.info("[CLOSE SUCCESS][%s] Position closed: %s", symbol, res)
         
         state["positions"].pop(symbol, None)
         state["best_price"].pop(symbol, None)
@@ -465,7 +463,7 @@ def handle_signal(product, df, signal):
 
 
 # ==================================================
-# MAIN BOT LOOP (MULTI-COIN)
+# MAIN BOT LOOP
 # ==================================================
 
 def bot_loop():
@@ -496,7 +494,7 @@ def bot_loop():
 
 
 # ==================================================
-# RENDER HEALTH CHECK
+# HEALTH CHECK ROUTES
 # ==================================================
 
 @app.route("/")
