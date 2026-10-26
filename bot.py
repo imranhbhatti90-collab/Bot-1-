@@ -169,7 +169,6 @@ def get_all_active_products():
     try:
         data = api_request("GET", "/v2/products")
         products = data.get("result", [])
-        # Sirf active aur USD wale perpetual contracts filter karenge
         active_products = [
             p for p in products 
             if p.get("state") == "active" and "USD" in p.get("symbol", "")
@@ -342,13 +341,20 @@ def place_order(product_id, symbol, side, entry_price):
 
 def check_and_manage_positions():
     try:
+        tracked_symbols = list(state["positions"].keys())
+        if not tracked_symbols:
+            return
+
         res = api_request("GET", "/v2/positions", signed=True)
         positions = res.get("result", [])
         
-        active_symbols_in_exchange = {p.get("product_symbol") for p in positions if float(p.get("size", 0)) != 0}
+        active_symbols_in_exchange = set()
+        for p in positions:
+            sym = p.get("product_symbol") or p.get("symbol")
+            size = float(p.get("size", 0))
+            if sym and size != 0:
+                active_symbols_in_exchange.add(sym)
         
-        # Check closed positions
-        tracked_symbols = list(state["positions"].keys())
         for sym in tracked_symbols:
             if sym not in active_symbols_in_exchange:
                 log.info("[POSITION] Position for %s closed on exchange.", sym)
@@ -410,10 +416,9 @@ def bot_loop():
 
                     handle_signal(product, df, signal)
                 except Exception as ex:
-                    # Individual coin error ko ignore karein taaki baaki coins scan hote rahein
                     pass
 
-                time.sleep(1) # Rate limit bachane ke liye chhota gap
+                time.sleep(1)
 
         except Exception as exc:
             bot_status["last_error"] = str(exc)
