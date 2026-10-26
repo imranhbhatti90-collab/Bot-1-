@@ -16,8 +16,6 @@ from flask import Flask, jsonify
 # ==================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-
-SYMBOL = "BTCUSD"
 TIMEFRAME_MINUTES = 5
 
 EMA_FAST = 9
@@ -26,16 +24,11 @@ EMA_SLOW = 21
 ORDER_SIZE = 40
 LEVERAGE = 50
 
-# Trailing Stop Loss Settings
-INITIAL_SL_PERCENT = 0.20  # 0.2% initial stop loss
-TRAILING_BUFFER_POINTS = 100  # Trail distance
-
 RSI_PERIOD = 14
 VOLUME_MA_PERIOD = 20
 MIN_VOLUME_MULTIPLIER = 1.0 
 
 ENABLE_TRADING = True
-
 POLL_SECONDS = 20
 STATE_FILE = "state.json"
 
@@ -47,20 +40,20 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s: %(message)s"
 )
 
-log = logging.getLogger("delta-bot")
+log = logging.getLogger("delta-multicoin-bot")
 session = requests.Session()
 app = Flask(__name__)
 
+# State ab multiple coins ke liye track karega
 state = {
-    "position": None,
-    "last_processed_candle": None,
-    "best_price": None,  # Trailing ke liye best price track karega
+    "positions": {},          # symbol -> position details
+    "last_processed_candle": {}, # symbol -> candle_id
+    "best_price": {},         # symbol -> best price for trailing
 }
 
 bot_status = {
     "running": True,
     "trading_enabled": ENABLE_TRADING,
-    "symbol": SYMBOL,
     "last_signal": "NONE",
     "last_error": None,
 }
@@ -84,9 +77,9 @@ def load_state():
         except Exception as exc:
             log.error("State file read failed: %s", exc)
 
-    state.setdefault("position", None)
-    state.setdefault("last_processed_candle", None)
-    state.setdefault("best_price", None)
+    state.setdefault("positions", {})
+    state.setdefault("last_processed_candle", {})
+    state.setdefault("best_price", {})
 
 
 def save_state():
@@ -169,70 +162,56 @@ def api_request(method, path, params=None, body=None, signed=False):
 
 
 # ==================================================
-# PRODUCT LOOKUP
+# FETCH ALL ACTIVE SYMBOLS
 # ==================================================
 
-def get_product():
-    data = api_request("GET", "/v2/products")
-    products = data.get("result", [])
-
-    for product in products:
-        if product.get("symbol") == SYMBOL:
-            return product
-
-    raise RuntimeError(
-        f"{SYMBOL} product nahi mila. Delta Testnet par symbol verify karein."
-    )
+def get_all_active_products():
+    try:
+        data = api_request("GET", "/v2/products")
+        products = data.get("result", [])
+        # Sirf active aur USD wale perpetual contracts filter karenge
+        active_products = [
+            p for p in products 
+            if p.get("state") == "active" and "USD" in p.get("symbol", "")
+        ]
+        return active_products
+    except Exception as exc:
+        log.error("Failed to fetch products list: %s", exc)
+        return []
 
 
 # ==================================================
-# FETCH DELTA 5-MINUTE CANDLES
+# FETCH CANDLES FOR ANY SYMBOL
 # ==================================================
 
-def fetch_market_candles(symbol=SYMBOL):
-    if symbol != SYMBOL:
-        raise ValueError("Unexpected symbol: " + symbol)
-
+def fetch_market_candles(symbol):
     end_time = int(time.time())
     start_time = end_time - (24 * 60 * 60)
 
     params = {
-        "resolution": "5m",
-        "symbol": SYMBOL,
+        "resolution": str(TIMEFRAME_MINUTES),
+        "symbol": symbol,
         "start": start_time,
         "end": end_time,
     }
 
-    data = api_request(
-        "GET",
-        "/v2/history/candles",
-        params=params,
-    )
-
+    data = api_request("GET", "/v2/history/candles", params=params)
     candles = data.get("result", [])
 
     if not candles:
-        raise RuntimeError("Delta candle response empty hai.")
+        raise RuntimeError(f"Delta candle response empty for {symbol}.")
 
     df = pd.DataFrame(candles)
-
     required = {"time", "open", "high", "low", "close"}
-
     missing = required - set(df.columns)
     if missing:
-        raise RuntimeError(
-            f"Candle response mein columns missing: {missing}"
-        )
+        raise RuntimeError(f"Candle response columns missing for {symbol}: {missing}")
 
     for column in ["open", "high", "low", "close"]:
-        df[column] = pd.to_numeric(
-            df[column], errors="coerce"
-        )
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
     if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(
-            df["volume"], errors="coerce"
-        )
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
     df = (
         df.dropna(subset=["time", "close"])
@@ -252,9 +231,7 @@ def fetch_market_candles(symbol=SYMBOL):
     ].reset_index(drop=True)
 
     if len(df) < max(EMA_SLOW + 3, VOLUME_MA_PERIOD + 2):
-        raise RuntimeError(
-            f"Closed candles insufficient: {len(df)}"
-        )
+        raise RuntimeError(f"Closed candles insufficient for {symbol}: {len(df)}")
 
     return df
 
@@ -263,7 +240,7 @@ def fetch_market_candles(symbol=SYMBOL):
 # FILTERS & SIGNAL SCANNER
 # ==================================================
 
-def check_market_filters(df, side):
+def check_market_filters(df, side, symbol):
     if len(df) < max(RSI_PERIOD, VOLUME_MA_PERIOD) + 2:
         return False
 
@@ -282,24 +259,21 @@ def check_market_filters(df, side):
     current_rsi = rsi.iloc[-1]
 
     if side == "buy" and current_rsi < 40:
+        log.info("[%s] BUY filtered: RSI (%.2f) < 40", symbol, current_rsi)
         return False
 
     if side == "sell" and current_rsi > 60:
+        log.info("[%s] SELL filtered: RSI (%.2f) > 60", symbol, current_rsi)
         return False
 
     return True
 
 
-def scan_signal():
-    df = fetch_market_candles()
+def scan_symbol(symbol):
+    df = fetch_market_candles(symbol)
 
-    df["ema9"] = df["close"].ewm(
-        span=EMA_FAST, adjust=False
-    ).mean()
-
-    df["ema21"] = df["close"].ewm(
-        span=EMA_SLOW, adjust=False
-    ).mean()
+    df["ema9"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema21"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
 
     previous = df.iloc[-2]
     latest = df.iloc[-1]
@@ -327,6 +301,7 @@ def scan_signal():
         side = None
 
     return df, {
+        "symbol": symbol,
         "candle_id": candle_id,
         "price": price,
         "ema9": ema9,
@@ -336,14 +311,11 @@ def scan_signal():
 
 
 # ==================================================
-# ORDER EXECUTION & TRAILING STOP LOSS MANAGEMENT
+# ORDER EXECUTION
 # ==================================================
 
-def place_order(side, entry_price):
+def place_order(product_id, symbol, side, entry_price):
     try:
-        product = get_product()
-        product_id = product["id"]
-
         body = {
             "product_id": product_id,
             "size": ORDER_SIZE,
@@ -352,116 +324,96 @@ def place_order(side, entry_price):
             "leverage": LEVERAGE
         }
 
-        log.info("[ORDER] Placing %s market order for %s...", side.upper(), SYMBOL)
+        log.info("[ORDER] Placing %s market order for %s...", side.upper(), symbol)
         res = api_request("POST", "/v2/orders", body=body, signed=True)
-        log.info("[ORDER SUCCESS] Response: %s", res)
+        log.info("[ORDER SUCCESS][%s] Response: %s", symbol, res)
         
-        state["position"] = {
+        state["positions"][symbol] = {
             "side": side,
             "entry": entry_price,
             "size": ORDER_SIZE
         }
-        state["best_price"] = entry_price
+        state["best_price"][symbol] = entry_price
         save_state()
 
     except Exception as exc:
-        log.error("[ORDER FAILED] Error placing order: %s", exc)
+        log.error("[ORDER FAILED][%s] Error placing order: %s", symbol, exc)
 
 
-def check_and_manage_position():
-    """Live position ko check karega aur profit badhne par stop loss trail karega"""
-    if not state.get("position"):
-        return
-
+def check_and_manage_positions():
     try:
-        # Delta positions fetch karna
         res = api_request("GET", "/v2/positions", signed=True)
         positions = res.get("result", [])
         
-        current_pos = None
-        for p in positions:
-            if p.get("product_symbol") == SYMBOL and float(p.get("size", 0)) != 0:
-                current_pos = p
-                break
-
-        if not current_pos:
-            log.info("[POSITION] Position closed on exchange.")
-            state["position"] = None
-            state["best_price"] = None
-            save_state()
-            return
-
-        entry_price = float(current_pos.get("entry_price", 0))
-        side = state["position"]["side"]
+        active_symbols_in_exchange = {p.get("product_symbol") for p in positions if float(p.get("size", 0)) != 0}
         
-        # Latest market price fetch karna candles se
-        df = fetch_market_candles()
-        current_price = float(df["close"].iloc[-1])
-
-        if side == "buy":
-            if state["best_price"] is None or current_price > state["best_price"]:
-                state["best_price"] = current_price
+        # Check closed positions
+        tracked_symbols = list(state["positions"].keys())
+        for sym in tracked_symbols:
+            if sym not in active_symbols_in_exchange:
+                log.info("[POSITION] Position for %s closed on exchange.", sym)
+                state["positions"].pop(sym, None)
+                state["best_price"].pop(sym, None)
                 save_state()
-                log.info("[TRAILING] New high price for BUY: %.2f", current_price)
-                
-        elif side == "sell":
-            if state["best_price"] is None or current_price < state["best_price"]:
-                state["best_price"] = current_price
-                save_state()
-                log.info("[TRAILING] New low price for SELL: %.2f", current_price)
 
     except Exception as exc:
-        log.error("Position management error: %s", exc)
+        log.error("Positions management error: %s", exc)
 
 
 # ==================================================
 # SIGNAL HANDLER
 # ==================================================
 
-def handle_signal(df, signal):
+def handle_signal(product, df, signal):
+    symbol = signal["symbol"]
     side = signal["side"]
     if not side:
         return
 
     candle_id = signal["candle_id"]
-    if candle_id == state.get("last_processed_candle"):
+    if candle_id == state["last_processed_candle"].get(symbol):
         return
 
-    state["last_processed_candle"] = candle_id
+    state["last_processed_candle"][symbol] = candle_id
     save_state()
 
-    if not check_market_filters(df, side):
+    if not check_market_filters(df, side, symbol):
         return
 
-    if state.get("position"):
-        log.info("[SIGNAL] Position already active. Skipping new signal.")
+    if symbol in state["positions"]:
         return
 
     if not ENABLE_TRADING:
+        log.info("[%s SAFE MODE] Signal found but trading disabled.", symbol)
         return
 
-    place_order(side, signal["price"])
+    place_order(product["id"], symbol, side, signal["price"])
 
 
 # ==================================================
-# MAIN BOT LOOP
+# MAIN BOT LOOP (MULTI-COIN)
 # ==================================================
 
 def bot_loop():
-    log.info("Delta BTCUSD EMA bot started with Trailing SL support.")
+    log.info("Delta Multi-Coin EMA Bot started successfully.")
     while True:
         try:
-            # Pehle active position aur trailing check karo
-            check_and_manage_position()
+            check_and_manage_positions()
+            products = get_all_active_products()
 
-            # Phir naye signals scan karo
-            df, signal = scan_signal()
-            bot_status["last_signal"] = (
-                signal["side"].upper() if signal["side"] else "NONE"
-            )
-            bot_status["last_error"] = None
+            for product in products:
+                symbol = product.get("symbol")
+                try:
+                    df, signal = scan_symbol(symbol)
+                    bot_status["last_signal"] = f"{symbol}:{signal['side'].upper() if signal['side'] else 'NONE'}"
+                    bot_status["last_error"] = None
 
-            handle_signal(df, signal)
+                    handle_signal(product, df, signal)
+                except Exception as ex:
+                    # Individual coin error ko ignore karein taaki baaki coins scan hote rahein
+                    pass
+
+                time.sleep(1) # Rate limit bachane ke liye chhota gap
 
         except Exception as exc:
             bot_status["last_error"] = str(exc)
@@ -477,9 +429,8 @@ def bot_loop():
 @app.route("/")
 def health_check():
     return jsonify({
-        "service": "Delta BTCUSD EMA Bot",
+        "service": "Delta Multi-Coin EMA Bot",
         "status": "running",
-        "symbol": SYMBOL,
         "trading_enabled": ENABLE_TRADING,
     })
 
@@ -490,8 +441,9 @@ def status():
 @app.route("/check")
 def check():
     try:
-        df, signal = scan_signal()
-        return jsonify({"ok": True, "signal": signal, "candles": len(df)})
+        products = get_all_active_products()
+        symbols = [p.get("symbol") for p in products]
+        return jsonify({"ok": True, "active_symbols": symbols})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -506,7 +458,7 @@ if __name__ == "__main__":
     threading.Thread(
         target=bot_loop,
         daemon=True,
-        name="delta-bot",
+        name="delta-multicoin-bot",
     ).start()
 
     port = int(os.environ.get("PORT", "10000"))
