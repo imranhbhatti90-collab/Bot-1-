@@ -373,7 +373,7 @@ def place_order(side):
             "product_id": product_id,
             "size": ORDER_SIZE,
             "side": side,
-            "order_type": "market",
+            "order_type": "market_order",  # Yahan 'market' ki jagah 'market_order' kar diya gaya hai
             "leverage": LEVERAGE
         }
 
@@ -390,6 +390,7 @@ def place_order(side):
 
     except Exception as exc:
         log.error("[ORDER FAILED] Error placing order: %s", exc)
+
 
 
 # ==================================================
