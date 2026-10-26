@@ -33,8 +33,8 @@ RSI_PERIOD = 14
 VOLUME_MA_PERIOD = 20
 MIN_VOLUME_MULTIPLIER = 1.2
 
-# Safe mode: do not submit orders in this version.
-ENABLE_TRADING = False
+# Trading is now enabled!
+ENABLE_TRADING = True
 
 POLL_SECONDS = 20
 STATE_FILE = "state.json"
@@ -240,8 +240,6 @@ def fetch_market_candles(symbol=SYMBOL):
         .reset_index(drop=True)
     )
 
-    # The final candle may still be forming.
-    # Only completed candles are used for signals.
     now = int(time.time())
     current_candle_start = (
         now // (TIMEFRAME_MINUTES * 60)
@@ -287,7 +285,6 @@ def check_market_filters(df, side):
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
 
-    # Previous row is the last completed candle.
     current_rsi = rsi.iloc[-1]
 
     volume_ma = volume.rolling(
@@ -387,7 +384,39 @@ def scan_signal():
 
 
 # ==================================================
-# SAFE SIGNAL HANDLER
+# LIVE ORDER EXECUTION
+# ==================================================
+
+def place_order(side):
+    try:
+        product = get_product()
+        product_id = product["id"]
+
+        body = {
+            "product_id": product_id,
+            "size": ORDER_SIZE,
+            "side": side,
+            "order_type": "market",
+            "leverage": LEVERAGE
+        }
+
+        log.info("[ORDER] Placing %s market order for %s...", side.upper(), SYMBOL)
+        res = api_request("POST", "/v2/orders", body=body, signed=True)
+        log.info("[ORDER SUCCESS] Response: %s", res)
+        
+        state["position"] = {
+            "side": side,
+            "entry": res.get("result", {}).get("average_price", 0),
+            "size": ORDER_SIZE
+        }
+        save_state()
+
+    except Exception as exc:
+        log.error("[ORDER FAILED] Error placing order: %s", exc)
+
+
+# ==================================================
+# SIGNAL HANDLER
 # ==================================================
 
 def handle_signal(df, signal):
@@ -403,7 +432,6 @@ def handle_signal(df, signal):
         log.info("[SIGNAL] Candle already processed.")
         return
 
-    # Record the candle to prevent repeated signal handling.
     state["last_processed_candle"] = candle_id
     save_state()
 
@@ -417,18 +445,11 @@ def handle_signal(df, signal):
     )
 
     if not ENABLE_TRADING:
-        log.info(
-            "[SAFE MODE] No order placed. "
-            "Entry/SL API execution is not enabled in this file."
-        )
+        log.info("[SAFE MODE] Trading is disabled.")
         return
 
-    # Deliberately fail closed: never claim an order was placed
-    # when a verified order execution function is unavailable.
-    raise RuntimeError(
-        "Trading execution is not implemented in this file. "
-        "No order was submitted."
-    )
+    # Execute market order on Delta Exchange
+    place_order(side)
 
 
 # ==================================================
@@ -436,7 +457,7 @@ def handle_signal(df, signal):
 # ==================================================
 
 def bot_loop():
-    log.info("Delta BTCUSD EMA bot started.")
+    log.info("Delta BTCUSD EMA bot started (LIVE TRADING ENABLED).")
     log.info(
         "Trading=%s | Order size=%s | Leverage setting=%sx",
         ENABLE_TRADING, ORDER_SIZE, LEVERAGE
@@ -496,7 +517,7 @@ def check():
         return jsonify({
             "ok": False,
             "error": str(exc),
-        }), 500
+        }, 500)
 
 
 # ==================================================
