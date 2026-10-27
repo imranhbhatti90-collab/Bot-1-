@@ -10,10 +10,10 @@ EMA_SLOW = 21
 RSI_PERIOD = 14
 ORDER_SIZE = 40
 LEVERAGE = 50
-TRAILING_STOP_PERCENT = 0.2  # <-- 0.5 se 0.2 kar diya aapke liye
+TRAILING_STOP_PERCENT = 0.2
 PROFIT_LOCK_ENABLE = True
-PROFIT_ACTIVATE = 20.0  # 20 USD par active
-PROFIT_FLOOR = 10.0      # 10 USD par close
+PROFIT_ACTIVATE = 20.0
+PROFIT_FLOOR = 10.0
 ENABLE_TRADING = True
 POLL_SECONDS = 15
 STATE_FILE = "state.json"
@@ -139,12 +139,12 @@ def get_all_positions():
 def get_positions_for_symbol(symbol, all_pos=None):
     if all_pos is None: all_pos=get_all_positions()
     return [p for p in all_pos if str(p.get("product_symbol","")).upper()==symbol.upper() and abs(float(p.get("size",0) or 0))>0]
+
 def position_side(p):
     s=str(p.get("side","")).lower()
     if s in ("buy","long"): return "buy"
     if s in ("sell","short"): return "sell"
     return "buy" if float(p.get("size",0) or 0)>0 else "sell"
-def position_size(p): return abs(int(float(p.get("size",0) or 0)))
 
 def place_order(product, side, price, candle_id, rsi):
     sym=product["symbol"]
@@ -159,19 +159,37 @@ def place_order(product, side, price, candle_id, rsi):
         bot_status["last_error"]=str(e); logging.error(f"Order fail {sym} {e}"); return False
 
 def close_position(symbol, position, reason):
-    curr_size=position_size(position)
-    if curr_size<=0: return False
-    side=position_side(position)
-    close_side="sell" if side=="buy" else "buy"
-    pid=position.get("product_id") or state.get(symbol,{}).get("product_id")
-    if not pid: return False
-    payload={"product_id":int(pid),"size":curr_size,"side":close_side,"order_type":"market_order","reduce_only":True}
+    # FIX: BTC 0.04 size ka bug fix
     try:
-        api_request("POST","/v2/orders",payload=payload,auth=True)
-        logging.warning(f"[CLOSE] {symbol} {reason}")
-        if symbol in state: state.pop(symbol,None); save_state()
+        size_float = abs(float(position.get("size", 0)))
+    except:
+        size_float = ORDER_SIZE
+    
+    if size_float < 1:
+        close_size = ORDER_SIZE
+    else:
+        close_size = int(size_float) if size_float >= 1 else ORDER_SIZE
+    
+    if close_size <= 0:
+        close_size = ORDER_SIZE
+    
+    side = position_side(position)
+    close_side = "sell" if side == "buy" else "buy"
+    pid = position.get("product_id") or state.get(symbol, {}).get("product_id")
+    if not pid:
+        return False
+    
+    payload = {"product_id": int(pid), "size": int(close_size), "side": close_side, "order_type": "market_order", "reduce_only": True}
+    try:
+        api_request("POST", "/v2/orders", payload=payload, auth=True)
+        logging.warning(f"[CLOSE] {symbol} {reason} size={close_size}")
+        if symbol in state:
+            state.pop(symbol, None)
+            save_state()
         return True
-    except Exception as e: logging.error(f"Close fail {e}"); return False
+    except Exception as e:
+        logging.error(f"Close fail {symbol} {e}")
+        return False
 
 def get_mark_price(p):
     for k in ("mark_price","markPrice","last_price"):
@@ -187,6 +205,7 @@ def get_current_pnl(pos, mark_price):
         size=abs(float(pos.get("size",0)))
         if pos.get("product_symbol")=="SOLUSD": size=40
         if pos.get("product_symbol")=="BTCUSD": size=0.04
+        if pos.get("product_symbol")=="ETHUSD": size=0.5
         if not entry or not mark_price: return 0
         if float(pos.get("size",0))>0 or str(pos.get("side","")).lower() in ("buy","long"):
             return (mark_price - entry) * size
@@ -196,7 +215,7 @@ def get_current_pnl(pos, mark_price):
 
 def bot_loop():
     bot_status["running"]=True
-    logging.info(f"BOT STARTED | ALL COINS | 0.2% TRAIL + 20->10 PROFIT LOCK")
+    logging.info(f"BOT STARTED | ALL COINS | 0.2% TRAIL + 20->10 PROFIT LOCK + BTC FIX")
     while True:
         try:
             products=get_all_active_products()
@@ -214,7 +233,6 @@ def bot_loop():
                 mp=get_mark_price(pos)
                 if mp is None: continue
 
-                # PROFIT LOCK CHECK
                 curr_pnl=get_current_pnl(pos, mp)
                 highest_pnl=float(info.get("highest_profit", curr_pnl))
                 if curr_pnl > highest_pnl:
@@ -233,20 +251,21 @@ def bot_loop():
                     close_position(sym, pos, f"Profit 50% drop")
                     continue
 
-                # PRICE TRAILING 0.2%
                 try: entry=float(pos.get("entry_price") or info.get("entry_price", mp))
                 except: continue
                 highest=float(info.get("highest_price", entry)); lowest=float(info.get("lowest_price", entry))
                 if position_side(pos)=="buy":
                     highest=max(highest, mp, entry); info["highest_price"]=highest; save_state()
                     trig=highest*(1-TRAILING_STOP_PERCENT/100)
-                    logging.info(f"[TRAIL LONG 0.2%] {sym} mark={mp:.2f} trig={trig:.2f} pnl={curr_pnl:.2f}")
-                    if mp<=trig: close_position(sym, pos, f"Long trail 0.2% {mp:.2f} <= {trig:.2f}")
+                    logging.info(f"[TRAIL LONG 0.2%] {sym} mark={mp:.2f} high={highest:.2f} trig={trig:.2f} pnl={curr_pnl:.2f}")
+                    if mp<=trig:
+                        close_position(sym, pos, f"Long trail 0.2% {mp:.2f} <= {trig:.2f} PnL {curr_pnl:.2f}")
                 else:
                     lowest=min(lowest, mp, entry); info["lowest_price"]=lowest; save_state()
                     trig=lowest*(1+TRAILING_STOP_PERCENT/100)
-                    logging.info(f"[TRAIL SHORT 0.2%] {sym} mark={mp:.2f} trig={trig:.2f} pnl={curr_pnl:.2f}")
-                    if mp>=trig: close_position(sym, pos, f"Short trail 0.2% {mp:.2f} >= {trig:.2f}")
+                    logging.info(f"[TRAIL SHORT 0.2%] {sym} mark={mp:.2f} low={lowest:.2f} trig={trig:.2f} pnl={curr_pnl:.2f}")
+                    if mp>=trig:
+                        close_position(sym, pos, f"Short trail 0.2% {mp:.2f} >= {trig:.2f} PnL {curr_pnl:.2f}")
 
             for prod in products:
                 sym=prod.get("symbol")
@@ -266,7 +285,7 @@ def bot_loop():
         time.sleep(POLL_SECONDS)
 
 @app.route("/")
-def home(): return jsonify({"bot":"0.2% TRAIL + PROFIT LOCK","status":"running"})
+def home(): return jsonify({"bot":"0.2% TRAIL + PROFIT LOCK + BTC FIX","status":"running"})
 @app.route("/status")
 def status(): return jsonify({**bot_status,"open":list(state.keys())})
 
