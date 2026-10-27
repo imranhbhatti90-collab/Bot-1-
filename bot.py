@@ -24,7 +24,6 @@ app = Flask(__name__)
 session = requests.Session()
 bot_status = {"running": False, "last_error": None, "last_signal": None}
 state = {}
-
 try:
     with open(STATE_FILE, "r") as f: state = json.load(f)
 except: state = {}
@@ -56,16 +55,21 @@ def get_all_active_products():
     result=api_request("GET","/v2/products",auth=False)
     prods=result_data(result)
     if isinstance(prods,dict): prods=prods.get("products",[])
+    if not isinstance(prods,list): prods=[]
     active=[]
     for p in prods:
-        if not isinstance(p,dict): continue
-        if str(p.get("state","")).lower()!="active": continue
-        if "USD" not in str(p.get("symbol","")).upper(): continue
+        sym=str(p.get("symbol","")).upper()
+        # FIX: Sirf USD check, state ka filter hata diya - isi wajah se 0 aa raha tha
+        if "USD" not in sym: continue
         if p.get("id") is None: continue
+        # Perpetual/Futures hi rakho
+        if p.get("contract_type") and p.get("contract_type") not in ("perpetual_futures","futures","call_options","put_options","move_options","spot","interest_rate_swap"):
+            # Agar contract_type nahi hai to bhi le lo
+            pass
         active.append(p)
-    # Sort BTC, ETH, SOL pehle
-    active.sort(key=lambda x: (0 if "BTC" in x.get("symbol","") else 1 if "ETH" in x.get("symbol","") else 2))
-    logging.info(f"Found {len(active)} active USD products")
+    # BTC, ETH pehle
+    active.sort(key=lambda x: 0 if "BTC" in x.get("symbol","") else 1 if "ETH" in x.get("symbol","") else 2)
+    logging.info(f"Found {len(active)} USD products - sample: {[p.get('symbol') for p in active[:5]]}")
     return active
 
 def fetch_market_candles(symbol):
@@ -109,7 +113,6 @@ def scan_symbol(symbol):
     if not ok: return None, df, reason
     return {"symbol":symbol,"side":side,"price":float(curr["close"]),"candle_id":str(curr["time"]),"rsi":float(curr["rsi"])}, df, reason
 
-# FAST POSITION FETCH - hang nahi karega
 _cached_positions = {"data": [], "time": 0}
 def get_all_positions():
     global _cached_positions
@@ -123,9 +126,8 @@ def get_all_positions():
             _cached_positions = {"data": pos, "time": time.time()}
             return pos
     except Exception as e: logging.info(f"margined fail {e}")
-    # Fallback - sirf 3 main assets try karo fast
     all_pos=[]
-    for asset in ["BTC","ETH","SOL"]:
+    for asset in ["BTC","ETH","SOL","XRP","BNB"]:
         try:
             result=api_request("GET","/v2/positions", params={"underlying_asset_symbol":asset}, auth=True)
             pos=result_data(result)
@@ -182,16 +184,18 @@ def get_mark_price(p):
 
 def bot_loop():
     bot_status["running"]=True
-    logging.info(f"BOT STARTED | ALL COINS | RSI 35 STRICT | trading={ENABLE_TRADING}")
+    logging.info(f"BOT STARTED | ALL COINS FIXED | RSI 35 STRICT")
     while True:
         try:
             products=get_all_active_products()
+            if len(products)==0:
+                logging.error("No products found, retry in 30s")
+                time.sleep(30)
+                continue
             all_pos=get_all_positions()
-            # Sync state
             for sym in list(state.keys()):
                 ps=get_positions_for_symbol(sym, all_pos)
                 if not ps: state.pop(sym,None); save_state()
-            # Trailing
             for sym in list(state.keys()):
                 ps=get_positions_for_symbol(sym, all_pos)
                 if not ps or len(ps)!=1: continue
@@ -212,11 +216,9 @@ def bot_loop():
                     logging.info(f"[TRAIL SHORT] {sym} mark={mp:.2f} trig={trig:.2f}")
                     if mp>=trig: close_position(sym,pos,f"Short trail {mp:.2f} >= {trig:.2f}")
 
-            # Scan all coins
             for prod in products:
                 sym=prod.get("symbol")
-                if not sym: continue
-                if sym in state: continue
+                if not sym or sym in state: continue
                 try:
                     sig,df,reason=scan_symbol(sym)
                     if sig is None:
@@ -227,14 +229,13 @@ def bot_loop():
                 except Exception as e:
                     logging.error(f"Scan {sym} error {e}")
                 time.sleep(0.6)
-
         except Exception as e:
             logging.exception(f"Main loop error {e}")
             bot_status["last_error"]=str(e)
         time.sleep(POLL_SECONDS)
 
 @app.route("/")
-def home(): return jsonify({"bot":"ALL COINS RSI 35 STRICT","coins":"all USD active","status":"running"})
+def home(): return jsonify({"bot":"ALL COINS FIXED RSI 35","status":"running"})
 @app.route("/status")
 def status(): return jsonify({**bot_status,"open":list(state.keys())})
 
