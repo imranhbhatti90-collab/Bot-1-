@@ -12,7 +12,7 @@ ORDER_SIZE = 40
 LEVERAGE = 50
 TRAILING_STOP_PERCENT = 0.5
 ENABLE_TRADING = True
-POLL_SECONDS = 25
+POLL_SECONDS = 15  # 25 se 15 kiya taaki fast scan kare
 STATE_FILE = "state.json"
 REQUEST_TIMEOUT = 15
 
@@ -59,15 +59,11 @@ def get_all_active_products():
     active=[]
     for p in prods:
         sym=str(p.get("symbol","")).upper()
-        # FIX: Sirf USD check, state ka filter hata diya - isi wajah se 0 aa raha tha
         if "USD" not in sym: continue
+        if "_USDT" in sym: continue
+        if "1000" in sym: continue
         if p.get("id") is None: continue
-        # Perpetual/Futures hi rakho
-        if p.get("contract_type") and p.get("contract_type") not in ("perpetual_futures","futures","call_options","put_options","move_options","spot","interest_rate_swap"):
-            # Agar contract_type nahi hai to bhi le lo
-            pass
         active.append(p)
-    # BTC, ETH pehle
     active.sort(key=lambda x: 0 if "BTC" in x.get("symbol","") else 1 if "ETH" in x.get("symbol","") else 2)
     logging.info(f"Found {len(active)} USD products - sample: {[p.get('symbol') for p in active[:5]]}")
     return active
