@@ -63,7 +63,7 @@ bot_status = {
 
 
 # ==================================================
-# STATE MANAGEMENT
+# STATE & EXCHANGE SYNC MANAGEMENT
 # ==================================================
 
 def load_state():
@@ -96,6 +96,49 @@ def save_state():
 
     except Exception as exc:
         log.error("State save failed: %s", exc)
+
+
+def sync_positions_with_exchange():
+    """Startup par exchange ki real positions ke sath state sync karta hai"""
+    try:
+        if not API_KEY or not API_SECRET:
+            return
+        
+        log.info("[SYNC] Fetching active positions from exchange for synchronization...")
+        res = api_request("GET", "/v2/positions", signed=True)
+        positions = res.get("result", [])
+        
+        active_symbols_on_exchange = set()
+        for p in positions:
+            p_sym = p.get("product_symbol") or p.get("symbol")
+            size = float(p.get("size", 0))
+            if p_sym and size != 0:
+                active_symbols_on_exchange.add(p_sym)
+                # Agar state mein nahi hai toh add kar lo
+                if p_sym not in state["positions"]:
+                    side = "buy" if size > 0 else "sell"
+                    entry_price = float(p.get("entry_price", 0))
+                    product_id = p.get("product_id")
+                    state["positions"][p_sym] = {
+                        "side": side,
+                        "entry": entry_price,
+                        "size": abs(size),
+                        "product_id": product_id
+                    }
+                    state["best_price"][p_sym] = entry_price
+                    log.info("[SYNC] Recovered active position from exchange: %s (%s)", p_sym, side)
+
+        # Jo positions exchange par nahi hain lekin state mein hain, unhe hata do
+        tracked_symbols = list(state["positions"].keys())
+        for sym in tracked_symbols:
+            if sym not in active_symbols_on_exchange:
+                log.info("[SYNC] Removing stale position from state: %s", sym)
+                state["positions"].pop(sym, None)
+                state["best_price"].pop(sym, None)
+        
+        save_state()
+    except Exception as exc:
+        log.error("[SYNC ERROR] Failed to sync positions on startup: %s", exc)
 
 
 # ==================================================
@@ -331,7 +374,7 @@ def place_order(product_id, symbol, side, entry_price):
             "leverage": LEVERAGE
         }
 
-        log.info("[ORDER] Placing %s market order for %s...", side.upper(), symbol)
+        log.info("[ORDER] Placing %s market order for %s (Size: %s, Leverage: %s)...", side.upper(), symbol, ORDER_SIZE, LEVERAGE)
         res = api_request("POST", "/v2/orders", body=body, signed=True)
         log.info("[ORDER SUCCESS][%s] Response: %s", symbol, res)
         
@@ -365,11 +408,13 @@ def check_and_manage_positions():
             positions = res.get("result", [])
             
             active_exchange_pos = None
+            actual_pos_size = ORDER_SIZE
             for p in positions:
                 p_sym = p.get("product_symbol") or p.get("symbol")
                 size = float(p.get("size", 0))
                 if p_sym == sym and size != 0:
                     active_exchange_pos = p
+                    actual_pos_size = abs(size)
                     break
             
             if not active_exchange_pos:
@@ -395,7 +440,7 @@ def check_and_manage_positions():
                 drop_from_best = ((best_price - current_price) / best_price) * 100
                 if drop_from_best >= TRAILING_STOP_PERCENT:
                     log.warning("[TRAILING STOP] BUY trailing stop hit for %s at price %.2f! Closing...", sym, current_price)
-                    close_position(pos_info["product_id"], sym, "sell")
+                    close_position(pos_info["product_id"], sym, "sell", actual_pos_size)
 
             elif side == "sell":
                 if current_price < best_price:
@@ -407,23 +452,23 @@ def check_and_manage_positions():
                 rise_from_best = ((current_price - best_price) / best_price) * 100
                 if rise_from_best >= TRAILING_STOP_PERCENT:
                     log.warning("[TRAILING STOP] SELL trailing stop hit for %s at price %.2f! Closing...", sym, current_price)
-                    close_position(pos_info["product_id"], sym, "buy")
+                    close_position(pos_info["product_id"], sym, "buy", actual_pos_size)
 
     except Exception as exc:
         log.error("Positions management & trailing error: %s", exc)
 
 
-def close_position(product_id, symbol, close_side):
+def close_position(product_id, symbol, close_side, close_size):
     try:
         body = {
             "product_id": product_id,
-            "size": ORDER_SIZE,
+            "size": close_size,
             "side": close_side,
             "order_type": "market_order",
             "reduce_only": True
         }
         res = api_request("POST", "/v2/orders", body=body, signed=True)
-        log.info("[CLOSE SUCCESS][%s] Position closed: %s", symbol, res)
+        log.info("[CLOSE SUCCESS][%s] Position closed successfully with size %s: %s", symbol, close_size, res)
         
         state["positions"].pop(symbol, None)
         state["best_price"].pop(symbol, None)
@@ -467,7 +512,11 @@ def handle_signal(product, df, signal):
 # ==================================================
 
 def bot_loop():
-    log.info("Delta Multi-Coin EMA Bot with Dynamic Trailing started successfully.")
+    log.info("Delta Multi-Coin EMA Bot with Safe Trailing & Sync started successfully.")
+    
+    # Startup synchronization
+    sync_positions_with_exchange()
+
     while True:
         try:
             check_and_manage_positions()
@@ -482,13 +531,13 @@ def bot_loop():
 
                     handle_signal(product, df, signal)
                 except Exception as ex:
-                    pass
+                    log.error("[SCAN ERROR][%s] %s", symbol, ex)
 
                 time.sleep(1)
 
         except Exception as exc:
             bot_status["last_error"] = str(exc)
-            log.exception("Bot loop error")
+            log.exception("Bot loop error: %s", exc)
 
         time.sleep(POLL_SECONDS)
 
@@ -500,7 +549,7 @@ def bot_loop():
 @app.route("/")
 def health_check():
     return jsonify({
-        "service": "Delta Multi-Coin EMA Bot + Trailing",
+        "service": "Delta Multi-Coin EMA Bot (Advanced & Secured)",
         "status": "running",
         "trading_enabled": ENABLE_TRADING,
     })
