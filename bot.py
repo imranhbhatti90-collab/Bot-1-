@@ -105,30 +105,42 @@ def sync_positions_with_exchange():
             return
         
         log.info("[SYNC] Fetching active positions from exchange for synchronization...")
-        res = api_request("GET", "/v2/positions", signed=True)
-        positions = res.get("result", [])
-        
+        products = get_all_active_products()
         active_symbols_on_exchange = set()
-        for p in positions:
-            p_sym = p.get("product_symbol") or p.get("symbol")
-            size = float(p.get("size", 0))
-            if p_sym and size != 0:
-                active_symbols_on_exchange.add(p_sym)
-                # Agar state mein nahi hai toh add kar lo
-                if p_sym not in state["positions"]:
-                    side = "buy" if size > 0 else "sell"
-                    entry_price = float(p.get("entry_price", 0))
-                    product_id = p.get("product_id")
-                    state["positions"][p_sym] = {
-                        "side": side,
-                        "entry": entry_price,
-                        "size": abs(size),
-                        "product_id": product_id
-                    }
-                    state["best_price"][p_sym] = entry_price
-                    log.info("[SYNC] Recovered active position from exchange: %s (%s)", p_sym, side)
+        
+        checked_assets = set()
+        for p in products:
+            sym = p.get("symbol", "")
+            asset = sym.replace("USD", "").replace("USDT", "")
+            if not asset or asset in checked_assets:
+                continue
+            checked_assets.add(asset)
+            
+            try:
+                params = {"underlying_asset_symbol": asset}
+                res = api_request("GET", "/v2/positions", params=params, signed=True)
+                positions = res.get("result", [])
+                
+                for pos in positions:
+                    p_sym = pos.get("product_symbol") or pos.get("symbol")
+                    size = float(pos.get("size", 0))
+                    if p_sym and size != 0:
+                        active_symbols_on_exchange.add(p_sym)
+                        if p_sym not in state["positions"]:
+                            side = "buy" if size > 0 else "sell"
+                            entry_price = float(pos.get("entry_price", 0))
+                            product_id = pos.get("product_id")
+                            state["positions"][p_sym] = {
+                                "side": side,
+                                "entry": entry_price,
+                                "size": abs(size),
+                                "product_id": product_id
+                            }
+                            state["best_price"][p_sym] = entry_price
+                            log.info("[SYNC] Recovered active position from exchange: %s (%s)", p_sym, side)
+            except Exception as e:
+                pass
 
-        # Jo positions exchange par nahi hain lekin state mein hain, unhe hata do
         tracked_symbols = list(state["positions"].keys())
         for sym in tracked_symbols:
             if sym not in active_symbols_on_exchange:
