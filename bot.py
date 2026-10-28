@@ -203,6 +203,7 @@ def main_loop():
                     continue
                 sig = check_signal(candles, symbol)
                 if sig:
+                    
                 has = False
                 pos_symbols = []
                 for p in positions:
