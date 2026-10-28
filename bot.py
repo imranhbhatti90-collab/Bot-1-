@@ -273,4 +273,3 @@ def main_loop():
 if __name__ == "__main__":
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
-    main_loop()
