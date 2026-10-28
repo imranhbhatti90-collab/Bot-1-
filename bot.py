@@ -164,11 +164,13 @@ def check_signal(candles, symbol):
         return "sell"
     
     return None
-
+    
 def place_entry(symbol, side):
     body = {"product_symbol": symbol, "size": 40, "side": side, "order_type": "market_order"}
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[ENTRY] {symbol} {side} -> {code}", flush=True)
+    # Full error dikhao
+    err_msg = str(res)[:800]
+    print(f"[ENTRY] {symbol} {side} -> {code} | {err_msg}", flush=True)
     return res, code
 
 def parse_pos_symbol(p):
@@ -241,6 +243,7 @@ def main_loop():
                     continue
                 sig = check_signal(candles, symbol)
                 if sig:
+                                    if sig:
                     if symbol in held:
                         print(f"[SKIP] {symbol} has pos", flush=True)
                         continue
@@ -257,13 +260,11 @@ def main_loop():
                         state["last_trade"][symbol] = time.time()
                         save_state(state)
                         held.append(symbol)
-                else:
-                    print(f"[NO TRADE] {symbol}", flush=True)
-            print("--- SLEEP 30s ---", flush=True)
-            time.sleep(30)
-        except Exception as e:
-            print(f"[ERROR] {e}", flush=True)
-            time.sleep(10)
+                    else:
+                        # Fail hone par bhi 5 min cooldown laga do - overtrading rokne ke liye
+                        print(f"[FAIL COOLDOWN] {symbol} 5min cooldown due to {code}", flush=True)
+                        state["last_trade"][symbol] = time.time()
+                        save_state(state)
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_flask, daemon=True)
