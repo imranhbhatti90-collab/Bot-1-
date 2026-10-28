@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot FINAL - 6 Coins - 5m - 0.5% Trail Visible - Live"
+    return "Bot FINAL - EMA CROSS + RSI40 + VOL + 0.5% Trail - Live"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -118,23 +118,51 @@ def check_signal(candles, symbol):
     df = pd.DataFrame(candles)
     if 'close' not in df.columns:
         df = pd.DataFrame(candles, columns=['time','open','high','low','close','volume'])
+    
     df['close'] = pd.to_numeric(df['close'])
+    df['volume'] = pd.to_numeric(df['volume'])
     df['ema9'] = df['close'].ewm(span=9).mean()
     df['ema21'] = df['close'].ewm(span=21).mean()
+    
+    # RSI
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0).rolling(window=14).mean()
     loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
+    
+    # Volume AVG 20
+    df['vol_avg'] = df['volume'].rolling(window=20).mean()
+    
     last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
     ema9 = float(last['ema9'])
     ema21 = float(last['ema21'])
+    ema9_prev = float(prev['ema9'])
+    ema21_prev = float(prev['ema21'])
     rsi = float(last['rsi'])
-    print(f"[CHECK] {symbol} EMA9 {ema9:.1f} EMA21 {ema21:.1f} RSI {rsi:.1f}", flush=True)
-    if ema9 > ema21 and rsi > 40:
+    vol = float(last['volume'])
+    vol_avg = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else vol
+    
+    print(f"[CHECK] {symbol} EMA9 {ema9:.1f} EMA21 {ema21:.1f} RSI {rsi:.1f} VOL {vol:.0f}/{vol_avg:.0f}", flush=True)
+    
+    # EMA CROSS
+    buy_cross = ema9_prev <= ema21_prev and ema9 > ema21
+    sell_cross = ema9_prev >= ema21_prev and ema9 < ema21
+    
+    # Volume filter - 80% of avg
+    vol_ok = vol > (vol_avg * 0.8)
+    
+    # BUY: Cross up + RSI >40 + Volume OK
+    if buy_cross and rsi > 40 and vol_ok:
+        print(f"[SIGNAL BUY] {symbol} CROSS UP RSI {rsi:.1f}>40 VOL OK", flush=True)
         return "buy"
-    if ema9 < ema21 and rsi < 60:
+    # SELL: Cross down + RSI <60 + Volume OK
+    if sell_cross and rsi < 60 and vol_ok:
+        print(f"[SIGNAL SELL] {symbol} CROSS DOWN RSI {rsi:.1f}<60 VOL OK", flush=True)
         return "sell"
+    
     return None
 
 def place_entry(symbol, side):
@@ -188,11 +216,9 @@ def handle_trailing():
         save_state(state)
 
 def main_loop():
-    print("=== BOT FINAL CLEAN - 6 COINS - 5m RSI40 0.5% TRAIL VISIBLE - USOON IGNORED ===", flush=True)
-    # Clear old state on start
+    print("=== FINAL BOT - EMA CROSS + RSI40 + VOL + 0.5% TRAIL VISIBLE - USOON IGNORED ===", flush=True)
     state["last_trade"] = {}
     save_state(state)
-    print("[POS HELD] Checking...", flush=True)
     while True:
         try:
             handle_trailing()
@@ -206,7 +232,7 @@ def main_loop():
                 if ps and ps in COINS:
                     held.append(ps)
                 elif ps:
-                    print(f"[SKIP POS not in COINS] {ps} size {sz}", flush=True)
+                    print(f"[SKIP POS not in COINS] {ps} size {sz} (ignored)", flush=True)
             held = list(set(held))
             print(f"[POS HELD] {held if held else '[] - Fresh start (USOON ignored)'}", flush=True)
             for symbol in COINS:
