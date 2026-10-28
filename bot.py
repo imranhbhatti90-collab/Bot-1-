@@ -87,17 +87,20 @@ def get_products():
     return active
 
 def get_candles(pid):
-    params = {"resolution": TIMEFRAME, "symbol": pid, "count": 100}
+    import time as t
+    end = int(t.time())
+    start = end - (100 * 5 * 60)
+    params = {"resolution": TIMEFRAME, "product_id": str(pid), "start": str(start), "end": str(end)}
     res, code = api_req("GET", "/v2/history/candles", params=params)
     if code == 200 and res.get("result") and len(res["result"]) > 0:
-        print(f"[CANDLES OK] {pid} {len(res['result'])}", flush=True)
+        print(f"[CANDLES OK] {pid} {len(res['result'])} candles", flush=True)
         return res["result"]
-    params2 = {"resolution": TIMEFRAME, "product_id": pid, "count": 100}
+    params2 = {"resolution": TIMEFRAME, "symbol": str(pid), "start": str(start), "end": str(end)}
     res2, code2 = api_req("GET", "/v2/history/candles", params=params2)
     if code2 == 200 and res2.get("result") and len(res2["result"]) > 0:
-        print(f"[CANDLES OK2] {pid} {len(res2['result'])}", flush=True)
+        print(f"[CANDLES OK2] {pid} {len(res2['result'])} candles", flush=True)
         return res2["result"]
-    print(f"[CANDLES FAIL] {pid}", flush=True)
+    print(f"[CANDLES FAIL] {pid} code={code}", flush=True)
     return []
 
 def get_pos():
