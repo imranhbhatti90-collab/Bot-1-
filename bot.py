@@ -130,15 +130,12 @@ def check_signal(candles, symbol):
     prev = df.iloc[-2]
     ema9 = last['ema9']
     ema21 = last['ema21']
-    ema9_prev = prev['ema9']
-    ema21_prev = prev['ema21']
     rsi = last['rsi']
     print(f"[CHECK] {symbol} EMA9 {ema9:.1f} EMA21 {ema21:.1f} RSI {rsi:.1f}", flush=True)
-    buy_cross = ema9_prev <= ema21_prev and ema9 > ema21
-    sell_cross = ema9_prev >= ema21_prev and ema9 < ema21
-    if buy_cross and rsi > 40:
+    # SIMPLE LOGIC - trend follow, not just cross
+    if ema9 > ema21 and rsi > 40:
         return "buy"
-    if sell_cross and rsi < 60:
+    if ema9 < ema21 and rsi < 60:
         return "sell"
     return None
 
