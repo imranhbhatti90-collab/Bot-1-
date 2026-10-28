@@ -152,7 +152,11 @@ def handle_trailing():
         size = float(p.get("size",0))
         if size == 0:
             continue
-        entry = float(p.get("entry_price", p.get("average_price",0)))
+        entry = float(p.get("entry_price") or p.get("average_price") or p.get("avg_price") or p.get("entry") or 0)
+        print(f"[DEBUG POS] {symbol} size={size} entry={entry} raw={str(p)[:200]}", flush=True)
+        if entry == 0:
+            # agar entry nahi mila to current price ko entry maan lo
+            entry = curr
         if entry == 0:
             continue
         candles = get_candles(symbol)
