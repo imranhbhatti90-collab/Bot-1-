@@ -203,15 +203,20 @@ def main_loop():
                     continue
                 sig = check_signal(candles, symbol)
                 if sig:
-                    has = False
-                    for p in positions:
-                        prod2 = p.get("product", {})
-                        spot2 = prod2.get("spot_index", {}) if isinstance(prod2, dict) else {}
-                        und2 = spot2.get("underlying_asset") or prod2.get("underlying_asset")
-                        psym = p.get("product_symbol") or p.get("symbol") or (f"{und2}USD" if und2 else "")
-                        if psym == symbol:
-                            has = True
-                            break
+                has = False
+                pos_symbols = []
+                for p in positions:
+                    prod2 = p.get("product", {})
+                    spot2 = prod2.get("spot_index", {}) if isinstance(prod2, dict) else {}
+                    und2 = spot2.get("underlying_asset") or prod2.get("underlying_asset") or ""
+                    psym = p.get("product_symbol") or p.get("symbol") or (f"{und2}USD" if und2 else "")
+                    if psym:
+                        pos_symbols.append(psym)
+                    # agar ETH, BTC jaisa base match ho to bhi has pos mano
+                    if psym == symbol or (und2 and und2 in symbol):
+                        has = True
+                if pos_symbols:
+                    print(f"[POS LIST] {pos_symbols} checking {symbol} has={has}", flush=True) 
                     if has:
                         print(f"[SKIP] {symbol} has pos", flush=True)
                         continue
