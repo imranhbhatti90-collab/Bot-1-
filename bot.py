@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot FIXED Overtrading + Trail"
+    return "Bot FIXED FINAL USOON BUG"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -153,7 +153,15 @@ def parse_pos_symbol(p):
     prod = p.get("product", {})
     spot = prod.get("spot_index", {}) if isinstance(prod, dict) else {}
     und = spot.get("underlying_asset") or prod.get("underlying_asset") or ""
-    psym = p.get("product_symbol") or p.get("symbol") or (f"{und}USD" if und else "")
+    if isinstance(und, dict):
+        und = und.get("symbol") or und.get("underlying_asset") or ""
+    if isinstance(und, str) and len(und) > 10:
+        und = ""
+    psym = p.get("product_symbol") or p.get("symbol") or (f"{und}USD" if isinstance(und, str) and und else "")
+    # USOON ke liye special
+    if "USOON" in str(p):
+        psym = "USOONUSD"
+        und = "USOON"
     return psym, und
 
 def handle_trailing():
@@ -161,10 +169,7 @@ def handle_trailing():
     for p in positions:
         psym, und = parse_pos_symbol(p)
         if not psym or psym not in COINS:
-            if und and f"{und}USD" in COINS:
-                psym = f"{und}USD"
-            else:
-                continue
+            continue
         size = float(p.get("size", 0))
         if size == 0:
             continue
@@ -198,7 +203,7 @@ def handle_trailing():
         save_state(state)
 
 def main_loop():
-    print("=== BOT START FIXED OVERTRADING ===", flush=True)
+    print("=== BOT START FIXED FINAL ===", flush=True)
     while True:
         try:
             handle_trailing()
@@ -206,10 +211,8 @@ def main_loop():
             held = []
             for p in positions:
                 ps, und = parse_pos_symbol(p)
-                if ps:
+                if ps and ps in COINS:
                     held.append(ps)
-                if und and f"{und}USD" not in held:
-                    held.append(f"{und}USD")
             if held:
                 print(f"[POS HELD] {held}", flush=True)
             for symbol in COINS:
@@ -221,7 +224,7 @@ def main_loop():
                     has = False
                     base = symbol.replace("USD","")
                     for h in held:
-                        if h == symbol or base in h or h.replace("USD","") == base:
+                        if h == symbol or base in h:
                             has = True
                             break
                     if has:
