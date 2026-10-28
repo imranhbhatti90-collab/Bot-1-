@@ -5,31 +5,31 @@ import hmac
 import hashlib
 import requests
 from urllib.parse import urlencode, quote
-from datetime import datetime
 import pandas as pd
+from flask import Flask
+import threading
+
+# Flask app for Render port binding
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Delta Bot Running - 7 Coins Only - 15m - 0.5% - 1 Pos Open"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
 
 # ========= CONFIG =========
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
 
-# Sirf ye 7 coins - BTC, ETH, SOL, GOLD, SILVER, CRUDE OIL, BNB
-ALLOWED_COINS = [
-    "BTCUSD",      # Bitcoin
-    "ETHUSD",      # Ethereum
-    "SOLUSD",      # Solana
-    "BNBUSD",      # BNB
-    "XAUTUSD",     # Gold
-    "PAXGUSD",     # Gold
-    "SILVERUSD",   # Silver
-    "USOONUSD",    # Crude Oil
-]
-
+ALLOWED_COINS = ["BTCUSD","ETHUSD","SOLUSD","BNBUSD","XAUTUSD","PAXGUSD","SILVERUSD","USOONUSD"]
 TIMEFRAME = "15m"
 POLL_SECONDS = 60
 ORDER_SIZE = 40
-TRAILING_STOP_PERCENT = 0.5  # 0.2% se 0.5% kiya
-
+TRAILING_STOP_PERCENT = 0.5
 PROFIT_LOCK_ENABLE = True
 PROFIT_ACTIVATE = 20.0
 PROFIT_FLOOR = 10.0
@@ -60,19 +60,12 @@ def api_request(method, path, params=None, body=None):
         path_with_query = f"{path}?{query_string}"
     else:
         path_with_query = path
-
     if body:
         message = method + timestamp + path_with_query + json.dumps(body)
     else:
         message = method + timestamp + path_with_query
-
     signature = hmac.new(API_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "api-key": API_KEY,
-        "timestamp": timestamp,
-        "signature": signature,
-        "Content-Type": "application/json"
-    }
+    headers = {"api-key": API_KEY, "timestamp": timestamp, "signature": signature, "Content-Type": "application/json"}
     url = BASE_URL + path_with_query
     try:
         if method == "GET":
@@ -98,7 +91,7 @@ def get_all_active_products():
         if "_USDT" in symbol or "1000" in symbol:
             continue
         active.append(p)
-    print(f"[INFO] Found {len(active)} ALLOWED: {[p['symbol'] for p in active]}")
+    print(f"[INFO] Found {len(active)} ALLOWED: {[p['symbol'] for p in active]}", flush=True)
     return active
 
 def get_candles(product_id, resolution="15m", count=100):
@@ -168,7 +161,7 @@ def place_order(symbol, side, size):
         size = ORDER_SIZE
     body = {"product_symbol": symbol, "size": size, "side": side, "order_type": "market_order"}
     res, code = api_request("POST", "/v2/orders", body=body)
-    print(f"[ORDER] {symbol} {side} {size} -> {code} {res}")
+    print(f"[ORDER] {symbol} {side} {size} -> {code} {res}", flush=True)
     return res, code
 
 def close_position(symbol, size, side):
@@ -188,21 +181,21 @@ def check_profit_lock(symbol, current_pnl):
         state["positions"][symbol] = pos_data
         save_state(state)
     if peak >= PROFIT_ACTIVATE and current_pnl <= PROFIT_FLOOR:
-        print(f"[PROFIT LOCK] {symbol} Peak {peak} -> Current {current_pnl} => CLOSE")
+        print(f"[PROFIT LOCK] {symbol} Peak {peak} -> Current {current_pnl} => CLOSE", flush=True)
         return True
     if peak >= PROFIT_ACTIVATE and current_pnl <= peak * 0.5:
-        print(f"[PROFIT LOCK 50%] {symbol} Peak {peak} -> Current {current_pnl} => CLOSE")
+        print(f"[PROFIT LOCK 50%] {symbol} Peak {peak} -> Current {current_pnl} => CLOSE", flush=True)
         return True
     return False
 
 def main_loop():
-    print("=== Delta Bot Started - 7 Coins Only - 15m - 0.5% ===")
+    print("=== Delta Bot Started - 7 Coins Only - 15m - 0.5% ===", flush=True)
     products = get_all_active_products()
     while True:
         try:
             positions = get_all_positions()
             if positions:
-                print(f"[POS] {len(positions)} open")
+                print(f"[POS] {len(positions)} open", flush=True)
             for prod in products:
                 symbol = prod["symbol"]
                 pid = prod.get("id", symbol)
@@ -245,7 +238,7 @@ def main_loop():
                             highest = max(highest, mark_price)
                             trigger = highest * (1 - TRAILING_STOP_PERCENT / 100)
                             if mark_price <= trigger:
-                                print(f"[TRAIL LONG {TRAILING_STOP_PERCENT}%] {symbol} Highest {highest} Trigger {trigger} => CLOSE")
+                                print(f"[TRAIL LONG {TRAILING_STOP_PERCENT}%] {symbol} Highest {highest} Trigger {trigger} => CLOSE", flush=True)
                                 for p in positions:
                                     if p.get("product_symbol") == symbol or p.get("symbol") == symbol:
                                         size = float(p.get("size", ORDER_SIZE))
@@ -264,7 +257,7 @@ def main_loop():
                             lowest = min(lowest, mark_price) if lowest else mark_price
                             trigger = lowest * (1 + TRAILING_STOP_PERCENT / 100)
                             if mark_price >= trigger:
-                                print(f"[TRAIL SHORT {TRAILING_STOP_PERCENT}%] {symbol} Lowest {lowest} Trigger {trigger} => CLOSE")
+                                print(f"[TRAIL SHORT {TRAILING_STOP_PERCENT}%] {symbol} Lowest {lowest} Trigger {trigger} => CLOSE", flush=True)
                                 for p in positions:
                                     if p.get("product_symbol") == symbol or p.get("symbol") == symbol:
                                         size = float(p.get("size", ORDER_SIZE))
@@ -285,7 +278,7 @@ def main_loop():
                     if has_pos:
                         continue
                     last_close = candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4]
-                    print(f"[SIGNAL] {symbol} {signal}")
+                    print(f"[SIGNAL] {symbol} {signal}", flush=True)
                     res, code = place_order(symbol, signal, ORDER_SIZE)
                     if code == 200:
                         state["positions"][symbol] = {
@@ -299,8 +292,12 @@ def main_loop():
                         save_state(state)
             time.sleep(POLL_SECONDS)
         except Exception as e:
-            print(f"[ERROR] {e}")
+            print(f"[ERROR] {e}", flush=True)
             time.sleep(10)
 
 if __name__ == "__main__":
+    # Flask ko alag thread me chalao
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    # Bot main loop chalao
     main_loop()
