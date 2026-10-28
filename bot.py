@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot FINAL - EMA CROSS + RSI40 + VOL + 0.5% Trail - Live"
+    return "Bot FINAL FIX - EMA CROSS + RSI40 + VOL + 400 Debug"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -106,7 +106,7 @@ def place_stop(symbol, side, size, stop_price):
         "stop_trigger_method": "last_traded_price"
     }
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[TRAIL STOP] {symbol} {stop_side} stop={price_str} -> {code}", flush=True)
+    print(f"[TRAIL STOP] {symbol} {stop_side} stop={price_str} -> {code} | {str(res)[:500]}", flush=True)
     if code == 200:
         state["stops"][symbol] = float(stop_price)
         save_state(state)
@@ -118,25 +118,18 @@ def check_signal(candles, symbol):
     df = pd.DataFrame(candles)
     if 'close' not in df.columns:
         df = pd.DataFrame(candles, columns=['time','open','high','low','close','volume'])
-    
     df['close'] = pd.to_numeric(df['close'])
     df['volume'] = pd.to_numeric(df['volume'])
     df['ema9'] = df['close'].ewm(span=9).mean()
     df['ema21'] = df['close'].ewm(span=21).mean()
-    
-    # RSI
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0).rolling(window=14).mean()
     loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
-    
-    # Volume AVG 20
     df['vol_avg'] = df['volume'].rolling(window=20).mean()
-    
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    
     ema9 = float(last['ema9'])
     ema21 = float(last['ema21'])
     ema9_prev = float(prev['ema9'])
@@ -144,38 +137,26 @@ def check_signal(candles, symbol):
     rsi = float(last['rsi'])
     vol = float(last['volume'])
     vol_avg = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else vol
-    
     print(f"[CHECK] {symbol} EMA9 {ema9:.1f} EMA21 {ema21:.1f} RSI {rsi:.1f} VOL {vol:.0f}/{vol_avg:.0f}", flush=True)
-    
-    # EMA CROSS
     buy_cross = ema9_prev <= ema21_prev and ema9 > ema21
     sell_cross = ema9_prev >= ema21_prev and ema9 < ema21
-    
-    # Volume filter - 80% of avg
     vol_ok = vol > (vol_avg * 0.8)
-    
-    # BUY: Cross up + RSI >40 + Volume OK
     if buy_cross and rsi > 40 and vol_ok:
         print(f"[SIGNAL BUY] {symbol} CROSS UP RSI {rsi:.1f}>40 VOL OK", flush=True)
         return "buy"
-    # SELL: Cross down + RSI <60 + Volume OK
     if sell_cross and rsi < 60 and vol_ok:
         print(f"[SIGNAL SELL] {symbol} CROSS DOWN RSI {rsi:.1f}<60 VOL OK", flush=True)
         return "sell"
-    
     return None
-    
+
 def place_entry(symbol, side):
     body = {"product_symbol": symbol, "size": 40, "side": side, "order_type": "market_order"}
     res, code = api_req("POST", "/v2/orders", body=body)
-    # Full error dikhao
-    err_msg = str(res)[:800]
-    print(f"[ENTRY] {symbol} {side} -> {code} | {err_msg}", flush=True)
+    print(f"[ENTRY] {symbol} {side} -> {code} | {str(res)[:800]}", flush=True)
     return res, code
 
 def parse_pos_symbol(p):
-    psym = p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
-    return psym
+    return p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
 
 def handle_trailing():
     positions = get_pos()
@@ -218,7 +199,7 @@ def handle_trailing():
         save_state(state)
 
 def main_loop():
-    print("=== FINAL BOT - EMA CROSS + RSI40 + VOL + 0.5% TRAIL VISIBLE - USOON IGNORED ===", flush=True)
+    print("=== FINAL BOT FIXED - EMA CROSS + RSI40 + VOL + 400 DEBUG ===", flush=True)
     state["last_trade"] = {}
     save_state(state)
     while True:
@@ -243,7 +224,6 @@ def main_loop():
                     continue
                 sig = check_signal(candles, symbol)
                 if sig:
-                                    if sig:
                     if symbol in held:
                         print(f"[SKIP] {symbol} has pos", flush=True)
                         continue
@@ -261,10 +241,18 @@ def main_loop():
                         save_state(state)
                         held.append(symbol)
                     else:
-                        # Fail hone par bhi 5 min cooldown laga do - overtrading rokne ke liye
                         print(f"[FAIL COOLDOWN] {symbol} 5min cooldown due to {code}", flush=True)
                         state["last_trade"][symbol] = time.time()
                         save_state(state)
+                else:
+                    print(f"[NO TRADE] {symbol}", flush=True)
+            print("--- SLEEP 30s ---", flush=True)
+            time.sleep(30)
+        except Exception as e:
+            print(f"[ERROR] {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            time.sleep(10)
 
 if __name__ == "__main__":
     t = threading.Thread(target=run_flask, daemon=True)
