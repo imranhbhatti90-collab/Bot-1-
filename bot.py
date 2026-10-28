@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot FINAL TREND - EMA9>EMA21 + RSI40 + VOL50% - Big Move Catch"
+    return "Bot FINAL - POS CACHE FIX - Size 40 - No Instant Cut"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -19,6 +19,10 @@ API_SECRET = os.getenv("DELTA_API_SECRET", "")
 COINS = ["BTCUSD","ETHUSD","SOLUSD","XAUTUSD","PAXGUSD","SILVERUSD"]
 TRAIL_PCT = 0.005
 STATE_FILE = "state.json"
+
+# POS CACHE - API khali bheje to cache use karo
+_last_pos_cache = []
+_last_pos_time = 0
 
 def load_state():
     try:
@@ -72,10 +76,26 @@ def get_candles(symbol):
     return []
 
 def get_pos():
+    global _last_pos_cache, _last_pos_time
     res, code = api_req("GET", "/v2/positions/margined")
     if code == 200 and res.get("result"):
         r = res["result"]
-        return r if isinstance(r, list) else [r]
+        lst = r if isinstance(r, list) else [r]
+        # Non-zero positions filter karo
+        filtered = [p for p in lst if float(p.get("size",0)) != 0]
+        if filtered:
+            _last_pos_cache = filtered
+            _last_pos_time = time.time()
+            return filtered
+        # Agar API ne khali bheja par cache me hai to cache use karo
+        if _last_pos_cache and (time.time() - _last_pos_time < 120):
+            print(f"[POS CACHE] API empty, using cached {len(_last_pos_cache)} pos", flush=True)
+            return _last_pos_cache
+        return []
+    # API fail hua to cache use karo
+    if _last_pos_cache and (time.time() - _last_pos_time < 120):
+        print(f"[POS CACHE] API fail {code}, using cached {len(_last_pos_cache)} pos", flush=True)
+        return _last_pos_cache
     return []
 
 def get_orders():
@@ -135,7 +155,7 @@ def check_signal(candles, symbol):
     vol = float(last['volume'])
     vol_avg = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else vol
     print(f"[CHECK] {symbol} EMA9 {ema9:.1f} EMA21 {ema21:.1f} RSI {rsi:.1f} VOL {vol:.0f}/{vol_avg:.0f}", flush=True)
-    # BIG MOVE CATCH - Trend based, not exact cross
+    # BIG MOVE CATCH - Trend based
     if ema9 > ema21 and rsi > 40:
         if vol > (vol_avg * 0.5):
             print(f"[SIGNAL BUY] {symbol} TREND UP EMA9>EMA21 RSI {rsi:.1f}>40 VOL OK", flush=True)
@@ -147,9 +167,10 @@ def check_signal(candles, symbol):
     return None
 
 def place_entry(symbol, side):
+    # Size 40 hi rakha hai jaise bola
     body = {"product_symbol": symbol, "size": 40, "side": side, "order_type": "market_order"}
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[ENTRY] {symbol} {side} -> {code} | {str(res)[:500]}", flush=True)
+    print(f"[ENTRY] {symbol} {side} size 40 -> {code} | {str(res)[:500]}", flush=True)
     return res, code
 
 def parse_pos_symbol(p):
@@ -196,9 +217,7 @@ def handle_trailing():
         save_state(state)
 
 def main_loop():
-    print("=== FINAL BOT TREND - BIG MOVE CATCH - EMA9>EMA21 + RSI40 + VOL50% ===", flush=True)
-    state["last_trade"] = {}
-    save_state(state)
+    print("=== FINAL BOT - POS CACHE FIX - SIZE 40 - NO INSTANT CUT ===", flush=True)
     while True:
         try:
             handle_trailing()
@@ -222,7 +241,7 @@ def main_loop():
                 sig = check_signal(candles, symbol)
                 if sig:
                     if symbol in held:
-                        print(f"[SKIP] {symbol} has pos", flush=True)
+                        print(f"[SKIP] {symbol} has pos {held}", flush=True)
                         continue
                     last_t = state["last_trade"].get(symbol, 0)
                     if time.time() - last_t < 300:
@@ -237,6 +256,7 @@ def main_loop():
                         state["last_trade"][symbol] = time.time()
                         save_state(state)
                         held.append(symbol)
+                        print(f"[HELD UPDATED] {held}", flush=True)
                     else:
                         print(f"[FAIL COOLDOWN] {symbol} 5min cooldown", flush=True)
                         state["last_trade"][symbol] = time.time()
