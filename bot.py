@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot Running 6 Coins 5m RSI40 0.5%"
+    return "Bot Running 6 Coins 5m RSI40 0.5% FIXED"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -69,9 +69,11 @@ def api_req(method, path, params=None, body=None):
 def get_products():
     res, code = api_req("GET", "/v2/products")
     if code != 200 or not res.get("result"):
+        print(f"[PRODUCTS FAIL] code={code}, using fallback", flush=True)
         out = []
         for s in ALLOWED:
             out.append({"symbol": s, "id": s})
+        print(f"[INFO] Fallback {len(out)} coins", flush=True)
         return out
     active = []
     for p in res["result"]:
@@ -87,8 +89,15 @@ def get_products():
 def get_candles(pid):
     params = {"resolution": TIMEFRAME, "symbol": pid, "count": 100}
     res, code = api_req("GET", "/v2/history/candles", params=params)
-    if code == 200 and res.get("result"):
+    if code == 200 and res.get("result") and len(res["result"]) > 0:
+        print(f"[CANDLES OK] {pid} {len(res['result'])}", flush=True)
         return res["result"]
+    params2 = {"resolution": TIMEFRAME, "product_id": pid, "count": 100}
+    res2, code2 = api_req("GET", "/v2/history/candles", params=params2)
+    if code2 == 200 and res2.get("result") and len(res2["result"]) > 0:
+        print(f"[CANDLES OK2] {pid} {len(res2['result'])}", flush=True)
+        return res2["result"]
+    print(f"[CANDLES FAIL] {pid}", flush=True)
     return []
 
 def get_pos():
@@ -100,6 +109,7 @@ def get_pos():
 
 def check_signal(candles):
     if len(candles) < 50:
+        print(f"[CHECK FAIL] {len(candles)} candles", flush=True)
         return None
     try:
         if isinstance(candles[0], dict):
@@ -108,7 +118,8 @@ def check_signal(candles):
         else:
             df = pd.DataFrame(candles, columns=['time','open','high','low','close','volume'])
             df['close'] = pd.to_numeric(df['close'])
-    except:
+    except Exception as e:
+        print(f"[CHECK ERROR] {e}", flush=True)
         return None
     df['ema9'] = df['close'].ewm(span=9).mean()
     df['ema21'] = df['close'].ewm(span=21).mean()
@@ -146,11 +157,11 @@ def place_order(sym, side, size, close=False, stop=None):
         if close:
             body["reduce_only"] = True
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[ORDER] {sym} {side} {sz} stop={stop} -> {code}", flush=True)
+    print(f"[ORDER] {sym} {side} {sz} -> {code}", flush=True)
     return res, code
 
 def main_loop():
-    print("=== BOT START 6 COINS 5m RSI40 0.5% ===", flush=True)
+    print("=== BOT START 6 COINS 5m RSI40 0.5% FIXED ===", flush=True)
     prods = get_products()
     while True:
         try:
@@ -165,6 +176,7 @@ def main_loop():
                     continue
                 candles = get_candles(pid)
                 if not candles:
+                    print(f"[SKIP] {sym} no candles", flush=True)
                     continue
                 sig = check_signal(candles)
                 if sig:
