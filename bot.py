@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot FIXED FINAL USOON BUG"
+    return "Bot FINAL - Fixed Overtrading + Trail + RSI40"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -25,7 +25,7 @@ def load_state():
         with open(STATE_FILE,'r') as f:
             return json.load(f)
     except:
-        return {"peaks":{}, "stops":{}}
+        return {"peaks":{}, "stops":{}, "last_trade":{}}
 
 def save_state(s):
     try:
@@ -61,10 +61,10 @@ def api_req(method, path, params=None, body=None):
 
 def get_candles(symbol):
     end = int(time.time())
-    start = end - (500 * 60)
+    start = end - (600 * 60)
     params = {"resolution": "5m", "symbol": symbol, "start": str(start), "end": str(end)}
     res, code = api_req("GET", "/v2/history/candles", params=params)
-    if code == 200 and res.get("result") and len(res["result"]) > 10:
+    if code == 200 and res.get("result") and len(res["result"]) > 20:
         print(f"[CANDLES OK] {symbol} {len(res['result'])}", flush=True)
         return res["result"]
     print(f"[CANDLES FAIL] {symbol} code={code}", flush=True)
@@ -86,7 +86,7 @@ def get_orders():
 def cancel_all_stops(symbol):
     orders = get_orders()
     for o in orders:
-        if o.get("product_symbol") == symbol:
+        if o.get("product_symbol") == symbol and o.get("reduce_only"):
             oid = o.get("id")
             if oid:
                 api_req("DELETE", f"/v2/orders/{oid}")
@@ -101,14 +101,14 @@ def place_stop(symbol, side, size, stop_price):
         "size": sz,
         "side": stop_side,
         "order_type": "market_order",
-        "stop_price": str(round(stop_price,1)),
+        "stop_price": str(round(float(stop_price), 1)),
         "reduce_only": True,
         "stop_trigger_method": "last_traded_price"
     }
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[TRAIL STOP] {symbol} {stop_side} stop={stop_price:.1f} -> {code}", flush=True)
+    print(f"[TRAIL STOP] {symbol} {stop_side} stop={float(stop_price):.2f} -> {code}", flush=True)
     if code == 200:
-        state["stops"][symbol] = stop_price
+        state["stops"][symbol] = float(stop_price)
         save_state(state)
     return res, code
 
@@ -127,19 +127,17 @@ def check_signal(candles, symbol):
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-    ema9 = last['ema9']
-    ema21 = last['ema21']
-    rsi = last['rsi']
+    ema9 = float(last['ema9'])
+    ema21 = float(last['ema21'])
+    rsi = float(last['rsi'])
     print(f"[CHECK] {symbol} EMA9 {ema9:.1f} EMA21 {ema21:.1f} RSI {rsi:.1f}", flush=True)
-    # SIMPLE LOGIC - trend follow, not just cross
     if ema9 > ema21 and rsi > 40:
         return "buy"
     if ema9 < ema21 and rsi < 60:
         return "sell"
     return None
 
-def place_entry(symbol, side, size):
+def place_entry(symbol, side):
     sz = 40
     body = {"product_symbol": symbol, "size": sz, "side": side, "order_type": "market_order"}
     res, code = api_req("POST", "/v2/orders", body=body)
@@ -147,28 +145,31 @@ def place_entry(symbol, side, size):
     return res, code
 
 def parse_pos_symbol(p):
+    psym = p.get("product_symbol") or p.get("symbol") or ""
     prod = p.get("product", {})
-    spot = prod.get("spot_index", {}) if isinstance(prod, dict) else {}
-    und = spot.get("underlying_asset") or prod.get("underlying_asset") or ""
-    if isinstance(und, dict):
-        und = und.get("symbol") or und.get("underlying_asset") or ""
-    if isinstance(und, str) and len(und) > 10:
-        und = ""
-    psym = p.get("product_symbol") or p.get("symbol") or (f"{und}USD" if isinstance(und, str) and und else "")
-    # USOON ke liye special
-    if "USOON" in str(p):
+    if not psym and isinstance(prod, dict):
+        psym = prod.get("symbol") or prod.get("product_symbol") or ""
+        if not psym:
+            spot = prod.get("spot_index", {})
+            if isinstance(spot, dict):
+                und = spot.get("underlying_asset", "")
+                if isinstance(und, dict):
+                    und = und.get("symbol") or ""
+                if isinstance(und, str) and und and len(und) < 20:
+                    psym = f"{und}USD" if not und.endswith("USD") else und
+    if "USOON" in str(p) or "USOON" in str(psym):
         psym = "USOONUSD"
-        und = "USOON"
-    return psym, und
+    return psym, psym.replace("USD","") if psym else ""
 
 def handle_trailing():
     positions = get_pos()
     for p in positions:
-        psym, und = parse_pos_symbol(p)
-        if not psym or psym not in COINS:
-            continue
         size = float(p.get("size", 0))
         if size == 0:
+            continue
+        psym, _ = parse_pos_symbol(p)
+        print(f"[DEBUG POS] {psym} size={size}", flush=True)
+        if not psym or psym not in COINS:
             continue
         entry = float(p.get("entry_price") or p.get("average_price") or 0)
         if entry == 0:
@@ -178,64 +179,80 @@ def handle_trailing():
             continue
         last_c = candles[-1]
         curr = float(last_c['close'] if isinstance(last_c, dict) else last_c[4])
+        pnl = (curr - entry) * size
         old_peak = state["peaks"].get(psym, entry)
         if size > 0:
             new_peak = max(old_peak, curr)
             state["peaks"][psym] = new_peak
-            trail_stop = new_peak * (1 - TRAIL_PCT)
-            print(f"[TRAIL] {psym} LONG {curr:.1f} stop {trail_stop:.1f}", flush=True)
+            if pnl > 20:
+                trail_stop = entry + 10
+                print(f"[PROFIT LOCK] {psym} LONG pnl={pnl:.1f} lock stop {trail_stop:.1f}", flush=True)
+            else:
+                trail_stop = new_peak * (1 - TRAIL_PCT)
+                print(f"[TRAIL] {psym} LONG {curr:.1f} peak {new_peak:.1f} stop {trail_stop:.1f}", flush=True)
             old_stop = state["stops"].get(psym, 0)
-            if trail_stop > old_stop:
+            if trail_stop > old_stop or pnl > 20:
                 cancel_all_stops(psym)
                 place_stop(psym, "buy", size, trail_stop)
         else:
             new_peak = min(old_peak, curr) if old_peak != 0 else curr
             state["peaks"][psym] = new_peak
-            trail_stop = new_peak * (1 + TRAIL_PCT)
-            print(f"[TRAIL] {psym} SHORT {curr:.1f} stop {trail_stop:.1f}", flush=True)
+            if pnl > 20:
+                trail_stop = entry - 10
+                print(f"[PROFIT LOCK] {psym} SHORT pnl={pnl:.1f} lock stop {trail_stop:.1f}", flush=True)
+            else:
+                trail_stop = new_peak * (1 + TRAIL_PCT)
+                print(f"[TRAIL] {psym} SHORT {curr:.1f} peak {new_peak:.1f} stop {trail_stop:.1f}", flush=True)
             old_stop = state["stops"].get(psym, 9999999)
-            if trail_stop < old_stop or old_stop == 9999999:
+            if trail_stop < old_stop or pnl > 20 or old_stop == 9999999:
                 cancel_all_stops(psym)
                 place_stop(psym, "sell", size, trail_stop)
         save_state(state)
 
 def main_loop():
-    print("=== BOT START FIXED FINAL ===", flush=True)
+    print("=== BOT FINAL V1 - 6 COINS 5m RSI40 TRAIL 0.5% ===", flush=True)
     while True:
         try:
             handle_trailing()
             positions = get_pos()
             held = []
             for p in positions:
-                ps, und = parse_pos_symbol(p)
+                sz = float(p.get("size", 0))
+                if sz == 0:
+                    continue
+                ps, _ = parse_pos_symbol(p)
                 if ps and ps in COINS:
                     held.append(ps)
+            held = list(set(held))
             if held:
                 print(f"[POS HELD] {held}", flush=True)
+            else:
+                print(f"[POS HELD] [] - No open positions", flush=True)
             for symbol in COINS:
                 candles = get_candles(symbol)
                 if not candles:
                     continue
                 sig = check_signal(candles, symbol)
                 if sig:
-                    has = False
-                    base = symbol.replace("USD","")
-                    for h in held:
-                        if h == symbol or base in h:
-                            has = True
-                            break
-                    if has:
+                    if symbol in held:
                         print(f"[SKIP] {symbol} has pos held={held}", flush=True)
                         continue
+                    last_t = state["last_trade"].get(symbol, 0)
+                    if time.time() - last_t < 300:
+                        print(f"[SKIP] {symbol} cooldown {int(300 - (time.time()-last_t))}s", flush=True)
+                        continue
                     print(f"[SIGNAL] {symbol} {sig}", flush=True)
-                    place_entry(symbol, sig, 40)
+                    place_entry(symbol, sig)
                     last_c = candles[-1]
                     curr = float(last_c['close'] if isinstance(last_c, dict) else last_c[4])
                     state["peaks"][symbol] = curr
                     state["stops"].pop(symbol, None)
+                    state["last_trade"][symbol] = time.time()
                     save_state(state)
+                    held.append(symbol)
                 else:
                     print(f"[NO TRADE] {symbol}", flush=True)
+            print("--- SLEEP 30s ---", flush=True)
             time.sleep(30)
         except Exception as e:
             print(f"[ERROR] {e}", flush=True)
