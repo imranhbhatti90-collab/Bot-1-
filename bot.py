@@ -98,11 +98,13 @@ def get_candles(product_id, resolution="5m", count=100):
     return []
 
 def get_all_positions():
-    all_pos = []
-    for coin in ALLOWED_COINS_ALL:
-        underlying = coin.replace("USD", "")
-        res, code = api_request("GET", "/v2/positions", params={"underlying_asset_symbol": underlying})
-        if code == 200 and res.get("result"):
+    # Fast - ek hi call me saare positions
+    res, code = api_request("GET", "/v2/positions/margined")
+    if code == 200 and res.get("result"):
+        result = res["result"]
+        return result if isinstance(result, list) else [result]
+    return []
+   if code == 200 and res.get("result"):
             result = res["result"]
             if isinstance(result, list):
                 all_pos.extend(result)
