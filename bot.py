@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot FINAL - Fixed Overtrading + Trail + RSI40"
+    return "Bot FINAL FIXED - Trail Visible"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -74,7 +74,10 @@ def get_pos():
     res, code = api_req("GET", "/v2/positions/margined")
     if code == 200 and res.get("result"):
         r = res["result"]
-        return r if isinstance(r, list) else [r]
+        lst = r if isinstance(r, list) else [r]
+        print(f"[POS API] total={len(lst)}", flush=True)
+        return lst
+    print(f"[POS API] code={code} empty", flush=True)
     return []
 
 def get_orders():
@@ -96,17 +99,27 @@ def place_stop(symbol, side, size, stop_price):
     if sz < 1:
         sz = 40
     stop_side = "sell" if side == "buy" else "buy"
+    # FIX: Gold ke liye 2 decimal, baki ke liye 1 decimal
+    if "XAUT" in symbol or "PAXG" in symbol:
+        price_str = f"{float(stop_price):.2f}"
+    elif "BTC" in symbol:
+        price_str = f"{float(stop_price):.1f}"
+    elif "SILVER" in symbol:
+        price_str = f"{float(stop_price):.2f}"
+    else:
+        price_str = f"{float(stop_price):.2f}"
+    
     body = {
         "product_symbol": symbol,
         "size": sz,
         "side": stop_side,
         "order_type": "market_order",
-        "stop_price": str(round(float(stop_price), 1)),
+        "stop_price": price_str,
         "reduce_only": True,
         "stop_trigger_method": "last_traded_price"
     }
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[TRAIL STOP] {symbol} {stop_side} stop={float(stop_price):.2f} -> {code}", flush=True)
+    print(f"[TRAIL STOP] {symbol} {stop_side} stop={price_str} -> {code} {str(res)[:400]}", flush=True)
     if code == 200:
         state["stops"][symbol] = float(stop_price)
         save_state(state)
@@ -141,10 +154,11 @@ def place_entry(symbol, side):
     sz = 40
     body = {"product_symbol": symbol, "size": sz, "side": side, "order_type": "market_order"}
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[ENTRY] {symbol} {side} -> {code}", flush=True)
+    print(f"[ENTRY] {symbol} {side} -> {code} {str(res)[:400]}", flush=True)
     return res, code
 
 def parse_pos_symbol(p):
+    # FIX: pehle product_symbol direct lo
     psym = p.get("product_symbol") or p.get("symbol") or ""
     prod = p.get("product", {})
     if not psym and isinstance(prod, dict):
@@ -168,8 +182,9 @@ def handle_trailing():
         if size == 0:
             continue
         psym, _ = parse_pos_symbol(p)
-        print(f"[DEBUG POS] {psym} size={size}", flush=True)
+        print(f"[DEBUG POS] {psym} size={size} entry={p.get('entry_price')}", flush=True)
         if not psym or psym not in COINS:
+            print(f"[SKIP POS] {psym} not in COINS", flush=True)
             continue
         entry = float(p.get("entry_price") or p.get("average_price") or 0)
         if entry == 0:
@@ -210,7 +225,7 @@ def handle_trailing():
         save_state(state)
 
 def main_loop():
-    print("=== BOT FINAL V1 - 6 COINS 5m RSI40 TRAIL 0.5% ===", flush=True)
+    print("=== BOT FINAL FIXED V2 - DYNAMIC TRAIL VISIBLE ===", flush=True)
     while True:
         try:
             handle_trailing()
@@ -224,10 +239,7 @@ def main_loop():
                 if ps and ps in COINS:
                     held.append(ps)
             held = list(set(held))
-            if held:
-                print(f"[POS HELD] {held}", flush=True)
-            else:
-                print(f"[POS HELD] [] - No open positions", flush=True)
+            print(f"[POS HELD] {held}", flush=True)
             for symbol in COINS:
                 candles = get_candles(symbol)
                 if not candles:
