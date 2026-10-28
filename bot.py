@@ -95,14 +95,38 @@ def cancel_all_stops(symbol):
             print(f"[CANCEL STOP] {symbol} {oid}", flush=True)
 
 def place_stop(symbol, side, size, stop_price):
-    sz = abs(float(size))
+    sz = int(abs(float(size)))
     if sz < 1:
         sz = 40
-    # side ulta hota hai stop ke liye
     stop_side = "sell" if side == "buy" else "buy"
-    body = {"product_symbol": symbol, "size": sz, "side": stop_side, "order_type": "stop_market_order", "stop_price": str(round(stop_price,1)), "reduce_only": True}
+    # pehle product_id nikalo - stop ke liye id chahiye hota hai
+    prod_id = None
+    try:
+        # position wale product se id
+        res_p, _ = api_req("GET", "/v2/products", params={"symbols": symbol})
+        if res_p.get("result"):
+            for pr in res_p["result"]:
+                if pr.get("symbol") == symbol:
+                    prod_id = pr.get("id")
+                    break
+    except:
+        prod_id = None
+    
+    # Try 1: product_id ke sath
+    if prod_id:
+        body = {"product_id": prod_id, "size": sz, "side": stop_side, "order_type": "stop_market_order", "stop_price": str(round(stop_price,1)), "reduce_only": True}
+    else:
+        body = {"product_symbol": symbol, "size": sz, "side": stop_side, "order_type": "stop_market_order", "stop_price": str(round(stop_price,1)), "reduce_only": True}
+    
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[TRAIL STOP] {symbol} {stop_side} stop={stop_price:.1f} size={sz} -> {code}", flush=True)
+    print(f"[TRAIL STOP] {symbol} id={prod_id} {stop_side} stop={stop_price:.1f} -> {code} RES={str(res)[:250]}", flush=True)
+    
+    if code == 400 and prod_id:
+        # agar id se fail hua to symbol se try karo
+        body2 = {"product_symbol": symbol, "size": sz, "side": stop_side, "order_type": "market_order", "stop_price": str(round(stop_price,1)), "reduce_only": True, "stop_trigger_method": "last_traded_price"}
+        res, code = api_req("POST", "/v2/orders", body=body2)
+        print(f"[TRAIL STOP RETRY] {symbol} -> {code} RES={str(res)[:250]}", flush=True)
+    
     if code == 200:
         state["stops"][symbol] = stop_price
         save_state(state)
