@@ -66,7 +66,7 @@ def get_pos():
         return r if isinstance(r, list) else [r]
     return []
 
-def check_signal(candles):
+def check_signal(candles, symbol):
     if len(candles) < 50:
         return None
     try:
@@ -122,7 +122,7 @@ def main_loop():
                 if not candles:
                     print(f"[SKIP] {symbol} no candles", flush=True)
                     continue
-                sig = check_signal(candles)
+                sig = check_signal(candles, symbol)
                 if sig:
                     has = False
                     for p in positions:
