@@ -5,7 +5,7 @@ from urllib.parse import urlencode, quote
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Closing USOON No ReduceOnly"
+    return "Closing USOON 1 by 1"
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 API_KEY = os.getenv("DELTA_API_KEY", "")
@@ -38,54 +38,54 @@ def api_req(method, path, params=None, body=None):
         return {"error": str(e)}, 500
 
 def close_usoon():
-    for i in range(5):
+    for attempt in range(40):
         res, code = api_req("GET", "/v2/positions/margined")
-        print(f"Check {i} Positions -> {code}", flush=True)
-        if code == 200 and res.get("result"):
-            lst = res["result"] if isinstance(res["result"], list) else [res["result"]]
-            found = False
-            for p in lst:
-                sym = p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
-                size = float(p.get("size",0))
-                if "USOON" in str(sym) and size != 0:
-                    found = True
-                    print(f"Found USOON {sym} size {size} - Attempt {i}", flush=True)
-                    # Cancel all
-                    res2, _ = api_req("GET", "/v2/orders", params={"states":"open"})
-                    if res2.get("result"):
-                        for o in res2["result"]:
-                            if "USOON" in o.get("product_symbol",""):
-                                api_req("DELETE", f"/v2/orders/{o.get('id')}")
-                                time.sleep(1)
-                    # Try WITHOUT reduce_only - direct close
-                    side = "buy" if size < 0 else "sell"
-                    # Try market first
-                    body = {
-                        "product_symbol": "USOONUSD",
-                        "size": abs(size),
-                        "side": side,
-                        "order_type": "market_order"
-                    }
-                    print(f"Trying MARKET close WITHOUT reduce_only: {body}", flush=True)
-                    res3, code3 = api_req("POST", "/v2/orders", body=body)
-                    print(f"MARKET CLOSE: {code3} {res3}", flush=True)
-                    time.sleep(2)
-                    # If market fails, try limit
-                    if code3 != 200:
-                        body = {
-                            "product_symbol": "USOONUSD",
-                            "size": abs(size),
-                            "side": side,
-                            "order_type": "limit_order",
-                            "limit_price": "155.0"
-                        }
-                        print(f"Trying LIMIT close WITHOUT reduce_only: {body}", flush=True)
-                        res4, code4 = api_req("POST", "/v2/orders", body=body)
-                        print(f"LIMIT CLOSE: {code4} {res4}", flush=True)
-            if not found:
-                print("No USOON position found - ALL CLOSED! ✅", flush=True)
-                return
+        if code != 200 or not res.get("result"):
+            print(f"No positions", flush=True)
+            time.sleep(2)
+            continue
+        lst = res["result"] if isinstance(res["result"], list) else [res["result"]]
+        usoon_pos = None
+        for p in lst:
+            sym = p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
+            size = float(p.get("size",0))
+            if "USOON" in str(sym) and size != 0:
+                usoon_pos = (sym, size)
+                break
+        if not usoon_pos:
+            print(f"✅ USOON ALL CLOSED! No position left!", flush=True)
+            return
+        sym, size = usoon_pos
+        print(f"Attempt {attempt}: Found {sym} size {size} - Closing 1 lot", flush=True)
+        # Cancel all open USOON orders first
+        res2, _ = api_req("GET", "/v2/orders", params={"states":"open"})
+        if res2.get("result"):
+            for o in res2["result"]:
+                if "USOON" in o.get("product_symbol",""):
+                    api_req("DELETE", f"/v2/orders/{o.get('id')}")
+                    time.sleep(0.5)
+        # Close 1 lot only
+        side = "buy" if size < 0 else "sell"
+        body = {
+            "product_symbol": "USOONUSD",
+            "size": 1,
+            "side": side,
+            "order_type": "limit_order",
+            "limit_price": "160.0",
+            "reduce_only": True
+        }
+        res3, code3 = api_req("POST", "/v2/orders", body=body)
+        print(f"Close 1 lot: {code3} {res3}", flush=True)
         time.sleep(3)
+        # Check if filled
+        res4, _ = api_req("GET", "/v2/orders", params={"states":"open"})
+        # If still open after 3 sec, cancel and try higher price
+        if res4.get("result"):
+            for o in res4["result"]:
+                if "USOON" in o.get("product_symbol",""):
+                    print(f"Order not filled, cancelling and trying higher price", flush=True)
+                    api_req("DELETE", f"/v2/orders/{o.get('id')}")
+        time.sleep(2)
 
 close_usoon()
 
