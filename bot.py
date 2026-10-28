@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot DEBUG - Checking API Keys"
+    return "Bot FINAL - 6 Coins - 5m - 0.5% Trail Visible - Live"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -17,6 +17,7 @@ BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
 COINS = ["BTCUSD","ETHUSD","SOLUSD","XAUTUSD","PAXGUSD","SILVERUSD"]
+TRAIL_PCT = 0.005
 STATE_FILE = "state.json"
 
 def load_state():
@@ -54,18 +55,11 @@ def api_req(method, path, params=None, body=None):
             r = requests.get(url, headers=headers, timeout=15)
         elif method == "DELETE":
             r = requests.delete(url, headers=headers, timeout=15)
-            print(f"[DELETE RESP] {r.status_code} {r.text[:500]}", flush=True)
             return {"success": True}, r.status_code
         else:
             r = requests.post(url, headers=headers, json=body, timeout=15)
-        # DEBUG LINE - exact error dikhega
-        print(f"[API DEBUG] {method} {path} -> {r.status_code} | {r.text[:1000]}", flush=True)
-        try:
-            return r.json(), r.status_code
-        except:
-            return {"raw": r.text}, r.status_code
+        return r.json(), r.status_code
     except Exception as e:
-        print(f"[API ERROR] {e}", flush=True)
         return {"error": str(e)}, 500
 
 def get_candles(symbol):
@@ -113,6 +107,9 @@ def place_stop(symbol, side, size, stop_price):
     }
     res, code = api_req("POST", "/v2/orders", body=body)
     print(f"[TRAIL STOP] {symbol} {stop_side} stop={price_str} -> {code}", flush=True)
+    if code == 200:
+        state["stops"][symbol] = float(stop_price)
+        save_state(state)
     return res, code
 
 def check_signal(candles, symbol):
@@ -146,21 +143,72 @@ def place_entry(symbol, side):
     print(f"[ENTRY] {symbol} {side} -> {code}", flush=True)
     return res, code
 
+def parse_pos_symbol(p):
+    psym = p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
+    return psym
+
+def handle_trailing():
+    positions = get_pos()
+    for p in positions:
+        size = float(p.get("size", 0))
+        if size == 0:
+            continue
+        psym = parse_pos_symbol(p)
+        if not psym or psym not in COINS:
+            continue
+        entry = float(p.get("entry_price") or p.get("average_price") or 0)
+        if entry == 0:
+            continue
+        candles = get_candles(psym)
+        if not candles:
+            continue
+        curr = float(candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4])
+        pnl = (curr - entry) * size
+        old_peak = state["peaks"].get(psym, entry)
+        if size > 0:
+            new_peak = max(old_peak, curr)
+            state["peaks"][psym] = new_peak
+            trail_stop = entry + 10 if pnl > 20 else new_peak * (1 - TRAIL_PCT)
+            if trail_stop >= curr:
+                continue
+            print(f"[TRAIL] {psym} LONG {curr:.1f} peak {new_peak:.1f} stop {trail_stop:.1f} pnl {pnl:.1f}", flush=True)
+            if trail_stop > state["stops"].get(psym, 0) or pnl > 20:
+                cancel_all_stops(psym)
+                place_stop(psym, "buy", size, trail_stop)
+        else:
+            new_peak = min(old_peak, curr) if old_peak != 0 else curr
+            state["peaks"][psym] = new_peak
+            trail_stop = entry - 10 if pnl > 20 else new_peak * (1 + TRAIL_PCT)
+            if trail_stop <= curr:
+                continue
+            print(f"[TRAIL] {psym} SHORT {curr:.1f} peak {new_peak:.1f} stop {trail_stop:.1f} pnl {pnl:.1f}", flush=True)
+            if trail_stop < state["stops"].get(psym, 9999999) or pnl > 20:
+                cancel_all_stops(psym)
+                place_stop(psym, "sell", size, trail_stop)
+        save_state(state)
+
 def main_loop():
-    print(f"=== DEBUG BOT START - KEY:{API_KEY[:5]}... SECRET:{'SET' if API_SECRET else 'EMPTY'} ===", flush=True)
+    print("=== BOT FINAL CLEAN - 6 COINS - 5m RSI40 0.5% TRAIL VISIBLE - USOON IGNORED ===", flush=True)
+    # Clear old state on start
+    state["last_trade"] = {}
+    save_state(state)
+    print("[POS HELD] Checking...", flush=True)
     while True:
         try:
+            handle_trailing()
             positions = get_pos()
             held = []
             for p in positions:
                 sz = float(p.get("size", 0))
                 if sz == 0:
                     continue
-                ps = p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
+                ps = parse_pos_symbol(p)
                 if ps and ps in COINS:
                     held.append(ps)
+                elif ps:
+                    print(f"[SKIP POS not in COINS] {ps} size {sz}", flush=True)
             held = list(set(held))
-            print(f"[POS HELD] {held if held else '[] - Fresh start'}", flush=True)
+            print(f"[POS HELD] {held if held else '[] - Fresh start (USOON ignored)'}", flush=True)
             for symbol in COINS:
                 candles = get_candles(symbol)
                 if not candles:
@@ -175,21 +223,20 @@ def main_loop():
                         print(f"[SKIP] {symbol} cooldown {int(300 - (time.time()-last_t))}s", flush=True)
                         continue
                     print(f"[SIGNAL] {symbol} {sig}", flush=True)
-                    place_entry(symbol, sig)
-                    curr = float(candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4])
-                    state["peaks"][symbol] = curr
-                    state["stops"].pop(symbol, None)
-                    state["last_trade"][symbol] = time.time()
-                    save_state(state)
-                    held.append(symbol)
+                    res, code = place_entry(symbol, sig)
+                    if code == 200:
+                        curr = float(candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4])
+                        state["peaks"][symbol] = curr
+                        state["stops"].pop(symbol, None)
+                        state["last_trade"][symbol] = time.time()
+                        save_state(state)
+                        held.append(symbol)
                 else:
                     print(f"[NO TRADE] {symbol}", flush=True)
             print("--- SLEEP 30s ---", flush=True)
             time.sleep(30)
         except Exception as e:
             print(f"[ERROR] {e}", flush=True)
-            import traceback
-            traceback.print_exc()
             time.sleep(10)
 
 if __name__ == "__main__":
