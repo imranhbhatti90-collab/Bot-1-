@@ -155,7 +155,12 @@ def place_entry(symbol, side, size):
 def handle_trailing():
     positions = get_pos()
     for p in positions:
-        symbol = p.get("product_symbol") or p.get("symbol")
+        prod = p.get("product", {})
+        spot = prod.get("spot_index", {}) if isinstance(prod, dict) else {}
+        underlying = spot.get("underlying_asset") or prod.get("underlying_asset") or p.get("underlying_asset")
+        symbol = p.get("product_symbol") or p.get("symbol") or (f"{underlying}USD" if underlying else None)
+        if not symbol:
+            continue
         if symbol not in COINS:
             continue
         size = float(p.get("size",0))
@@ -223,11 +228,18 @@ def main_loop():
                     continue
                 sig = check_signal(candles, symbol)
                 if sig:
-                    has = False
+                 has = False
                     for p in positions:
-                        if (p.get("product_symbol") == symbol):
+                        prod2 = p.get("product", {})
+                        spot2 = prod2.get("spot_index", {}) if isinstance(prod2, dict) else {}
+                        und2 = spot2.get("underlying_asset") or prod2.get("underlying_asset") or p.get("underlying_asset")
+                        psym = p.get("product_symbol") or p.get("symbol") or (f"{und2}USD" if und2 else "")
+                        if psym == symbol:
                             has = True
-                            break
+                            break   
+            
+    
+                        
                     if has:
                         print(f"[SKIP] {symbol} has pos", flush=True)
                         continue
