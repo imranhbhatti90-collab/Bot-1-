@@ -7,7 +7,7 @@ import threading
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "Bot FINAL - POS CACHE + INSTANT RED LINE + CHART LEVELS - Size 40"
+    return "Bot FINAL FIXED - RED LINE VISIBLE - Size 40"
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -116,17 +116,17 @@ def place_stop(symbol, side, size, stop_price):
         "product_symbol": symbol,
         "size": sz,
         "side": stop_side,
-        "order_type": "stop_market_order",
+        "order_type": "market_order",
         "stop_price": price_str,
-        "reduce_only": True
+        "reduce_only": True,
+        "stop_trigger_method": "last_traded_price"
     }
     res, code = api_req("POST", "/v2/orders", body=body)
     print(f"[TRAIL STOP] {symbol} {stop_side} stop={price_str} -> {code}", flush=True)
     if code == 200:
         state["stops"][symbol] = float(stop_price)
         save_state(state)
-        # Chart levels log
-        print(f"[CHART LEVEL] {symbol} | ENTRY side {side} | STOP {price_str} RED DOTTED | SIZE {sz}", flush=True)
+        print(f"[CHART LEVEL] {symbol} STOP {price_str} RED DOTTED - Ab lal line dikhegi", flush=True)
     else:
         print(f"[TRAIL STOP FAIL] {symbol} {res}", flush=True)
     return res, code
@@ -168,7 +168,7 @@ def check_signal(candles, symbol):
 def place_entry(symbol, side):
     body = {"product_symbol": symbol, "size": 40, "side": side, "order_type": "market_order"}
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[ENTRY] {symbol} {side} size 40 -> {code} | {str(res)[:600]}", flush=True)
+    print(f"[ENTRY] {symbol} {side} size 40 -> {code}", flush=True)
     return res, code
 
 def parse_pos_symbol(p):
@@ -199,7 +199,6 @@ def handle_trailing():
             if trail_stop >= curr:
                 continue
             print(f"[TRAIL] {psym} LONG {curr:.2f} peak {new_peak:.2f} stop {trail_stop:.2f} pnl {pnl:.2f}", flush=True)
-            print(f"[CHART LEVEL] {psym} LONG | CURR {curr:.2f} | STOP {trail_stop:.2f} RED | TP1 {curr*1.005:.2f} GREEN | ENTRY {entry:.2f} BLUE", flush=True)
             if trail_stop > state["stops"].get(psym, 0) or pnl > 20:
                 cancel_all_stops(psym)
                 place_stop(psym, "buy", size, trail_stop)
@@ -210,14 +209,13 @@ def handle_trailing():
             if trail_stop <= curr:
                 continue
             print(f"[TRAIL] {psym} SHORT {curr:.2f} peak {new_peak:.2f} stop {trail_stop:.2f} pnl {pnl:.2f}", flush=True)
-            print(f"[CHART LEVEL] {psym} SHORT | CURR {curr:.2f} | STOP {trail_stop:.2f} RED | TP1 {curr*0.995:.2f} GREEN | ENTRY {entry:.2f} BLUE", flush=True)
             if trail_stop < state["stops"].get(psym, 9999999) or pnl > 20:
                 cancel_all_stops(psym)
                 place_stop(psym, "sell", size, trail_stop)
         save_state(state)
 
 def main_loop():
-    print("=== FINAL BOT - POS CACHE + INSTANT RED LINE + CHART LEVELS - SIZE 40 ===", flush=True)
+    print("=== FINAL BOT - RED LINE FIXED - SIZE 40 ===", flush=True)
     while True:
         try:
             handle_trailing()
@@ -230,8 +228,6 @@ def main_loop():
                 ps = parse_pos_symbol(p)
                 if ps and ps in COINS:
                     held.append(ps)
-                elif ps:
-                    print(f"[SKIP POS not in COINS] {ps} size {sz}", flush=True)
             held = list(set(held))
             print(f"[POS HELD] {held if held else '[] - Fresh start'}", flush=True)
             for symbol in COINS:
@@ -254,17 +250,14 @@ def main_loop():
                         state["peaks"][symbol] = curr
                         state["stops"].pop(symbol, None)
                         state["last_trade"][symbol] = time.time()
-                        # INSTANT STOP - Turant lal line lagao
                         if sig == "buy":
                             stop_px = curr * (1 - TRAIL_PCT)
-                            tp1 = curr * 1.005
-                            print(f"[CHART LEVEL] NEW {symbol} BUY @ {curr:.2f} | STOP {stop_px:.2f} RED DOTTED | TP1 {tp1:.2f} GREEN | TP2 {curr*1.008:.2f}", flush=True)
+                            print(f"[CHART LEVEL] NEW {symbol} BUY @ {curr:.2f} STOP {stop_px:.2f} RED DOTTED TP {curr*1.005:.2f} GREEN", flush=True)
                             cancel_all_stops(symbol)
                             place_stop(symbol, "buy", 40, stop_px)
                         else:
                             stop_px = curr * (1 + TRAIL_PCT)
-                            tp1 = curr * 0.995
-                            print(f"[CHART LEVEL] NEW {symbol} SELL @ {curr:.2f} | STOP {stop_px:.2f} RED DOTTED | TP1 {tp1:.2f} GREEN | TP2 {curr*0.992:.2f}", flush=True)
+                            print(f"[CHART LEVEL] NEW {symbol} SELL @ {curr:.2f} STOP {stop_px:.2f} RED DOTTED TP {curr*0.995:.2f} GREEN", flush=True)
                             cancel_all_stops(symbol)
                             place_stop(symbol, "sell", 40, stop_px)
                         save_state(state)
