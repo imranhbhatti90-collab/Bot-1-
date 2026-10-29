@@ -271,7 +271,7 @@ def main_loop():
             traceback.print_exc()
             time.sleep(10)
 
-        if __name__ == "__main__":
+if __name__ == "__main__":
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     main_loop()
