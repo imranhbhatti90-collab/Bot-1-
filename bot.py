@@ -298,7 +298,12 @@ def main_loop():
             import traceback
             traceback.print_exc()
             time.sleep(10)
+if __name__ == "__main__":
+    print("=== BOT STARTING ===", flush=True)
 
-if True:  # main
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
+
+    print("=== FLASK STARTED ===", flush=True)
+
+    main_loop()
