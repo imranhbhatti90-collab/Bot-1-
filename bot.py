@@ -3,197 +3,472 @@ import json
 import time
 import hmac
 import hashlib
-import requests
+import threading
+import logging
 from urllib.parse import urlencode, quote
+
+import requests
 import pandas as pd
 from flask import Flask, jsonify
-import threading
 
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "Bot FINAL - CROSS + RSI45 + VOL + NO OVERTRADE + RED LINE - 5min"
-@app.route("/health", methods=["GET"])
-def health():
-    return {"status": "ok", "bot": "running"}, 200
-    
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+# =====================================================
+# DELTA EXCHANGE INDIA TESTNET - CONFIGURATION
+# =====================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
-COINS = ["BTCUSD","ETHUSD","SOLUSD","XAUTUSD","PAXGUSD","SILVERUSD"]
+
+COINS = [
+    "BTCUSD",
+    "ETHUSD",
+    "SOLUSD",
+    "XAUTUSD",
+    "PAXGUSD",
+    "SILVERUSD"
+]
+
+TIMEFRAME = "5m"
+
+ORDER_SIZE = 40
+MAX_POSITIONS = 2
+
 TRAIL_PCT = 0.005
+COOLDOWN_SECONDS = 300
+
+CHECK_INTERVAL = 30
 STATE_FILE = "state.json"
 
-_last_pos_cache = []
-_last_pos_time = 0
+# =====================================================
+# FLASK SERVER
+# =====================================================
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return (
+        "DELTA TESTNET BOT | EMA CROSS + RSI + VOL "
+        "| LIVE TRAILING STOP | 5 MIN"
+    )
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "bot": "running",
+        "environment": "TESTNET"
+    }), 200
+
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
+
+
+# =====================================================
+# LOGGING
+# =====================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s"
+)
+
+
+def log(message):
+    print(message, flush=True)
+
+
+# =====================================================
+# STATE
+# =====================================================
 
 def load_state():
-    try:
-        with open(STATE_FILE,'r') as f:
-            return json.load(f)
-    except:
-        return {"peaks":{}, "stops":{}, "last_trade":{}}
+    default = {
+        "peaks": {},
+        "stops": {},
+        "last_trade": {}
+    }
 
-def save_state(s):
     try:
-        with open(STATE_FILE,'w') as f:
-            json.dump(s,f)
-    except:
-        pass
+        with open(STATE_FILE, "r") as f:
+            saved = json.load(f)
+
+        for key in default:
+            if key not in saved or not isinstance(saved[key], dict):
+                saved[key] = {}
+
+        return saved
+
+    except Exception:
+        return default
+
+
+def save_state():
+    try:
+        temp_file = STATE_FILE + ".tmp"
+
+        with open(temp_file, "w") as f:
+            json.dump(state, f)
+
+        os.replace(temp_file, STATE_FILE)
+
+    except Exception as e:
+        log(f"[STATE SAVE ERROR] {e}")
+
 
 state = load_state()
 
+# =====================================================
+# API REQUEST
+# =====================================================
+
+session = requests.Session()
+
 def api_req(method, path, params=None, body=None):
-    ts = str(int(time.time()))
+
+    if not API_KEY or not API_SECRET:
+        return {"error": "API credentials missing"}, 401
+
+    method = method.upper()
 
     if params:
         qs = urlencode(params, quote_via=quote)
-        pqs = f"{path}?{qs}"
+        query_string = "?" + qs
     else:
-        pqs = path
+        query_string = ""
 
-    if body:
-        msg = method + ts + pqs + json.dumps(body)
-    else:
-        msg = method + ts + pqs
+    payload = json.dumps(
+        body,
+        separators=(",", ":")
+    ) if body is not None else ""
 
-    sig = hmac.new(
+    timestamp = str(int(time.time()))
+
+    message = (
+        method
+        + timestamp
+        + path
+        + query_string
+        + payload
+    )
+
+    signature = hmac.new(
         API_SECRET.encode(),
-        msg.encode(),
+        message.encode(),
         hashlib.sha256
     ).hexdigest()
 
     headers = {
         "api-key": API_KEY,
-        "timestamp": ts,
-        "signature": sig,
-        "Content-Type": "application/json"
+        "timestamp": timestamp,
+        "signature": signature,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "python-delta-testnet-bot"
     }
 
-    url = BASE_URL + pqs
+    url = BASE_URL + path + query_string
 
     try:
-        if method == "GET":
-            r = requests.get(
-                url,
-                headers=headers,
-                timeout=15
-            )
+        response = session.request(
+            method=method,
+            url=url,
+            headers=headers,
+            data=payload if payload else None,
+            timeout=(5, 15)
+        )
 
-        elif method == "DELETE":
-            r = requests.delete(
-                url,
-                headers=headers,
-                json=body,
-                timeout=15
-            )
+        try:
+            result = response.json()
+        except Exception:
+            result = {"error": response.text[:500]}
 
-        else:
-            r = requests.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=15
-            )
-
-        return r.json(), r.status_code
+        return result, response.status_code
 
     except Exception as e:
         return {"error": str(e)}, 500
 
+
+# =====================================================
+# LIVE TICKER PRICE
+# =====================================================
+
+def get_live_price(symbol):
+
+    # Ticker endpoint is public market data.
+    path = f"/v2/tickers/{symbol}"
+
+    try:
+        response = requests.get(
+            BASE_URL + path,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "python-delta-testnet-bot"
+            },
+            timeout=(5, 10)
+        )
+
+        if response.status_code != 200:
+            log(
+                f"[TICKER ERROR] {symbol} "
+                f"HTTP={response.status_code}"
+            )
+            return None
+
+        data = response.json()
+
+        result = data.get("result")
+
+        if isinstance(result, list):
+            if not result:
+                return None
+            result = result[0]
+
+        if not isinstance(result, dict):
+            return None
+
+        # Last traded price preferred for last_traded_price stops.
+        price_fields = [
+            "close",
+            "last_price",
+            "price"
+        ]
+
+        for field in price_fields:
+            value = result.get(field)
+
+            if value is not None:
+                price = float(value)
+
+                if price > 0:
+                    return price
+
+        log(f"[TICKER PRICE MISSING] {symbol}: {result}")
+        return None
+
+    except Exception as e:
+        log(f"[TICKER EXCEPTION] {symbol}: {e}")
+        return None
+
+
+# =====================================================
+# CANDLE DATA
+# =====================================================
+
 def get_candles(symbol):
+
     end = int(time.time())
     start = end - (600 * 60)
-    params = {"resolution": "5m", "symbol": symbol, "start": str(start), "end": str(end)}
-    res, code = api_req("GET", "/v2/history/candles", params=params)
-    if code == 200 and res.get("result") and len(res["result"]) > 20:
+
+    params = {
+        "resolution": TIMEFRAME,
+        "symbol": symbol,
+        "start": str(start),
+        "end": str(end)
+    }
+
+    res, code = api_req(
+        "GET",
+        "/v2/history/candles",
+        params=params
+    )
+
+    if (
+        code == 200
+        and isinstance(res, dict)
+        and res.get("success")
+        and res.get("result")
+    ):
         return res["result"]
+
+    log(f"[CANDLE ERROR] {symbol} HTTP={code} {res}")
     return []
+
+
+# =====================================================
+# POSITIONS
+# =====================================================
 
 def get_pos():
-    global _last_pos_cache, _last_pos_time
-    res, code = api_req("GET", "/v2/positions/margined")
-    if code == 200 and res.get("result"):
-        r = res["result"]
-        lst = r if isinstance(r, list) else [r]
-        filtered = [p for p in lst if float(p.get("size",0)) != 0]
-        if filtered:
-            _last_pos_cache = filtered
-            _last_pos_time = time.time()
-            return filtered
-        if _last_pos_cache and (time.time() - _last_pos_time < 120):
-            print(f"[POS CACHE] API empty, using cached {len(_last_pos_cache)} pos", flush=True)
-            return _last_pos_cache
-        return []
-    if _last_pos_cache and (time.time() - _last_pos_time < 120):
-        print(f"[POS CACHE] API fail {code}, using cached {len(_last_pos_cache)} pos", flush=True)
-        return _last_pos_cache
-    return []
+
+    res, code = api_req(
+        "GET",
+        "/v2/positions/margined"
+    )
+
+    if code != 200 or not isinstance(res, dict):
+        log(f"[POSITION ERROR] HTTP={code} {res}")
+        return None
+
+    if res.get("success") is not True:
+        log(f"[POSITION ERROR] {res}")
+        return None
+
+    result = res.get("result", [])
+
+    if isinstance(result, dict):
+        result = [result]
+
+    if not isinstance(result, list):
+        return None
+
+    positions = []
+
+    for p in result:
+        try:
+            if float(p.get("size", 0)) != 0:
+                positions.append(p)
+        except Exception:
+            continue
+
+    return positions
+
+
+def parse_pos_symbol(p):
+
+    return (
+        p.get("product_symbol")
+        or p.get("product", {}).get("symbol")
+        or ""
+    )
+
+
+# =====================================================
+# OPEN ORDERS
+# =====================================================
 
 def get_orders():
+
     res, code = api_req(
         "GET",
         "/v2/orders",
-        params={"states": "open,pending"}
+        params={
+            "states": "open,pending",
+            "page_size": 100
+        }
+    )
+
+    if (
+        code == 200
+        and isinstance(res, dict)
+        and res.get("success") is True
+    ):
+        result = res.get("result", [])
+
+        if isinstance(result, list):
+            return result
+
+    log(f"[ORDER ERROR] HTTP={code} {res}")
+    return None
+
+
+def is_active_stop(order, symbol):
+
+    return (
+        order.get("product_symbol") == symbol
+        and order.get("stop_order_type") == "stop_loss_order"
+        and order.get("state") in ("open", "pending")
+    )
+
+
+# =====================================================
+# VERIFY STOP ORDER
+# =====================================================
+
+def verify_stop(symbol, order_id):
+
+    orders = get_orders()
+
+    if orders is None:
+        return False
+
+    for order in orders:
+
+        if str(order.get("id")) == str(order_id):
+
+            if (
+                is_active_stop(order, symbol)
+                and order.get("reduce_only") is True
+            ):
+                return True
+
+    return False
+
+
+# =====================================================
+# CANCEL ONE STOP
+# =====================================================
+
+def cancel_stop(order):
+
+    order_id = order.get("id")
+    product_id = order.get("product_id")
+
+    if not order_id or not product_id:
+        log("[CANCEL ERROR] Order ID/product ID missing")
+        return False
+
+    body = {
+        "id": int(order_id),
+        "product_id": int(product_id)
+    }
+
+    res, code = api_req(
+        "DELETE",
+        "/v2/orders",
+        body=body
     )
 
     if code == 200 and isinstance(res, dict) and res.get("success"):
-        return res.get("result", [])
+        log(f"[CANCEL SENT] ID={order_id}")
+        return True
 
-    print(f"[ORDER ERROR] HTTP={code} | {res}", flush=True)
-    return None
-def cancel_all_stops(symbol):
+    log(f"[CANCEL FAILED] ID={order_id} HTTP={code} {res}")
+    return False
+
+
+# =====================================================
+# CANCEL OLD STOPS AFTER NEW STOP VERIFIED
+# =====================================================
+
+def cancel_old_stops(symbol, keep_order_id):
+
     orders = get_orders()
 
-    for o in orders:
-        if (
-            o.get("product_symbol") == symbol
-            and o.get("stop_order_type") == "stop_loss_order"
-            and o.get("state") in ("open", "pending")
-        ):
-            oid = o.get("id")
-            product_id = o.get("product_id")
+    if orders is None:
+        log("[CANCEL BLOCKED] Cannot verify open orders")
+        return False
 
-            if not oid or not product_id:
-                print(
-                    f"[CANCEL ERROR] {symbol}: ID/product_id missing",
-                    flush=True
-                )
-                continue
+    success = True
 
-            body = {
-                "id": int(oid),
-                "product_id": int(product_id)
-            }
+    for order in orders:
 
-            res, code = api_req(
-                "DELETE",
-                "/v2/orders",
-                body=body
-            )
+        if not is_active_stop(order, symbol):
+            continue
 
-            if code == 200 and res.get("success") is True:
-                print(
-                    f"[CANCEL SENT] {symbol} ID={oid}",
-                    flush=True
-                )
-            else:
-                print(
-                    f"[CANCEL FAILED] {symbol} ID={oid} "
-                    f"HTTP={code} RESPONSE={res}",
-                    flush=True
-                )
+        if str(order.get("id")) == str(keep_order_id):
+            continue
+
+        if not cancel_stop(order):
+            success = False
+
+    return success
+
+
+# =====================================================
+# PLACE STOP LOSS
+# =====================================================
 
 def place_stop(symbol, side, size, stop_price):
+
     sz = int(abs(float(size)))
 
-    if sz <= 0:
-        print("[STOP ERROR] Invalid size", flush=True)
-        return None, 400
+    if sz <= 0 or stop_price <= 0:
+        log("[STOP ERROR] Invalid size or price")
+        return False
 
     stop_side = "sell" if side == "buy" else "buy"
 
@@ -208,201 +483,576 @@ def place_stop(symbol, side, size, stop_price):
         "stop_trigger_method": "last_traded_price"
     }
 
-    res, code = api_req("POST", "/v2/orders", body=body)
+    res, code = api_req(
+        "POST",
+        "/v2/orders",
+        body=body
+    )
 
-    result = res.get("result", {}) if isinstance(res, dict) else {}
+    result = (
+        res.get("result", {})
+        if isinstance(res, dict)
+        else {}
+    )
+
+    if (
+        code != 200
+        or res.get("success") is not True
+        or not result.get("id")
+    ):
+        log(f"[STOP FAILED] {symbol} HTTP={code} {res}")
+        return False
+
+    order_id = result.get("id")
+
+    # Check the exchange open-order list.
+    time.sleep(1)
+
+    if not verify_stop(symbol, order_id):
+        log(
+            f"[STOP NOT VERIFIED] {symbol} "
+            f"ID={order_id}. Old stop will NOT be cancelled."
+        )
+        return False
+
+    state["stops"][symbol] = float(stop_price)
+    save_state()
+
+    log(
+        f"[STOP VERIFIED] {symbol} "
+        f"{stop_side.upper()} "
+        f"STOP={stop_price:.2f} "
+        f"ID={order_id}"
+    )
+
+    # Only after the new stop is confirmed.
+    cancel_old_stops(symbol, order_id)
+
+    return True
+
+
+# =====================================================
+# SIGNAL CALCULATION
+# =====================================================
+
+def check_signal(candles, symbol):
+
+    if len(candles) < 50:
+        log(f"[SCAN] {symbol} not enough candles")
+        return None
+
+    try:
+
+        df = pd.DataFrame(candles)
+
+        if "close" not in df.columns:
+            df = pd.DataFrame(
+                candles,
+                columns=[
+                    "time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume"
+                ]
+            )
+
+        df["close"] = pd.to_numeric(df["close"])
+        df["volume"] = pd.to_numeric(df["volume"])
+
+        df["ema9"] = df["close"].ewm(
+            span=9,
+            adjust=False
+        ).mean()
+
+        df["ema21"] = df["close"].ewm(
+            span=21,
+            adjust=False
+        ).mean()
+
+        delta = df["close"].diff()
+
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+
+        rs = gain / loss.replace(0, float("nan"))
+
+        df["rsi"] = 100 - (100 / (1 + rs))
+
+        # Handle all-up / all-down edge cases.
+        df.loc[(loss == 0) & (gain > 0), "rsi"] = 100
+        df.loc[(gain == 0) & (loss > 0), "rsi"] = 0
+        df.loc[(gain == 0) & (loss == 0), "rsi"] = 50
+
+        df["vol_avg"] = df["volume"].rolling(20).mean()
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        ema9 = float(last["ema9"])
+        ema21 = float(last["ema21"])
+
+        ema9_prev = float(prev["ema9"])
+        ema21_prev = float(prev["ema21"])
+
+        rsi = float(last["rsi"])
+        vol = float(last["volume"])
+
+        vol_avg = float(last["vol_avg"])
+
+        close_px = float(last["close"])
+
+        if pd.isna(rsi) or pd.isna(vol_avg):
+            return None
+
+        buy_cross = (
+            ema9_prev <= ema21_prev
+            and ema9 > ema21
+        )
+
+        sell_cross = (
+            ema9_prev >= ema21_prev
+            and ema9 < ema21
+        )
+
+        log(
+            f"[SCAN] {symbol} "
+            f"Close={close_px:.2f} "
+            f"EMA9={ema9:.2f} "
+            f"EMA21={ema21:.2f} "
+            f"RSI={rsi:.1f} "
+            f"VOL={vol:.0f}/{vol_avg:.0f}"
+        )
+
+        if (
+            buy_cross
+            and 45 <= rsi <= 70
+            and vol > vol_avg * 0.8
+        ):
+            log(f"[SIGNAL BUY] {symbol}")
+            return "buy"
+
+        if (
+            sell_cross
+            and 30 <= rsi <= 55
+            and vol > vol_avg * 0.8
+        ):
+            log(f"[SIGNAL SELL] {symbol}")
+            return "sell"
+
+        return None
+
+    except Exception as e:
+        log(f"[SIGNAL ERROR] {symbol}: {e}")
+        return None
+
+
+# =====================================================
+# ENTRY ORDER
+# =====================================================
+
+def place_entry(symbol, side):
+
+    body = {
+        "product_symbol": symbol,
+        "size": ORDER_SIZE,
+        "side": side,
+        "order_type": "market_order"
+    }
+
+    res, code = api_req(
+        "POST",
+        "/v2/orders",
+        body=body
+    )
 
     if (
         code == 200
+        and isinstance(res, dict)
         and res.get("success") is True
-        and result.get("stop_order_type") == "stop_loss_order"
-        and result.get("state") in ("pending", "open")
     ):
-        state["stops"][symbol] = float(stop_price)
-        save_state(state)
+        log(f"[ENTRY ACCEPTED] {symbol} {side} SIZE={ORDER_SIZE}")
+        return True
 
-        print(
-            f"[STOP ACTIVE] {symbol} {stop_side} "
-            f"STOP={stop_price} ID={result.get('id')} "
-            f"STATE={result.get('state')}",
-            flush=True
-        )
-    else:
-        print(
-            f"[STOP NOT VERIFIED] {symbol} HTTP={code} RESPONSE={res}",
-            flush=True
-        )
+    log(f"[ENTRY FAILED] {symbol} HTTP={code} {res}")
+    return False
 
-    return res, code
 
-def check_signal(candles, symbol):
-    if len(candles) < 50:
-        print(f"[SCAN] {symbol} not enough candles", flush=True)
-        return None
-    df = pd.DataFrame(candles)
-    if 'close' not in df.columns:
-        df = pd.DataFrame(candles, columns=['time','open','high','low','close','volume'])
-    df['close'] = pd.to_numeric(df['close'])
-    df['volume'] = pd.to_numeric(df['volume'])
-    df['ema9'] = df['close'].ewm(span=9).mean()
-    df['ema21'] = df['close'].ewm(span=21).mean()
-    delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0).rolling(window=14).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=14).mean()
-    rs = gain / loss
-    df['rsi'] = 100 - (100 / (1 + rs))
-    df['vol_avg'] = df['volume'].rolling(window=20).mean()
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    ema9 = float(last['ema9'])
-    ema21 = float(last['ema21'])
-    ema9_prev = float(prev['ema9'])
-    ema21_prev = float(prev['ema21'])
-    rsi = float(last['rsi'])
-    vol = float(last['volume'])
-    vol_avg = float(last['vol_avg']) if not pd.isna(last['vol_avg']) else vol
-    close_px = float(last['close'])
-    buy_cross = ema9_prev <= ema21_prev and ema9 > ema21
-    sell_cross = ema9_prev >= ema21_prev and ema9 < ema21
-    print(f"[SCAN] {symbol} Close:{close_px:.2f} EMA9:{ema9:.1f} EMA21:{ema21:.1f} RSI:{rsi:.1f} VOL:{vol:.0f}/{vol_avg:.0f} CROSS: BUY={buy_cross} SELL={sell_cross}", flush=True)
-    if buy_cross and rsi >= 45 and rsi <= 70 and vol > (vol_avg * 0.8):
-        print(f"[SIGNAL BUY] {symbol} CROSS UP | RSI {rsi:.1f} >=45 | VOL OK", flush=True)
-        return "buy"
-    if sell_cross and rsi <= 55 and rsi >= 30 and vol > (vol_avg * 0.8):
-        print(f"[SIGNAL SELL] {symbol} CROSS DOWN | RSI {rsi:.1f} <=55 | VOL OK", flush=True)
-        return "sell"
-    if not (buy_cross or sell_cross):
-        print(f"[NO CROSS] {symbol} cross nahi hua", flush=True)
-    elif rsi < 45:
-        print(f"[NO RSI] {symbol} RSI {rsi:.1f} <45", flush=True)
-    elif vol < (vol_avg * 0.8):
-        print(f"[NO VOL] {symbol} VOL kam", flush=True)
-    return None
-
-def place_entry(symbol, side):
-    body = {"product_symbol": symbol, "size": 40, "side": side, "order_type": "market_order"}
-    res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[ENTRY] {symbol} {side} size 40 -> {code}", flush=True)
-    return res, code
-
-def parse_pos_symbol(p):
-    return p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
+# =====================================================
+# TRAILING STOP MANAGEMENT
+# =====================================================
 
 def handle_trailing():
+
     positions = get_pos()
+
+    if positions is None:
+        log("[TRAIL BLOCKED] Position API unavailable")
+        return
+
+    active_symbols = set()
+
     for p in positions:
-        size = float(p.get("size", 0))
-        if size == 0:
-            continue
-        psym = parse_pos_symbol(p)
-        if not psym or psym not in COINS:
-            continue
-        entry = float(p.get("entry_price") or p.get("average_price") or 0)
-        if entry == 0:
-            continue
-        candles = get_candles(psym)
-        if not candles:
-            continue
-        curr = float(candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4])
-        pnl = (curr - entry) * size
-        old_peak = state["peaks"].get(psym, entry)
-        if size > 0:
-            new_peak = max(old_peak, curr)
-            state["peaks"][psym] = new_peak
-            trail_stop = entry + 10 if pnl > 20 else new_peak * (1 - TRAIL_PCT)
-            if trail_stop >= curr:
+
+        try:
+
+            size = float(p.get("size", 0))
+
+            if size == 0:
                 continue
-            print(f"[TRAIL] {psym} LONG CURR {curr:.2f} ENTRY {entry:.2f} BLUE | STOP {trail_stop:.2f} RED DOTTED | PEAK {new_peak:.2f} | PNL {pnl:.2f} | TP1 {curr*1.005:.2f} GREEN", flush=True)
-            if trail_stop > state["stops"].get(psym, 0) or pnl > 20:
-                cancel_all_stops(psym)
-                place_stop(psym, "buy", size, trail_stop)
-        else:
-            new_peak = min(old_peak, curr) if old_peak != 0 else curr
-            state["peaks"][psym] = new_peak
-            trail_stop = entry - 10 if pnl > 20 else new_peak * (1 + TRAIL_PCT)
-            if trail_stop <= curr:
+
+            symbol = parse_pos_symbol(p)
+
+            if symbol not in COINS:
                 continue
-            print(f"[TRAIL] {psym} SHORT CURR {curr:.2f} ENTRY {entry:.2f} BLUE | STOP {trail_stop:.2f} RED DOTTED | PEAK {new_peak:.2f} | PNL {pnl:.2f} | TP1 {curr*0.995:.2f} GREEN", flush=True)
-            if trail_stop < state["stops"].get(psym, 9999999) or pnl > 20:
-                cancel_all_stops(psym)
-                place_stop(psym, "sell", size, trail_stop)
-        save_state(state)
+
+            active_symbols.add(symbol)
+
+            entry = float(
+                p.get("entry_price")
+                or p.get("average_price")
+                or 0
+            )
+
+            if entry <= 0:
+                log(f"[TRAIL ERROR] {symbol} entry price missing")
+                continue
+
+            # LIVE PRICE, NOT CANDLE CLOSE.
+            curr = get_live_price(symbol)
+
+            if curr is None:
+                log(f"[TRAIL SKIP] {symbol} live price unavailable")
+                continue
+
+            old_peak = float(
+                state["peaks"].get(symbol, entry)
+            )
+
+            old_stop = float(
+                state["stops"].get(
+                    symbol,
+                    0 if size > 0 else 999999999
+                )
+            )
+
+            if size > 0:
+
+                # LONG position.
+                new_peak = max(old_peak, curr)
+
+                trail_stop = new_peak * (1 - TRAIL_PCT)
+
+                # Never move a long stop downward.
+                trail_stop = max(trail_stop, old_stop)
+
+                if trail_stop >= curr:
+                    log(
+                        f"[TRAIL WAIT] {symbol} LONG "
+                        f"PRICE={curr:.2f} STOP={trail_stop:.2f}"
+                    )
+                    state["peaks"][symbol] = new_peak
+                    save_state()
+                    continue
+
+                log(
+                    f"[TRAIL] {symbol} LONG "
+                    f"LIVE={curr:.2f} "
+                    f"ENTRY={entry:.2f} "
+                    f"PEAK={new_peak:.2f} "
+                    f"STOP={trail_stop:.2f}"
+                )
+
+                state["peaks"][symbol] = new_peak
+
+                # Only update if stop has improved.
+                if trail_stop > old_stop:
+
+                    if place_stop(
+                        symbol,
+                        "buy",
+                        size,
+                        trail_stop
+                    ):
+                        log(f"[TRAIL UPDATED] {symbol} LONG")
+
+            else:
+
+                # SHORT position.
+                new_peak = min(
+                    old_peak if old_peak > 0 else curr,
+                    curr
+                )
+
+                trail_stop = new_peak * (1 + TRAIL_PCT)
+
+                # Never move a short stop upward.
+                trail_stop = min(trail_stop, old_stop)
+
+                if trail_stop <= curr:
+                    log(
+                        f"[TRAIL WAIT] {symbol} SHORT "
+                        f"PRICE={curr:.2f} STOP={trail_stop:.2f}"
+                    )
+                    state["peaks"][symbol] = new_peak
+                    save_state()
+                    continue
+
+                log(
+                    f"[TRAIL] {symbol} SHORT "
+                    f"LIVE={curr:.2f} "
+                    f"ENTRY={entry:.2f} "
+                    f"PEAK={new_peak:.2f} "
+                    f"STOP={trail_stop:.2f}"
+                )
+
+                state["peaks"][symbol] = new_peak
+
+                if trail_stop < old_stop:
+
+                    if place_stop(
+                        symbol,
+                        "sell",
+                        size,
+                        trail_stop
+                    ):
+                        log(f"[TRAIL UPDATED] {symbol} SHORT")
+
+            save_state()
+
+        except Exception as e:
+            log(f"[TRAIL ERROR] {e}")
+
+
+# =====================================================
+# ENTRY STOP INITIALIZATION
+# =====================================================
+
+def initialize_new_position(symbol, side):
+
+    # Wait briefly for position data to update.
+    time.sleep(2)
+
+    positions = get_pos()
+
+    if positions is None:
+        log(f"[INITIAL STOP BLOCKED] {symbol} position API error")
+        return False
+
+    position = None
+
+    for p in positions:
+        if parse_pos_symbol(p) == symbol:
+            position = p
+            break
+
+    if position is None:
+        log(f"[INITIAL STOP WAIT] {symbol} position not visible yet")
+        return False
+
+    size = float(position.get("size", 0))
+
+    if size == 0:
+        return False
+
+    entry = float(
+        position.get("entry_price")
+        or position.get("average_price")
+        or 0
+    )
+
+    curr = get_live_price(symbol)
+
+    if entry <= 0 or curr is None:
+        log(f"[INITIAL STOP ERROR] {symbol} price unavailable")
+        return False
+
+    if size > 0:
+
+        stop_price = curr * (1 - TRAIL_PCT)
+
+        state["peaks"][symbol] = max(entry, curr)
+
+        stop_side = "buy"
+
+    else:
+
+        stop_price = curr * (1 + TRAIL_PCT)
+
+        state["peaks"][symbol] = curr
+
+        stop_side = "sell"
+
+    save_state()
+
+    log(
+        f"[INITIAL STOP] {symbol} "
+        f"ENTRY={entry:.2f} "
+        f"LIVE={curr:.2f} "
+        f"STOP={stop_price:.2f}"
+    )
+
+    return place_stop(
+        symbol,
+        stop_side,
+        size,
+        stop_price
+    )
+
+
+# =====================================================
+# MAIN BOT LOOP
+# =====================================================
 
 def main_loop():
-    print("=== FINAL - CROSS + RSI45 + VOL + 5min + NO OVERTRADE + RED LINE ===", flush=True)
+
+    log("======================================")
+    log("DELTA TESTNET AUTO BOT STARTED")
+    log("EMA 9/21 + RSI + VOLUME")
+    log("LIVE PRICE TRAILING STOP")
+    log("ORDER SIZE = 40")
+    log("MAX POSITIONS = 2")
+    log("======================================")
+
     while True:
+
         try:
+
+            # First manage existing positions.
             handle_trailing()
+
             positions = get_pos()
-            held = []
-            for p in positions:
-                sz = float(p.get("size", 0))
-                if sz == 0:
-                    continue
-                ps = parse_pos_symbol(p)
-                if ps and ps in COINS:
-                    held.append(ps)
-            held = list(set(held))
-            print(f"[POS HELD] {held if held else '[] - Fresh start'} | Total {len(held)}", flush=True)
-            if len(held) >= 2:
-                print(f"[MAX POS REACHED] {len(held)} positions, no new trade", flush=True)
-                print("--- SLEEP 30s ---", flush=True)
-                time.sleep(30)
+
+            if positions is None:
+                log("[SCAN BLOCKED] Position API unavailable")
+                time.sleep(CHECK_INTERVAL)
                 continue
-            for symbol in COINS:
-                candles = get_candles(symbol)
-                if not candles:
-                    print(f"[SCAN] {symbol} no candles", flush=True)
+
+            held = []
+
+            for p in positions:
+
+                size = float(p.get("size", 0))
+
+                if size == 0:
                     continue
-                sig = check_signal(candles, symbol)
-                if sig:
-                    if symbol in held:
-                        print(f"[SKIP] {symbol} already has position", flush=True)
-                        continue
-                    last_t = state["last_trade"].get(symbol, 0)
-                    remaining = 300 - (time.time() - last_t)
-                    if remaining > 0:
-                        print(f"[SKIP] {symbol} cooldown {int(remaining)}s left", flush=True)
-                        continue
-                    print(f"[SIGNAL] {symbol} {sig} - CONDITION MATCH", flush=True)
-                    res, code = place_entry(symbol, sig)
-                    if code == 200:
-                        curr = float(candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4])
-                        state["peaks"][symbol] = curr
-                        state["stops"].pop(symbol, None)
-                        state["last_trade"][symbol] = time.time()
-                        if sig == "buy":
-                            stop_px = curr * (1 - TRAIL_PCT)
-                            print(f"[CHART] NEW {symbol} BUY @ {curr:.2f} BLUE | STOP {stop_px:.2f} RED DOTTED | TP1 {curr*1.005:.2f} GREEN", flush=True)
-                            cancel_all_stops(symbol)
-                            place_stop(symbol, "buy", 40, stop_px)
-                        else:
-                            stop_px = curr * (1 + TRAIL_PCT)
-                            print(f"[CHART] NEW {symbol} SELL @ {curr:.2f} BLUE | STOP {stop_px:.2f} RED DOTTED | TP1 {curr*0.995:.2f} GREEN", flush=True)
-                            cancel_all_stops(symbol)
-                            place_stop(symbol, "sell", 40, stop_px)
-                        save_state(state)
-                        held.append(symbol)
-                        print(f"[HELD UPDATED] {held}", flush=True)
-                    else:
-                        print(f"[FAIL COOLDOWN] {symbol} 5min", flush=True)
-                        state["last_trade"][symbol] = time.time()
-                        save_state(state)
-                else:
-                    print(f"[NO TRADE] {symbol} - Condition match nahi hua", flush=True)
-            print("--- SLEEP 30s ---", flush=True)
-            time.sleep(30)
+
+                symbol = parse_pos_symbol(p)
+
+                if symbol in COINS:
+                    held.append(symbol)
+
+            held = list(set(held))
+
+            log(
+                f"[POS HELD] {held} "
+                f"TOTAL={len(held)}"
+            )
+
+            if len(held) >= MAX_POSITIONS:
+                log("[MAX POSITIONS] No new entry")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            for symbol in COINS:
+
+                if len(held) >= MAX_POSITIONS:
+                    break
+
+                if symbol in held:
+                    continue
+
+                last_trade = float(
+                    state["last_trade"].get(symbol, 0)
+                )
+
+                remaining = (
+                    COOLDOWN_SECONDS
+                    - (time.time() - last_trade)
+                )
+
+                if remaining > 0:
+                    log(
+                        f"[COOLDOWN] {symbol} "
+                        f"{int(remaining)}s"
+                    )
+                    continue
+
+                candles = get_candles(symbol)
+
+                if not candles:
+                    continue
+
+                signal = check_signal(candles, symbol)
+
+                if not signal:
+                    continue
+
+                log(
+                    f"[ENTRY SIGNAL] {symbol} {signal.upper()}"
+                )
+
+                # Save cooldown before order request to prevent
+                # repeated entries if exchange response is delayed.
+                state["last_trade"][symbol] = time.time()
+                save_state()
+
+                accepted = place_entry(symbol, signal)
+
+                if not accepted:
+                    log(f"[ENTRY NOT CONFIRMED] {symbol}")
+                    continue
+
+                # Position may take time to appear in API.
+                stop_ok = initialize_new_position(
+                    symbol,
+                    signal
+                )
+
+                held.append(symbol)
+
+                log(
+                    f"[ENTRY COMPLETE] {symbol} "
+                    f"STOP_VERIFIED={stop_ok}"
+                )
+
+                if not stop_ok:
+                    log(
+                        f"[URGENT CHECK] {symbol}: "
+                        "Entry accepted but protective stop "
+                        "was not verified. Check Testnet manually."
+                    )
+
+            log(f"--- SLEEP {CHECK_INTERVAL}s ---")
+
+            time.sleep(CHECK_INTERVAL)
+
         except Exception as e:
-            print(f"[ERROR] {e}", flush=True)
+
+            log(f"[MAIN LOOP ERROR] {e}")
+
             import traceback
             traceback.print_exc()
+
             time.sleep(10)
+
+
+# =====================================================
+# START
+# =====================================================
+
 if __name__ == "__main__":
-    print("=== BOT STARTING ===", flush=True)
 
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    log("=== BOT STARTING ===")
 
-    print("=== FLASK STARTED ===", flush=True)
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True
+    )
+
+    flask_thread.start()
+
+    log("=== FLASK STARTED ===")
 
     main_loop()
