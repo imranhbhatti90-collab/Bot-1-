@@ -201,15 +201,14 @@ def api_req(method, path, params=None, body=None):
 
 
 # =====================================================
-# LIVE TICKER PRICE
+# LIVE TRADE PRICE
 # =====================================================
 
 def get_live_price(symbol):
 
-    path = f"/v2/tickers/{symbol}"
+    path = f"/v2/trades/{symbol}"
 
     try:
-
         response = requests.get(
             BASE_URL + path,
             headers={
@@ -221,43 +220,51 @@ def get_live_price(symbol):
 
         if response.status_code != 200:
             log(
-                f"[TICKER ERROR] {symbol} "
+                f"[TRADE PRICE ERROR] {symbol} "
                 f"HTTP={response.status_code}"
             )
             return None
 
         data = response.json()
-        result = data.get("result")
 
-        if isinstance(result, list):
-
-            if not result:
-                return None
-
-            result = result[0]
-
-        if not isinstance(result, dict):
+        if data.get("success") is not True:
+            log(f"[TRADE PRICE ERROR] {symbol}: {data}")
             return None
 
-        for field in ("close", "last_price", "price"):
+        result = data.get("result", {})
 
-            value = result.get(field)
+        if isinstance(result, dict):
+            trades = result.get("trades", [])
+        elif isinstance(result, list):
+            trades = result
+        else:
+            trades = []
 
-            if value is not None:
+        if not trades:
+            log(f"[NO RECENT TRADES] {symbol}")
+            return None
 
-                price = float(value)
+        latest = max(
+            trades,
+            key=lambda x: int(x.get("timestamp", 0))
+        )
 
-                if price > 0:
-                    return price
+        price = float(latest.get("price", 0))
 
-        log(f"[TICKER PRICE MISSING] {symbol}: {result}")
+        if price <= 0:
+            log(f"[INVALID TRADE PRICE] {symbol}")
+            return None
 
-        return None
+        log(
+            f"[LIVE TRADE PRICE] {symbol} "
+            f"PRICE={price} "
+            f"TIMESTAMP={latest.get('timestamp')}"
+        )
+
+        return price
 
     except Exception as e:
-
-        log(f"[TICKER EXCEPTION] {symbol}: {e}")
-
+        log(f"[LIVE PRICE ERROR] {symbol}: {e}")
         return None
 
 
