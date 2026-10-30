@@ -103,40 +103,78 @@ def get_pos():
     return []
 
 def get_orders():
-    res, code = api_req("GET", "/v2/orders", params={"states":"open"})
-    if code == 200 and res.get("result"):
-        return res["result"]
+    res, code = api_req(
+        "GET",
+        "/v2/orders",
+        params={"states": "open,pending"}
+    )
+    if code == 200 and res.get("success"):
+        return res.get("result", [])
+    print(f"[ORDER ERROR] {code} | {res}", flush=True)
     return []
-
 def cancel_all_stops(symbol):
     orders = get_orders()
+
     for o in orders:
-        if o.get("product_symbol") == symbol and o.get("reduce_only"):
+        if (
+            o.get("product_symbol") == symbol
+            and o.get("reduce_only") is True
+            and o.get("stop_order_type") == "stop_loss_order"
+            and o.get("state") in ("open", "pending")
+        ):
             oid = o.get("id")
             if oid:
-                api_req("DELETE", f"/v2/orders/{oid}")
+                res, code = api_req("DELETE", f"/v2/orders/{oid}")
+                print(
+                    f"[CANCEL STOP] {symbol} ID={oid} HTTP={code}",
+                    flush=True
+                )
 
 def place_stop(symbol, side, size, stop_price):
-    sz = float(abs(float(size)))
+    sz = int(abs(float(size)))
+
+    if sz <= 0:
+        print("[STOP ERROR] Invalid size", flush=True)
+        return None, 400
+
     stop_side = "sell" if side == "buy" else "buy"
-    price_str = f"{float(stop_price):.2f}"
+
     body = {
         "product_symbol": symbol,
         "size": sz,
         "side": stop_side,
         "order_type": "market_order",
-        "stop_price": price_str,
+        "stop_order_type": "stop_loss_order",
+        "stop_price": f"{float(stop_price):.2f}",
         "reduce_only": True,
         "stop_trigger_method": "last_traded_price"
     }
+
     res, code = api_req("POST", "/v2/orders", body=body)
-    print(f"[TRAIL STOP] {symbol} {stop_side} stop={price_str} -> {code}", flush=True)
-    if code == 200:
+
+    result = res.get("result", {}) if isinstance(res, dict) else {}
+
+    if (
+        code == 200
+        and res.get("success") is True
+        and result.get("stop_order_type") == "stop_loss_order"
+        and result.get("state") in ("pending", "open")
+    ):
         state["stops"][symbol] = float(stop_price)
         save_state(state)
-        print(f"[CHART] {symbol} RED LINE @ {price_str} - Stop Orders me dekho", flush=True)
+
+        print(
+            f"[STOP ACTIVE] {symbol} {stop_side} "
+            f"STOP={stop_price} ID={result.get('id')} "
+            f"STATE={result.get('state')}",
+            flush=True
+        )
     else:
-        print(f"[TRAIL STOP FAIL] {symbol} {res}", flush=True)
+        print(
+            f"[STOP NOT VERIFIED] {symbol} HTTP={code} RESPONSE={res}",
+            flush=True
+        )
+
     return res, code
 
 def check_signal(candles, symbol):
