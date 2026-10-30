@@ -34,7 +34,7 @@ TIMEFRAME = "5m"
 ORDER_SIZE = 40
 MAX_POSITIONS = 6
 
-TRAIL_PCT = 0.005
+TRAIL_PCT = 0.003
 COOLDOWN_SECONDS = 300
 
 CHECK_INTERVAL = 30
@@ -624,30 +624,21 @@ def place_stop(symbol, side, size, stop_price):
 # =====================================================
 # SIGNAL CALCULATION
 # =====================================================
-
 def check_signal(candles, symbol):
 
     if len(candles) < 50:
-
         log(f"[SCAN] {symbol} not enough candles")
-
         return None
 
     try:
-
         df = pd.DataFrame(candles)
 
         if "close" not in df.columns:
-
             df = pd.DataFrame(
                 candles,
                 columns=[
-                    "time",
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume"
+                    "time", "open", "high",
+                    "low", "close", "volume"
                 ]
             )
 
@@ -655,13 +646,11 @@ def check_signal(candles, symbol):
         df["volume"] = pd.to_numeric(df["volume"])
 
         df["ema9"] = df["close"].ewm(
-            span=9,
-            adjust=False
+            span=9, adjust=False
         ).mean()
 
         df["ema21"] = df["close"].ewm(
-            span=21,
-            adjust=False
+            span=21, adjust=False
         ).mean()
 
         delta = df["close"].diff()
@@ -680,32 +669,16 @@ def check_signal(candles, symbol):
         df["vol_avg"] = df["volume"].rolling(20).mean()
 
         last = df.iloc[-1]
-        prev = df.iloc[-2]
 
         ema9 = float(last["ema9"])
         ema21 = float(last["ema21"])
-
-        ema9_prev = float(prev["ema9"])
-        ema21_prev = float(prev["ema21"])
-
         rsi = float(last["rsi"])
         vol = float(last["volume"])
         vol_avg = float(last["vol_avg"])
-
         close_px = float(last["close"])
 
         if pd.isna(rsi) or pd.isna(vol_avg):
             return None
-
-        buy_cross = (
-            ema9_prev <= ema21_prev
-            and ema9 > ema21
-        )
-
-        sell_cross = (
-            ema9_prev >= ema21_prev
-            and ema9 < ema21
-        )
 
         log(
             f"[SCAN] {symbol} "
@@ -716,32 +689,33 @@ def check_signal(candles, symbol):
             f"VOL={vol:.0f}/{vol_avg:.0f}"
         )
 
-        if (
-            buy_cross
+        # Bullish trend setup
+        buy_setup = (
+            ema9 > ema21
             and 45 <= rsi <= 70
-            and vol > vol_avg * 0.8
-        ):
+            and vol > vol_avg * 0.6
+        )
 
+        # Bearish trend setup
+        sell_setup = (
+            ema9 < ema21
+            and 30 <= rsi <= 55
+            and vol > vol_avg * 0.6
+        )
+
+        if buy_setup:
             log(f"[SIGNAL BUY] {symbol}")
-
             return "buy"
 
-        if (
-            sell_cross
-            and 30 <= rsi <= 55
-            and vol > vol_avg * 0.8
-        ):
-
+        if sell_setup:
             log(f"[SIGNAL SELL] {symbol}")
-
             return "sell"
 
+        log(f"[NO TRADE] {symbol} filters not satisfied")
         return None
 
     except Exception as e:
-
         log(f"[SIGNAL ERROR] {symbol}: {e}")
-
         return None
 
 
