@@ -32,13 +32,16 @@ COINS = [
 TIMEFRAME = "5m"
 
 ORDER_SIZE = 40
-MAX_POSITIONS = 2
+MAX_POSITIONS = 6
 
 TRAIL_PCT = 0.005
 COOLDOWN_SECONDS = 300
 
 CHECK_INTERVAL = 30
 STATE_FILE = "state.json"
+
+# Stop must remain at least this far from current Last Price.
+MIN_STOP_GAP_PCT = 0.0005
 
 # =====================================================
 # FLASK SERVER
@@ -50,7 +53,7 @@ app = Flask(__name__)
 def home():
     return (
         "DELTA TESTNET BOT | EMA CROSS + RSI + VOL "
-        "| LIVE TRAILING STOP | 5 MIN"
+        "| SAFE LIVE TRAILING STOP | MAX POSITIONS 6"
     )
 
 @app.route("/health")
@@ -58,7 +61,8 @@ def health():
     return jsonify({
         "status": "ok",
         "bot": "running",
-        "environment": "TESTNET"
+        "environment": "TESTNET",
+        "max_positions": MAX_POSITIONS
     }), 200
 
 
@@ -86,6 +90,7 @@ def log(message):
 # =====================================================
 
 def load_state():
+
     default = {
         "peaks": {},
         "stops": {},
@@ -107,6 +112,7 @@ def load_state():
 
 
 def save_state():
+
     try:
         temp_file = STATE_FILE + ".tmp"
 
@@ -126,6 +132,7 @@ state = load_state()
 # =====================================================
 
 session = requests.Session()
+
 
 def api_req(method, path, params=None, body=None):
 
@@ -173,6 +180,7 @@ def api_req(method, path, params=None, body=None):
     url = BASE_URL + path + query_string
 
     try:
+
         response = session.request(
             method=method,
             url=url,
@@ -198,10 +206,10 @@ def api_req(method, path, params=None, body=None):
 
 def get_live_price(symbol):
 
-    # Ticker endpoint is public market data.
     path = f"/v2/tickers/{symbol}"
 
     try:
+
         response = requests.get(
             BASE_URL + path,
             headers={
@@ -219,38 +227,37 @@ def get_live_price(symbol):
             return None
 
         data = response.json()
-
         result = data.get("result")
 
         if isinstance(result, list):
+
             if not result:
                 return None
+
             result = result[0]
 
         if not isinstance(result, dict):
             return None
 
-        # Last traded price preferred for last_traded_price stops.
-        price_fields = [
-            "close",
-            "last_price",
-            "price"
-        ]
+        for field in ("close", "last_price", "price"):
 
-        for field in price_fields:
             value = result.get(field)
 
             if value is not None:
+
                 price = float(value)
 
                 if price > 0:
                     return price
 
         log(f"[TICKER PRICE MISSING] {symbol}: {result}")
+
         return None
 
     except Exception as e:
+
         log(f"[TICKER EXCEPTION] {symbol}: {e}")
+
         return None
 
 
@@ -285,6 +292,7 @@ def get_candles(symbol):
         return res["result"]
 
     log(f"[CANDLE ERROR] {symbol} HTTP={code} {res}")
+
     return []
 
 
@@ -300,11 +308,15 @@ def get_pos():
     )
 
     if code != 200 or not isinstance(res, dict):
+
         log(f"[POSITION ERROR] HTTP={code} {res}")
+
         return None
 
     if res.get("success") is not True:
+
         log(f"[POSITION ERROR] {res}")
+
         return None
 
     result = res.get("result", [])
@@ -318,9 +330,12 @@ def get_pos():
     positions = []
 
     for p in result:
+
         try:
+
             if float(p.get("size", 0)) != 0:
                 positions.append(p)
+
         except Exception:
             continue
 
@@ -329,9 +344,11 @@ def get_pos():
 
 def parse_pos_symbol(p):
 
+    product = p.get("product") or {}
+
     return (
         p.get("product_symbol")
-        or p.get("product", {}).get("symbol")
+        or product.get("symbol")
         or ""
     )
 
@@ -356,12 +373,14 @@ def get_orders():
         and isinstance(res, dict)
         and res.get("success") is True
     ):
+
         result = res.get("result", [])
 
         if isinstance(result, list):
             return result
 
     log(f"[ORDER ERROR] HTTP={code} {res}")
+
     return None
 
 
@@ -387,13 +406,16 @@ def verify_stop(symbol, order_id):
 
     for order in orders:
 
-        if str(order.get("id")) == str(order_id):
+        if str(order.get("id")) != str(order_id):
+            continue
 
-            if (
-                is_active_stop(order, symbol)
-                and order.get("reduce_only") is True
-            ):
-                return True
+        reduce_only = order.get("reduce_only")
+
+        if (
+            is_active_stop(order, symbol)
+            and reduce_only in (True, 1, "true", "True")
+        ):
+            return True
 
     return False
 
@@ -408,7 +430,9 @@ def cancel_stop(order):
     product_id = order.get("product_id")
 
     if not order_id or not product_id:
+
         log("[CANCEL ERROR] Order ID/product ID missing")
+
         return False
 
     body = {
@@ -422,11 +446,18 @@ def cancel_stop(order):
         body=body
     )
 
-    if code == 200 and isinstance(res, dict) and res.get("success"):
+    if (
+        code == 200
+        and isinstance(res, dict)
+        and res.get("success")
+    ):
+
         log(f"[CANCEL SENT] ID={order_id}")
+
         return True
 
     log(f"[CANCEL FAILED] ID={order_id} HTTP={code} {res}")
+
     return False
 
 
@@ -439,7 +470,9 @@ def cancel_old_stops(symbol, keep_order_id):
     orders = get_orders()
 
     if orders is None:
+
         log("[CANCEL BLOCKED] Cannot verify open orders")
+
         return False
 
     success = True
@@ -459,6 +492,31 @@ def cancel_old_stops(symbol, keep_order_id):
 
 
 # =====================================================
+# STOP PRICE VALIDATION
+# =====================================================
+
+def valid_stop_price(side, stop_price, live_price):
+
+    if live_price is None or live_price <= 0:
+        return False
+
+    if stop_price is None or stop_price <= 0:
+        return False
+
+    gap = live_price * MIN_STOP_GAP_PCT
+
+    if side == "buy":
+        # LONG position: SELL stop below current price.
+        return stop_price < (live_price - gap)
+
+    if side == "sell":
+        # SHORT position: BUY stop above current price.
+        return stop_price > (live_price + gap)
+
+    return False
+
+
+# =====================================================
 # PLACE STOP LOSS
 # =====================================================
 
@@ -467,7 +525,29 @@ def place_stop(symbol, side, size, stop_price):
     sz = int(abs(float(size)))
 
     if sz <= 0 or stop_price <= 0:
+
         log("[STOP ERROR] Invalid size or price")
+
+        return False
+
+    live_price = get_live_price(symbol)
+
+    if live_price is None:
+
+        log(f"[STOP BLOCKED] {symbol} live price unavailable")
+
+        return False
+
+    if not valid_stop_price(side, stop_price, live_price):
+
+        log(
+            f"[STOP BLOCKED] {symbol} "
+            f"SIDE={side} "
+            f"STOP={stop_price:.2f} "
+            f"LAST={live_price:.2f} "
+            "Wrong-side or too close to Last Price"
+        )
+
         return False
 
     stop_side = "sell" if side == "buy" else "buy"
@@ -500,22 +580,26 @@ def place_stop(symbol, side, size, stop_price):
         or res.get("success") is not True
         or not result.get("id")
     ):
+
         log(f"[STOP FAILED] {symbol} HTTP={code} {res}")
+
         return False
 
     order_id = result.get("id")
 
-    # Check the exchange open-order list.
     time.sleep(1)
 
     if not verify_stop(symbol, order_id):
+
         log(
             f"[STOP NOT VERIFIED] {symbol} "
             f"ID={order_id}. Old stop will NOT be cancelled."
         )
+
         return False
 
     state["stops"][symbol] = float(stop_price)
+
     save_state()
 
     log(
@@ -525,7 +609,6 @@ def place_stop(symbol, side, size, stop_price):
         f"ID={order_id}"
     )
 
-    # Only after the new stop is confirmed.
     cancel_old_stops(symbol, order_id)
 
     return True
@@ -538,7 +621,9 @@ def place_stop(symbol, side, size, stop_price):
 def check_signal(candles, symbol):
 
     if len(candles) < 50:
+
         log(f"[SCAN] {symbol} not enough candles")
+
         return None
 
     try:
@@ -546,6 +631,7 @@ def check_signal(candles, symbol):
         df = pd.DataFrame(candles)
 
         if "close" not in df.columns:
+
             df = pd.DataFrame(
                 candles,
                 columns=[
@@ -580,7 +666,6 @@ def check_signal(candles, symbol):
 
         df["rsi"] = 100 - (100 / (1 + rs))
 
-        # Handle all-up / all-down edge cases.
         df.loc[(loss == 0) & (gain > 0), "rsi"] = 100
         df.loc[(gain == 0) & (loss > 0), "rsi"] = 0
         df.loc[(gain == 0) & (loss == 0), "rsi"] = 50
@@ -598,7 +683,6 @@ def check_signal(candles, symbol):
 
         rsi = float(last["rsi"])
         vol = float(last["volume"])
-
         vol_avg = float(last["vol_avg"])
 
         close_px = float(last["close"])
@@ -630,7 +714,9 @@ def check_signal(candles, symbol):
             and 45 <= rsi <= 70
             and vol > vol_avg * 0.8
         ):
+
             log(f"[SIGNAL BUY] {symbol}")
+
             return "buy"
 
         if (
@@ -638,13 +724,17 @@ def check_signal(candles, symbol):
             and 30 <= rsi <= 55
             and vol > vol_avg * 0.8
         ):
+
             log(f"[SIGNAL SELL] {symbol}")
+
             return "sell"
 
         return None
 
     except Exception as e:
+
         log(f"[SIGNAL ERROR] {symbol}: {e}")
+
         return None
 
 
@@ -672,10 +762,16 @@ def place_entry(symbol, side):
         and isinstance(res, dict)
         and res.get("success") is True
     ):
-        log(f"[ENTRY ACCEPTED] {symbol} {side} SIZE={ORDER_SIZE}")
+
+        log(
+            f"[ENTRY ACCEPTED] {symbol} "
+            f"{side} SIZE={ORDER_SIZE}"
+        )
+
         return True
 
     log(f"[ENTRY FAILED] {symbol} HTTP={code} {res}")
+
     return False
 
 
@@ -688,7 +784,9 @@ def handle_trailing():
     positions = get_pos()
 
     if positions is None:
+
         log("[TRAIL BLOCKED] Position API unavailable")
+
         return
 
     active_symbols = set()
@@ -716,14 +814,17 @@ def handle_trailing():
             )
 
             if entry <= 0:
+
                 log(f"[TRAIL ERROR] {symbol} entry price missing")
+
                 continue
 
-            # LIVE PRICE, NOT CANDLE CLOSE.
             curr = get_live_price(symbol)
 
             if curr is None:
+
                 log(f"[TRAIL SKIP] {symbol} live price unavailable")
+
                 continue
 
             old_peak = float(
@@ -731,30 +832,29 @@ def handle_trailing():
             )
 
             old_stop = float(
-                state["stops"].get(
-                    symbol,
-                    0 if size > 0 else 999999999
-                )
+                state["stops"].get(symbol, 0)
             )
+
+            # =========================================
+            # LONG POSITION
+            # =========================================
 
             if size > 0:
 
-                # LONG position.
-                new_peak = max(old_peak, curr)
+                new_peak = max(old_peak, entry, curr)
 
                 trail_stop = new_peak * (1 - TRAIL_PCT)
 
-                # Never move a long stop downward.
-                trail_stop = max(trail_stop, old_stop)
+                # Discard stale stop if it is on wrong side.
+                if old_stop >= curr:
+                    old_stop = 0
 
+                if old_stop > 0:
+                    trail_stop = max(trail_stop, old_stop)
+
+                # Always keep candidate below Last Price.
                 if trail_stop >= curr:
-                    log(
-                        f"[TRAIL WAIT] {symbol} LONG "
-                        f"PRICE={curr:.2f} STOP={trail_stop:.2f}"
-                    )
-                    state["peaks"][symbol] = new_peak
-                    save_state()
-                    continue
+                    trail_stop = curr * (1 - TRAIL_PCT)
 
                 log(
                     f"[TRAIL] {symbol} LONG "
@@ -766,8 +866,10 @@ def handle_trailing():
 
                 state["peaks"][symbol] = new_peak
 
-                # Only update if stop has improved.
-                if trail_stop > old_stop:
+                if (
+                    old_stop <= 0
+                    or trail_stop > old_stop
+                ):
 
                     if place_stop(
                         symbol,
@@ -775,29 +877,45 @@ def handle_trailing():
                         size,
                         trail_stop
                     ):
+
                         log(f"[TRAIL UPDATED] {symbol} LONG")
+
+            # =========================================
+            # SHORT POSITION
+            # =========================================
 
             else:
 
-                # SHORT position.
+                # For a short, the best price is the lowest
+                # price reached since entry.
+                if old_peak <= 0:
+                    old_peak = entry
+
                 new_peak = min(
-                    old_peak if old_peak > 0 else curr,
+                    old_peak,
+                    entry,
                     curr
                 )
 
                 trail_stop = new_peak * (1 + TRAIL_PCT)
 
-                # Never move a short stop upward.
-                trail_stop = min(trail_stop, old_stop)
-
-                if trail_stop <= curr:
+                # IMPORTANT FIX:
+                # A stale stop below current price is invalid
+                # for a short protective BUY stop.
+                if old_stop > 0 and old_stop <= curr:
                     log(
-                        f"[TRAIL WAIT] {symbol} SHORT "
-                        f"PRICE={curr:.2f} STOP={trail_stop:.2f}"
+                        f"[STALE STOP IGNORED] {symbol} "
+                        f"OLD_STOP={old_stop:.2f} "
+                        f"LAST={curr:.2f}"
                     )
-                    state["peaks"][symbol] = new_peak
-                    save_state()
-                    continue
+                    old_stop = 0
+
+                if old_stop > 0:
+                    trail_stop = min(trail_stop, old_stop)
+
+                # Ensure short stop is above current Last Price.
+                if trail_stop <= curr:
+                    trail_stop = curr * (1 + TRAIL_PCT)
 
                 log(
                     f"[TRAIL] {symbol} SHORT "
@@ -809,7 +927,10 @@ def handle_trailing():
 
                 state["peaks"][symbol] = new_peak
 
-                if trail_stop < old_stop:
+                if (
+                    old_stop <= 0
+                    or trail_stop < old_stop
+                ):
 
                     if place_stop(
                         symbol,
@@ -817,38 +938,44 @@ def handle_trailing():
                         size,
                         trail_stop
                     ):
+
                         log(f"[TRAIL UPDATED] {symbol} SHORT")
 
             save_state()
 
         except Exception as e:
+
             log(f"[TRAIL ERROR] {e}")
 
 
 # =====================================================
-# ENTRY STOP INITIALIZATION
+# INITIAL STOP
 # =====================================================
 
 def initialize_new_position(symbol, side):
 
-    # Wait briefly for position data to update.
     time.sleep(2)
 
     positions = get_pos()
 
     if positions is None:
+
         log(f"[INITIAL STOP BLOCKED] {symbol} position API error")
+
         return False
 
     position = None
 
     for p in positions:
+
         if parse_pos_symbol(p) == symbol:
             position = p
             break
 
     if position is None:
+
         log(f"[INITIAL STOP WAIT] {symbol} position not visible yet")
+
         return False
 
     size = float(position.get("size", 0))
@@ -865,7 +992,9 @@ def initialize_new_position(symbol, side):
     curr = get_live_price(symbol)
 
     if entry <= 0 or curr is None:
+
         log(f"[INITIAL STOP ERROR] {symbol} price unavailable")
+
         return False
 
     if size > 0:
@@ -880,7 +1009,7 @@ def initialize_new_position(symbol, side):
 
         stop_price = curr * (1 + TRAIL_PCT)
 
-        state["peaks"][symbol] = curr
+        state["peaks"][symbol] = min(entry, curr)
 
         stop_side = "sell"
 
@@ -910,23 +1039,27 @@ def main_loop():
     log("======================================")
     log("DELTA TESTNET AUTO BOT STARTED")
     log("EMA 9/21 + RSI + VOLUME")
-    log("LIVE PRICE TRAILING STOP")
-    log("ORDER SIZE = 40")
-    log("MAX POSITIONS = 2")
+    log("SAFE LIVE TRAILING STOP")
+    log(f"ORDER SIZE = {ORDER_SIZE}")
+    log(f"MAX POSITIONS = {MAX_POSITIONS}")
+    log(f"COINS = {COINS}")
     log("======================================")
 
     while True:
 
         try:
 
-            # First manage existing positions.
+            # Manage existing positions first.
             handle_trailing()
 
             positions = get_pos()
 
             if positions is None:
+
                 log("[SCAN BLOCKED] Position API unavailable")
+
                 time.sleep(CHECK_INTERVAL)
+
                 continue
 
             held = []
@@ -951,8 +1084,11 @@ def main_loop():
             )
 
             if len(held) >= MAX_POSITIONS:
+
                 log("[MAX POSITIONS] No new entry")
+
                 time.sleep(CHECK_INTERVAL)
+
                 continue
 
             for symbol in COINS:
@@ -973,10 +1109,12 @@ def main_loop():
                 )
 
                 if remaining > 0:
+
                     log(
                         f"[COOLDOWN] {symbol} "
                         f"{int(remaining)}s"
                     )
+
                     continue
 
                 candles = get_candles(symbol)
@@ -993,18 +1131,18 @@ def main_loop():
                     f"[ENTRY SIGNAL] {symbol} {signal.upper()}"
                 )
 
-                # Save cooldown before order request to prevent
-                # repeated entries if exchange response is delayed.
                 state["last_trade"][symbol] = time.time()
+
                 save_state()
 
                 accepted = place_entry(symbol, signal)
 
                 if not accepted:
+
                     log(f"[ENTRY NOT CONFIRMED] {symbol}")
+
                     continue
 
-                # Position may take time to appear in API.
                 stop_ok = initialize_new_position(
                     symbol,
                     signal
@@ -1018,6 +1156,7 @@ def main_loop():
                 )
 
                 if not stop_ok:
+
                     log(
                         f"[URGENT CHECK] {symbol}: "
                         "Entry accepted but protective stop "
