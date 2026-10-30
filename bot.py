@@ -302,4 +302,3 @@ def main_loop():
 if True:  # main
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
-    main_loop()
