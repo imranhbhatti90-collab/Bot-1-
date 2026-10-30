@@ -6,14 +6,17 @@ import hashlib
 import requests
 from urllib.parse import urlencode, quote
 import pandas as pd
-from flask import Flask
+from flask import Flask, jsonify
 import threading
 
 app = Flask(__name__)
 @app.route('/')
 def home():
     return "Bot FINAL - CROSS + RSI45 + VOL + NO OVERTRADE + RED LINE - 5min"
-
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "bot": "running"}, 200
+    
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
