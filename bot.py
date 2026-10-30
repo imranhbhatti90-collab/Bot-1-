@@ -140,10 +140,12 @@ def get_orders():
         "/v2/orders",
         params={"states": "open,pending"}
     )
-    if code == 200 and res.get("success"):
+
+    if code == 200 and isinstance(res, dict) and res.get("success"):
         return res.get("result", [])
-    print(f"[ORDER ERROR] {code} | {res}", flush=True)
-    return []
+
+    print(f"[ORDER ERROR] HTTP={code} | {res}", flush=True)
+    return None
 def cancel_all_stops(symbol):
     orders = get_orders()
 
