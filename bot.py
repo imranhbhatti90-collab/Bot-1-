@@ -52,6 +52,8 @@ STATE_FILE = "state.json"
 
 # Stop must remain at least this far from current Last Price.
 MIN_STOP_GAP_PCT = 0.0005
+ADX_PERIOD = 14
+MIN_ADX = 25.0
 
 # =====================================================
 # FLASK SERVER
@@ -632,8 +634,9 @@ def place_stop(symbol, side, size, stop_price):
 
 
 # =====================================================
-# SIGNAL CALCULATION
+# SIGNAL CALCULATION - EMA + RSI + VOLUME + ADX
 # =====================================================
+
 def check_signal(candles, symbol):
 
     if len(candles) < 50:
@@ -652,9 +655,24 @@ def check_signal(candles, symbol):
                 ]
             )
 
-        df["close"] = pd.to_numeric(df["close"])
-        df["volume"] = pd.to_numeric(df["volume"])
+        required = ["high", "low", "close", "volume"]
 
+        for col in required:
+            if col not in df.columns:
+                log(f"[ADX ERROR] {symbol} missing {col} data")
+                return None
+
+            df[col] = pd.to_numeric(
+                df[col], errors="coerce"
+            )
+
+        df = df.dropna(subset=required).copy()
+
+        if len(df) < 50:
+            log(f"[SCAN] {symbol} insufficient valid candles")
+            return None
+
+        # EMA
         df["ema9"] = df["close"].ewm(
             span=9, adjust=False
         ).mean()
@@ -663,20 +681,114 @@ def check_signal(candles, symbol):
             span=21, adjust=False
         ).mean()
 
+        # RSI
         delta = df["close"].diff()
 
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        gain = delta.clip(lower=0)
+        loss = (-delta.clip(upper=0))
 
-        rs = gain / loss.replace(0, float("nan"))
+        avg_gain = gain.ewm(
+            alpha=1/14,
+            adjust=False,
+            min_periods=14
+        ).mean()
+
+        avg_loss = loss.ewm(
+            alpha=1/14,
+            adjust=False,
+            min_periods=14
+        ).mean()
+
+        rs = avg_gain / avg_loss.replace(0, float("nan"))
 
         df["rsi"] = 100 - (100 / (1 + rs))
 
-        df.loc[(loss == 0) & (gain > 0), "rsi"] = 100
-        df.loc[(gain == 0) & (loss > 0), "rsi"] = 0
-        df.loc[(gain == 0) & (loss == 0), "rsi"] = 50
+        df.loc[
+            (avg_loss == 0) & (avg_gain > 0), "rsi"
+        ] = 100
 
+        df.loc[
+            (avg_gain == 0) & (avg_loss > 0), "rsi"
+        ] = 0
+
+        df.loc[
+            (avg_gain == 0) & (avg_loss == 0), "rsi"
+        ] = 50
+
+        # Volume
         df["vol_avg"] = df["volume"].rolling(20).mean()
+
+        # ADX - Wilder's method
+        up_move = df["high"].diff()
+        down_move = -df["low"].diff()
+
+        plus_dm = pd.Series(
+            0.0, index=df.index
+        )
+
+        minus_dm = pd.Series(
+            0.0, index=df.index
+        )
+
+        plus_dm.loc[
+            (up_move > down_move) & (up_move > 0)
+        ] = up_move
+
+        minus_dm.loc[
+            (down_move > up_move) & (down_move > 0)
+        ] = down_move
+
+        previous_close = df["close"].shift(1)
+
+        tr = pd.concat(
+            [
+                df["high"] - df["low"],
+                (df["high"] - previous_close).abs(),
+                (df["low"] - previous_close).abs()
+            ],
+            axis=1
+        ).max(axis=1)
+
+        atr = tr.ewm(
+            alpha=1/ADX_PERIOD,
+            adjust=False,
+            min_periods=ADX_PERIOD
+        ).mean()
+
+        plus_dm_smooth = plus_dm.ewm(
+            alpha=1/ADX_PERIOD,
+            adjust=False,
+            min_periods=ADX_PERIOD
+        ).mean()
+
+        minus_dm_smooth = minus_dm.ewm(
+            alpha=1/ADX_PERIOD,
+            adjust=False,
+            min_periods=ADX_PERIOD
+        ).mean()
+
+        plus_di = 100 * plus_dm_smooth / atr.replace(
+            0, float("nan")
+        )
+
+        minus_di = 100 * minus_dm_smooth / atr.replace(
+            0, float("nan")
+        )
+
+        di_sum = (plus_di + minus_di).replace(
+            0, float("nan")
+        )
+
+        dx = (
+            (plus_di - minus_di).abs()
+            / di_sum
+        ) * 100
+
+        df["adx"] = dx.ewm(
+            alpha=1/ADX_PERIOD,
+            adjust=False,
+            min_periods=ADX_PERIOD
+        ).mean()
 
         last = df.iloc[-1]
 
@@ -685,9 +797,14 @@ def check_signal(candles, symbol):
         rsi = float(last["rsi"])
         vol = float(last["volume"])
         vol_avg = float(last["vol_avg"])
+        adx = float(last["adx"])
         close_px = float(last["close"])
 
-        if pd.isna(rsi) or pd.isna(vol_avg):
+        if any(
+            pd.isna(x)
+            for x in [ema9, ema21, rsi, vol_avg, adx]
+        ):
+            log(f"[SCAN] {symbol} indicator data not ready")
             return None
 
         log(
@@ -696,17 +813,27 @@ def check_signal(candles, symbol):
             f"EMA9={ema9:.2f} "
             f"EMA21={ema21:.2f} "
             f"RSI={rsi:.1f} "
-            f"VOL={vol:.0f}/{vol_avg:.0f}"
+            f"VOL={vol:.0f}/{vol_avg:.0f} "
+            f"ADX={adx:.1f}"
         )
 
-        # Bullish trend setup
+        # Strict ADX filter
+        if adx < MIN_ADX:
+            log(
+                f"[NO TRADE] {symbol} "
+                f"ADX={adx:.1f} BELOW {MIN_ADX} "
+                "(SIDEWAYS / WEAK TREND)"
+            )
+            return None
+
+        # BUY setup
         buy_setup = (
             ema9 > ema21
             and 45 <= rsi <= 70
             and vol > vol_avg * 0.6
         )
 
-        # Bearish trend setup
+        # SELL setup
         sell_setup = (
             ema9 < ema21
             and 30 <= rsi <= 55
@@ -714,11 +841,11 @@ def check_signal(candles, symbol):
         )
 
         if buy_setup:
-            log(f"[SIGNAL BUY] {symbol}")
+            log(f"[SIGNAL BUY] {symbol} ADX={adx:.1f}")
             return "buy"
 
         if sell_setup:
-            log(f"[SIGNAL SELL] {symbol}")
+            log(f"[SIGNAL SELL] {symbol} ADX={adx:.1f}")
             return "sell"
 
         log(f"[NO TRADE] {symbol} filters not satisfied")
@@ -1031,6 +1158,7 @@ def main_loop():
     log("DELTA TESTNET AUTO BOT STARTED")
     log("EMA 9/21 + RSI + VOLUME")
     log("SAFE LIVE TRAILING STOP")
+    log(f"ADX FILTER = {MIN_ADX}+")
     log(f"ORDER SIZE = {ORDER_SIZE}")
     log(f"MAX POSITIONS = {MAX_POSITIONS}")
     log(f"COINS = {COINS}")
