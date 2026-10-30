@@ -65,8 +65,12 @@ def api_req(method, path, params=None, body=None):
         if method == "GET":
             r = requests.get(url, headers=headers, timeout=15)
         elif method == "DELETE":
-            r = requests.delete(url, headers=headers, timeout=15)
-            return {"success": True}, r.status_code
+    r = requests.delete(
+        url,
+        headers=headers,
+        json=body,
+        timeout=15
+    )
         else:
             r = requests.post(url, headers=headers, json=body, timeout=15)
         return r.json(), r.status_code
@@ -118,15 +122,39 @@ def cancel_all_stops(symbol):
     for o in orders:
         if (
             o.get("product_symbol") == symbol
-            and o.get("reduce_only") is True
             and o.get("stop_order_type") == "stop_loss_order"
             and o.get("state") in ("open", "pending")
         ):
             oid = o.get("id")
-            if oid:
-                res, code = api_req("DELETE", f"/v2/orders/{oid}")
+            product_id = o.get("product_id")
+
+            if not oid or not product_id:
                 print(
-                    f"[CANCEL STOP] {symbol} ID={oid} HTTP={code}",
+                    f"[CANCEL ERROR] {symbol}: ID/product_id missing",
+                    flush=True
+                )
+                continue
+
+            body = {
+                "id": int(oid),
+                "product_id": int(product_id)
+            }
+
+            res, code = api_req(
+                "DELETE",
+                "/v2/orders",
+                body=body
+            )
+
+            if code == 200 and res.get("success") is True:
+                print(
+                    f"[CANCEL SENT] {symbol} ID={oid}",
+                    flush=True
+                )
+            else:
+                print(
+                    f"[CANCEL FAILED] {symbol} ID={oid} "
+                    f"HTTP={code} RESPONSE={res}",
                     flush=True
                 )
 
