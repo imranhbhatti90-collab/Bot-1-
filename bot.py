@@ -32,6 +32,16 @@ COINS = [
 TIMEFRAME = "5m"
 
 ORDER_SIZE = 40
+
+ORDER_SIZES = {
+    "BTCUSD": 40,
+    "ETHUSD": 40,
+    "SOLUSD": 40,
+    "XAUTUSD": 200,
+    "PAXGUSD": 200,
+    "SILVERUSD": 200
+}
+
 MAX_POSITIONS = 6
 
 TRAIL_PCT = 0.003
@@ -727,7 +737,7 @@ def place_entry(symbol, side):
 
     body = {
         "product_symbol": symbol,
-        "size": ORDER_SIZE,
+        "size": ORDER_SIZES.get(symbol, 40),
         "side": side,
         "order_type": "market_order"
     }
@@ -745,9 +755,9 @@ def place_entry(symbol, side):
     ):
 
         log(
-            f"[ENTRY ACCEPTED] {symbol} "
-            f"{side} SIZE={ORDER_SIZE}"
-        )
+    f"[ENTRY ACCEPTED] {symbol} "
+    f"{side} SIZE={ORDER_SIZES.get(symbol, 40)}"
+)
 
         return True
 
