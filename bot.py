@@ -1,4 +1,9 @@
-import os, json, time, hmac, hashlib, requests
+import os
+import json
+import time
+import hmac
+import hashlib
+import requests
 from urllib.parse import urlencode, quote
 import pandas as pd
 from flask import Flask
@@ -297,3 +302,4 @@ def main_loop():
 if True:  # main
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
+    main_loop()
