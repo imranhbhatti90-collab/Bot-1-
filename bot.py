@@ -1,4 +1,4 @@
-ruimport os
+import os
 import json
 import time
 import hmac
