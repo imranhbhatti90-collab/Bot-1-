@@ -22,21 +22,20 @@ COINS = ["BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "SILVERUSD"]
 TIMEFRAME = "5m"
 ORDER_SIZE = 40
 ORDER_SIZES = {
-    "BTCUSD": 40,
-    "ETHUSD": 40,
-    "SOLUSD": 40,
-    "XAUTUSD": 200,
-    "PAXGUSD": 200,
-    "SILVERUSD": 200,
+    "BTCUSD": 40, "ETHUSD": 40, "SOLUSD": 40,
+    "XAUTUSD": 200, "PAXGUSD": 200, "SILVERUSD": 200,
 }
 MAX_POSITIONS = 6
-ENABLE_TRADING = True                 # User requested automatic entries ON
-TRAIL_PCT = 0.003                     # 0.3% trailing distance
+ENABLE_TRADING = True
+LEVERAGE = 50  # Informational setting; this script does not change account leverage.
+TRAIL_PCT = 0.003
+TRAIL_ACTIVATE_PROFIT_USD = 5.0
 COOLDOWN_SECONDS = 300
 CHECK_INTERVAL = 30
 STATE_FILE = "state.json"
 MIN_STOP_GAP_PCT = 0.0005
-MAX_CANDLE_LIVE_GAP_PCT = 0.005       # Skip fresh entry if mismatch exceeds 0.5%
+MAX_CANDLE_LIVE_GAP_PCT = 0.005
+MAX_TRADE_AGE_SECONDS = 30
 ADX_PERIOD = 14
 MIN_ADX = 25.0
 EMA_FAST = 9
@@ -60,13 +59,17 @@ def log(message):
 
 @app.route("/")
 def home():
-    return ("DELTA TESTNET AUTO BOT | EMA 9/21/100 + RSI + ADX + MACD + VOLUME "
-            "| PRICE MISMATCH GUARD | TRAILING STOP")
+    return ("DELTA TESTNET AUTO BOT | $5 PROFIT TRAIL ACTIVATION | "
+            "EMA + RSI + ADX + MACD + VOLUME")
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "bot": "running", "environment": "TESTNET",
-                    "automatic_trading": ENABLE_TRADING, "max_positions": MAX_POSITIONS}), 200
+    return jsonify({
+        "status": "ok", "bot": "running", "environment": "TESTNET",
+        "automatic_trading": ENABLE_TRADING, "max_positions": MAX_POSITIONS,
+        "trail_activation_profit_usd": TRAIL_ACTIVATE_PROFIT_USD,
+        "trail_distance_pct": TRAIL_PCT * 100
+    }), 200
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
@@ -75,7 +78,10 @@ def run_flask():
 # STATE
 # =====================================================
 def load_state():
-    default = {"peaks": {}, "stops": {}, "last_trade": {}, "last_candle": {}}
+    default = {
+        "peaks": {}, "stops": {}, "last_trade": {}, "last_candle": {},
+        "trail_active": {}
+    }
     try:
         with open(STATE_FILE, "r") as f:
             saved = json.load(f)
@@ -121,8 +127,10 @@ def api_req(method, path, params=None, body=None):
         "User-Agent": "python-delta-testnet-bot",
     }
     try:
-        response = session.request(method, BASE_URL + path + query_string,
-                                   headers=headers, data=payload or None, timeout=(5, 15))
+        response = session.request(
+            method, BASE_URL + path + query_string,
+            headers=headers, data=payload or None, timeout=(5, 15)
+        )
         try:
             result = response.json()
         except Exception:
@@ -136,8 +144,10 @@ def api_req(method, path, params=None, body=None):
 # =====================================================
 def get_live_price(symbol):
     try:
-        r = session.get(BASE_URL + f"/v2/trades/{symbol}",
-                        headers={"Accept": "application/json"}, timeout=(5, 10))
+        r = session.get(
+            BASE_URL + f"/v2/trades/{symbol}",
+            headers={"Accept": "application/json"}, timeout=(5, 10)
+        )
         if r.status_code != 200:
             log(f"[TRADE PRICE ERROR] {symbol} HTTP={r.status_code}")
             return None
@@ -146,15 +156,34 @@ def get_live_price(symbol):
             log(f"[TRADE PRICE ERROR] {symbol}: {data}")
             return None
         result = data.get("result", {})
-        trades = result.get("trades", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+        trades = result.get("trades", []) if isinstance(result, dict) else (
+            result if isinstance(result, list) else []
+        )
         if not trades:
             log(f"[NO RECENT TRADES] {symbol}")
             return None
-        latest = max(trades, key=lambda x: int(x.get("timestamp", 0)))
-        price = float(latest.get("price", 0))
-        if price <= 0:
+
+        def trade_ts(t):
+            raw = t.get("timestamp", t.get("t", t.get("created_at", 0)))
+            try:
+                ts = float(raw)
+                if ts > 1e14:
+                    ts /= 1_000_000
+                elif ts > 1e11:
+                    ts /= 1_000
+                return ts
+            except Exception:
+                return 0
+
+        latest = max(trades, key=trade_ts)
+        ts = trade_ts(latest)
+        price_raw = latest.get("price", latest.get("p", 0))
+        price = float(price_raw or 0)
+        age = time.time() - ts if ts else 999999
+        if price <= 0 or ts <= 0 or age < -10 or age > MAX_TRADE_AGE_SECONDS:
+            log(f"[STALE/INVALID PRICE] {symbol} PRICE={price} AGE={age:.1f}s")
             return None
-        log(f"[LIVE TRADE PRICE] {symbol} PRICE={price} TIMESTAMP={latest.get('timestamp')}")
+        log(f"[LIVE TRADE PRICE] {symbol} PRICE={price} AGE={age:.1f}s")
         return price
     except Exception as e:
         log(f"[LIVE PRICE ERROR] {symbol}: {e}")
@@ -162,8 +191,10 @@ def get_live_price(symbol):
 
 def get_candles(symbol):
     end = int(time.time())
-    params = {"resolution": TIMEFRAME, "symbol": symbol,
-              "start": str(end - CANDLE_LOOKBACK_SECONDS), "end": str(end)}
+    params = {
+        "resolution": TIMEFRAME, "symbol": symbol,
+        "start": str(end - CANDLE_LOOKBACK_SECONDS), "end": str(end)
+    }
     res, code = api_req("GET", "/v2/history/candles", params=params)
     if code == 200 and isinstance(res, dict) and res.get("success") and res.get("result"):
         return res["result"]
@@ -174,71 +205,51 @@ def candles_to_df(candles):
     try:
         if not candles:
             return None
-
         if isinstance(candles[0], dict):
             df = pd.DataFrame(candles).copy()
         else:
             df = pd.DataFrame(
-                candles,
-                columns=["time", "open", "high", "low", "close", "volume"]
+                candles, columns=["time", "open", "high", "low", "close", "volume"]
             )
-
         required = ["high", "low", "close", "volume"]
-
         if not all(c in df.columns for c in required):
             log(f"[CANDLE INVALID] Missing columns: {list(df.columns)}")
             return None
-
         for c in required:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-
         if "time" not in df.columns:
             log("[CANDLE INVALID] Timestamp column missing")
             return None
-
         df["time"] = pd.to_numeric(df["time"], errors="coerce")
         df = df.dropna(subset=["time"]).copy()
-
         if df.empty:
             return None
 
-        # Normalize timestamp: seconds, milliseconds or microseconds
         def normalize_ts(value):
             value = float(value)
-
             if value > 1e14:
-                value = value / 1_000_000
+                value /= 1_000_000
             elif value > 1e11:
-                value = value / 1_000
-
+                value /= 1_000
             return int(value)
 
         df["time"] = df["time"].apply(normalize_ts)
         df = df.sort_values("time").drop_duplicates("time")
-
         now = int(time.time())
-        candle_seconds = 300
-
-        # Keep only fully closed candles
-        df = df[df["time"] + candle_seconds <= now]
-
+        df = df[df["time"] + 300 <= now]
         df = df.dropna(subset=required).reset_index(drop=True)
-
         log(
             f"[CANDLE CHECK] rows={len(df)} "
-            f"last_time={int(df['time'].iloc[-1]) if len(df) else 'NONE'} "
-            f"now={now}"
+            f"last_time={int(df['time'].iloc[-1]) if len(df) else 'NONE'} now={now}"
         )
-
         if len(df) < 120:
             log(f"[CANDLE INSUFFICIENT] Only {len(df)} closed candles")
             return None
-
         return df
-
     except Exception as e:
         log(f"[CANDLE PARSE ERROR] {e}")
         return None
+
 # =====================================================
 # INDICATORS / SIGNAL
 # =====================================================
@@ -271,7 +282,9 @@ def add_indicators(df):
     plus_dm.loc[(up_move > down_move) & (up_move > 0)] = up_move
     minus_dm.loc[(down_move > up_move) & (down_move > 0)] = down_move
     prev_close = close.shift(1)
-    tr = pd.concat([(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1).max(axis=1)
+    tr = pd.concat(
+        [(high-low), (high-prev_close).abs(), (low-prev_close).abs()], axis=1
+    ).max(axis=1)
     atr = tr.ewm(alpha=1/ADX_PERIOD, adjust=False, min_periods=ADX_PERIOD).mean()
     plus_s = plus_dm.ewm(alpha=1/ADX_PERIOD, adjust=False, min_periods=ADX_PERIOD).mean()
     minus_s = minus_dm.ewm(alpha=1/ADX_PERIOD, adjust=False, min_periods=ADX_PERIOD).mean()
@@ -291,23 +304,38 @@ def check_signal(candles, symbol):
     try:
         df = add_indicators(df)
         last = df.iloc[-1]
-        fields = ["ema9", "ema21", "ema100", "rsi", "vol_avg", "adx", "macd", "macd_signal", "atr"]
+        fields = [
+            "ema9", "ema21", "ema100", "rsi", "vol_avg",
+            "adx", "macd", "macd_signal", "atr"
+        ]
         if any(pd.isna(last[x]) for x in fields):
             log(f"[SCAN] {symbol} indicator data not ready")
             return None, None
         close_px = float(last["close"])
-        ema9, ema21, ema100 = float(last["ema9"]), float(last["ema21"]), float(last["ema100"])
-        rsi, vol, vol_avg, adx = float(last["rsi"]), float(last["volume"]), float(last["vol_avg"]), float(last["adx"])
-        macd, macd_sig, atr_val = float(last["macd"]), float(last["macd_signal"]), float(last["atr"])
-        candle_id = int(last["time"]) if "time" in df.columns and pd.notna(last["time"]) else int(time.time() // 300) * 300
-        if candle_id > 10_000_000_000:
-            candle_id //= 1000
-        log(f"[SCAN] {symbol} Candle={candle_id} Close={close_px:.4f} EMA9={ema9:.4f} EMA21={ema21:.4f} EMA100={ema100:.4f} RSI={rsi:.1f} VOL={vol:.0f}/{vol_avg:.0f} ADX={adx:.1f} MACD={macd:.5f}/{macd_sig:.5f} ATR={atr_val:.5f}")
+        ema9, ema21, ema100 = (
+            float(last["ema9"]), float(last["ema21"]), float(last["ema100"])
+        )
+        rsi = float(last["rsi"])
+        vol, vol_avg, adx = float(last["volume"]), float(last["vol_avg"]), float(last["adx"])
+        macd, macd_sig = float(last["macd"]), float(last["macd_signal"])
+        candle_id = int(last["time"])
+        log(
+            f"[SCAN] {symbol} Candle={candle_id} Close={close_px:.4f} "
+            f"EMA9={ema9:.4f} EMA21={ema21:.4f} EMA100={ema100:.4f} "
+            f"RSI={rsi:.1f} VOL={vol:.0f}/{vol_avg:.0f} ADX={adx:.1f} "
+            f"MACD={macd:.5f}/{macd_sig:.5f}"
+        )
         if adx < MIN_ADX:
             log(f"[NO TRADE] {symbol} ADX={adx:.1f} BELOW {MIN_ADX}")
             return None, candle_id
-        buy = ema9 > ema21 and close_px > ema100 and 45 <= rsi <= 70 and macd > macd_sig and vol > vol_avg * 0.6
-        sell = ema9 < ema21 and close_px < ema100 and 30 <= rsi <= 55 and macd < macd_sig and vol > vol_avg * 0.6
+        buy = (
+            ema9 > ema21 and close_px > ema100 and 45 <= rsi <= 70
+            and macd > macd_sig and vol > vol_avg * 0.6
+        )
+        sell = (
+            ema9 < ema21 and close_px < ema100 and 30 <= rsi <= 55
+            and macd < macd_sig and vol > vol_avg * 0.6
+        )
         if buy:
             log(f"[SIGNAL BUY] {symbol} ADX={adx:.1f}")
             return "buy", candle_id
@@ -337,10 +365,13 @@ def get_pos():
 
 def parse_pos_symbol(p):
     product = p.get("product") or {}
-    return p.get("product_symbol") or product.get("symbol") or ""
+    return p.get("product_symbol") or product.get("symbol") or p.get("symbol") or ""
 
 def get_orders():
-    res, code = api_req("GET", "/v2/orders", params={"states": "open,pending", "page_size": 100})
+    res, code = api_req(
+        "GET", "/v2/orders",
+        params={"states": "open,pending", "page_size": 100}
+    )
     if code == 200 and isinstance(res, dict) and res.get("success") is True:
         result = res.get("result", [])
         if isinstance(result, list):
@@ -349,40 +380,54 @@ def get_orders():
     return None
 
 def is_active_stop(order, symbol):
-    return (order.get("product_symbol") == symbol and order.get("stop_order_type") == "stop_loss_order" and order.get("state") in ("open", "pending"))
+    return (
+        order.get("product_symbol") == symbol
+        and order.get("stop_order_type") == "stop_loss_order"
+        and order.get("state") in ("open", "pending")
+        and order.get("reduce_only") in (True, 1, "true", "True")
+    )
+
+def active_stop_orders(symbol, orders=None):
+    if orders is None:
+        orders = get_orders()
+    if orders is None:
+        return None
+    return [o for o in orders if is_active_stop(o, symbol)]
 
 def verify_stop(symbol, order_id):
     orders = get_orders()
     if orders is None:
         return False
-    for order in orders:
-        if str(order.get("id")) == str(order_id):
-            return is_active_stop(order, symbol) and order.get("reduce_only") in (True, 1, "true", "True")
-    return False
+    return any(
+        str(o.get("id")) == str(order_id) and is_active_stop(o, symbol)
+        for o in orders
+    )
 
 def cancel_stop(order):
     order_id, product_id = order.get("id"), order.get("product_id")
     if not order_id or not product_id:
         log("[CANCEL ERROR] Order ID/product ID missing")
         return False
-    res, code = api_req("DELETE", "/v2/orders", body={"id": int(order_id), "product_id": int(product_id)})
-    if code == 200 and isinstance(res, dict) and res.get("success"):
-        log(f"[CANCEL SENT] ID={order_id}")
-        return True
-    log(f"[CANCEL FAILED] ID={order_id} HTTP={code} {res}")
-    return False
+    res, code = api_req(
+        "DELETE", "/v2/orders",
+        body={"id": int(order_id), "product_id": int(product_id)}
+    )
+    if code != 200 or not isinstance(res, dict) or not res.get("success"):
+        log(f"[CANCEL FAILED] ID={order_id} HTTP={code} {res}")
+        return False
 
-def cancel_old_stops(symbol, keep_order_id):
+    # Verify cancellation by checking open/pending orders again.
+    time.sleep(0.7)
     orders = get_orders()
     if orders is None:
-        log("[CANCEL BLOCKED] Cannot verify open orders")
+        log(f"[CANCEL UNVERIFIED] ID={order_id}")
         return False
-    ok = True
-    for order in orders:
-        if is_active_stop(order, symbol) and str(order.get("id")) != str(keep_order_id):
-            if not cancel_stop(order):
-                ok = False
-    return ok
+    still_open = any(str(o.get("id")) == str(order_id) for o in orders)
+    if still_open:
+        log(f"[CANCEL NOT CONFIRMED] ID={order_id}")
+        return False
+    log(f"[CANCEL VERIFIED] ID={order_id}")
+    return True
 
 def valid_stop_price(position_side, stop_price, live_price):
     if live_price is None or live_price <= 0 or stop_price is None or stop_price <= 0:
@@ -401,38 +446,102 @@ def place_stop(symbol, position_side, size, stop_price):
         return False
     live = get_live_price(symbol)
     if live is None or not valid_stop_price(position_side, stop_price, live):
-        log(f"[STOP BLOCKED] {symbol} SIDE={position_side} STOP={stop_price:.4f} LAST={live} wrong-side/too-close")
+        log(
+            f"[STOP BLOCKED] {symbol} SIDE={position_side} "
+            f"STOP={stop_price:.4f} LAST={live} wrong-side/too-close"
+        )
         return False
+
     stop_side = "sell" if position_side == "buy" else "buy"
-    body = {"product_symbol": symbol, "size": sz, "side": stop_side,
-            "order_type": "market_order", "stop_order_type": "stop_loss_order",
-            "stop_price": f"{float(stop_price):.2f}", "reduce_only": True,
-            "stop_trigger_method": "last_traded_price"}
+    body = {
+        "product_symbol": symbol, "size": sz, "side": stop_side,
+        "order_type": "market_order", "stop_order_type": "stop_loss_order",
+        "stop_price": f"{float(stop_price):.2f}", "reduce_only": True,
+        "stop_trigger_method": "last_traded_price"
+    }
     res, code = api_req("POST", "/v2/orders", body=body)
     result = res.get("result", {}) if isinstance(res, dict) else {}
     if code != 200 or res.get("success") is not True or not result.get("id"):
         log(f"[STOP FAILED] {symbol} HTTP={code} {res}")
         return False
+
     order_id = result["id"]
     time.sleep(1)
     if not verify_stop(symbol, order_id):
-        log(f"[STOP NOT VERIFIED] {symbol} ID={order_id}; old stop retained")
+        log(f"[STOP NOT VERIFIED] {symbol} ID={order_id}; existing stop retained")
         return False
+
+    # Record the new verified stop before attempting to cancel older stops.
     state["stops"][symbol] = float(stop_price)
+    state["stop_order_ids"] = state.get("stop_order_ids", {})
+    state["stop_order_ids"][symbol] = str(order_id)
     save_state()
     log(f"[STOP VERIFIED] {symbol} {stop_side.upper()} STOP={stop_price:.4f} ID={order_id}")
-    cancel_old_stops(symbol, order_id)
+
+    orders = get_orders()
+    if orders is None:
+        log(f"[OLD STOP RETAINED] {symbol}: cannot verify order list")
+        return True
+
+    for old in orders:
+        if is_active_stop(old, symbol) and str(old.get("id")) != str(order_id):
+            if not cancel_stop(old):
+                log(f"[OLD STOP NOT CANCELLED] {symbol} ID={old.get('id')}")
     return True
 
 # =====================================================
-# TRAILING STOP MANAGEMENT
+# PROFIT-TRIGGERED TRAILING STOP
 # =====================================================
+def position_unrealized_pnl(position):
+    # Delta margined positions document exposes unrealized_pnl in USD.
+    for key in ("unrealized_pnl", "unrealizedPnl"):
+        value = position.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    return None
+
+def recover_stop_state(symbol, position_side, orders):
+    """Recover the exchange's active stop after a Render restart."""
+    stops = [o for o in (orders or []) if is_active_stop(o, symbol)]
+    if not stops:
+        return float(state["stops"].get(symbol, 0) or 0), False
+
+    parsed = []
+    for order in stops:
+        try:
+            parsed.append((float(order.get("stop_price")), order))
+        except (TypeError, ValueError):
+            continue
+    if not parsed:
+        return float(state["stops"].get(symbol, 0) or 0), False
+
+    # For LONG keep the highest protective stop; for SHORT the lowest.
+    chosen_price, chosen_order = (
+        max(parsed, key=lambda x: x[0]) if position_side == "buy"
+        else min(parsed, key=lambda x: x[0])
+    )
+    state["stops"][symbol] = chosen_price
+    state.setdefault("stop_order_ids", {})[symbol] = str(chosen_order.get("id", ""))
+    # An exchange-side protective stop indicates trailing/stop management
+    # was already initialized before a process restart.
+    state["trail_active"][symbol] = bool(state["trail_active"].get(symbol, False))
+    return chosen_price, True
+
 def handle_trailing():
     positions = get_pos()
     if positions is None:
         log("[TRAIL BLOCKED] Position API unavailable")
         return
-    active = set()
+
+    orders = get_orders()
+    if orders is None:
+        log("[TRAIL BLOCKED] Cannot read open orders; leaving stops untouched")
+        return
+
+    active_symbols = set()
     for p in positions:
         try:
             size = float(p.get("size", 0) or 0)
@@ -441,58 +550,106 @@ def handle_trailing():
             symbol = parse_pos_symbol(p)
             if symbol not in COINS:
                 continue
-            active.add(symbol)
+            active_symbols.add(symbol)
+
             entry = float(p.get("entry_price") or p.get("average_price") or 0)
             if entry <= 0:
                 log(f"[TRAIL ERROR] {symbol} entry missing")
                 continue
+
             curr = get_live_price(symbol)
             if curr is None:
-                log(f"[TRAIL SKIP] {symbol} live price unavailable")
+                log(f"[TRAIL SKIP] {symbol} stale/unavailable live price")
                 continue
-            old_peak = float(state["peaks"].get(symbol, entry))
-            old_stop = float(state["stops"].get(symbol, 0))
-            if size > 0:  # LONG
-                new_peak = max(old_peak, entry, curr)
-                candidate = new_peak * (1 - TRAIL_PCT)
-                if old_stop >= curr:
-                    old_stop = 0
-                if old_stop > 0:
-                    candidate = max(candidate, old_stop)
-                if candidate >= curr:
-                    candidate = curr * (1 - TRAIL_PCT)
-                state["peaks"][symbol] = new_peak
-                log(f"[TRAIL] {symbol} LONG LIVE={curr:.4f} ENTRY={entry:.4f} PEAK={new_peak:.4f} STOP={candidate:.4f}")
-                if old_stop <= 0 or candidate > old_stop:
-                    if place_stop(symbol, "buy", size, candidate):
-                        log(f"[TRAIL UPDATED] {symbol} LONG")
-            else:  # SHORT
-                if old_peak <= 0:
-                    old_peak = entry
-                new_peak = min(old_peak, entry, curr)
-                candidate = new_peak * (1 + TRAIL_PCT)
-                if old_stop > 0 and old_stop <= curr:
-                    log(f"[STALE STOP IGNORED] {symbol} OLD_STOP={old_stop:.4f} LAST={curr:.4f}")
-                    old_stop = 0
-                if old_stop > 0:
-                    candidate = min(candidate, old_stop)
-                if candidate <= curr:
-                    candidate = curr * (1 + TRAIL_PCT)
-                state["peaks"][symbol] = new_peak
-                log(f"[TRAIL] {symbol} SHORT LIVE={curr:.4f} ENTRY={entry:.4f} LOW={new_peak:.4f} STOP={candidate:.4f}")
-                if old_stop <= 0 or candidate < old_stop:
-                    if place_stop(symbol, "sell", size, candidate):
-                        log(f"[TRAIL UPDATED] {symbol} SHORT")
+
+            pnl = position_unrealized_pnl(p)
+            if pnl is None:
+                log(f"[PROFIT DATA MISSING] {symbol}; cannot activate $5 trail safely")
+                continue
+
+            side = "buy" if size > 0 else "sell"
+            old_stop, exchange_stop_found = recover_stop_state(symbol, side, orders)
+
+            # Rebuild peak conservatively after restart. Never discard an
+            # exchange-side active stop. Do not lower a previously stored peak.
+            old_peak = float(state["peaks"].get(symbol, entry) or entry)
+            if side == "buy":
+                peak = max(old_peak, entry, curr)
+            else:
+                peak = min(old_peak, entry, curr)
+
+            was_active = bool(state["trail_active"].get(symbol, False))
+            if not was_active and pnl >= TRAIL_ACTIVATE_PROFIT_USD:
+                state["trail_active"][symbol] = True
+                was_active = True
+                log(
+                    f"[TRAIL ACTIVATED] {symbol} PNL=${pnl:.2f} "
+                    f">= ${TRAIL_ACTIVATE_PROFIT_USD:.2f}"
+                )
+
+            state["peaks"][symbol] = peak
+
+            # Before +$5, retain the initial protective stop; do not trail.
+            if not was_active:
+                log(
+                    f"[WAIT $5] {symbol} PNL=${pnl:.2f} "
+                    f"TARGET=${TRAIL_ACTIVATE_PROFIT_USD:.2f} "
+                    f"STOP={old_stop or 'not recorded'}"
+                )
+                save_state()
+                continue
+
+            candidate = (
+                peak * (1 - TRAIL_PCT) if side == "buy"
+                else peak * (1 + TRAIL_PCT)
+            )
+
+            # Enforce monotonic protection: a LONG stop can only rise;
+            # a SHORT stop can only fall. Never reset an old stop to zero
+            # just because price has crossed it; let exchange order state decide.
+            if old_stop > 0:
+                candidate = max(candidate, old_stop) if side == "buy" else min(candidate, old_stop)
+
+            if not valid_stop_price(side, candidate, curr):
+                log(
+                    f"[TRAIL WAIT] {symbol} candidate={candidate:.4f} "
+                    f"live={curr:.4f}; existing stop retained"
+                )
+                save_state()
+                continue
+
+            improvement = (
+                old_stop <= 0 or candidate > old_stop
+                if side == "buy"
+                else old_stop <= 0 or candidate < old_stop
+            )
+            log(
+                f"[TRAIL] {symbol} SIDE={side.upper()} PNL=${pnl:.2f} "
+                f"PEAK={peak:.4f} OLD_STOP={old_stop:.4f} "
+                f"NEW_STOP={candidate:.4f}"
+            )
+            if improvement:
+                place_stop(symbol, side, size, candidate)
             save_state()
+
         except Exception as e:
-            log(f"[TRAIL ERROR] {symbol if 'symbol' in locals() else '?'}: {e}")
+            log(f"[TRAIL ERROR] {p.get('product_symbol', '?')}: {e}")
+
+    # Clear only local state for symbols no longer in open positions.
+    # Exchange orders are not cancelled here; manual/exchange review is safer.
+    for symbol in list(state["peaks"].keys()):
+        if symbol in COINS and symbol not in active_symbols:
+            state["peaks"].pop(symbol, None)
+            state["stops"].pop(symbol, None)
+            state.get("trail_active", {}).pop(symbol, None)
+            state.get("stop_order_ids", {}).pop(symbol, None)
+    save_state()
 
 # =====================================================
 # INITIAL PROTECTIVE STOP AFTER ENTRY
 # =====================================================
 def initialize_new_position(symbol):
-    # Wait briefly for the exchange position endpoint to reflect the filled order.
-    for attempt in range(5):
+    for attempt in range(6):
         time.sleep(2)
         positions = get_pos()
         if positions is None:
@@ -506,17 +663,24 @@ def initialize_new_position(symbol):
         curr = get_live_price(symbol)
         if not size or entry <= 0 or curr is None:
             continue
+
         if size > 0:
             stop_price = curr * (1 - TRAIL_PCT)
             state["peaks"][symbol] = max(entry, curr)
-            pos_side = "buy"
+            side = "buy"
         else:
             stop_price = curr * (1 + TRAIL_PCT)
             state["peaks"][symbol] = min(entry, curr)
-            pos_side = "sell"
+            side = "sell"
+
+        state["trail_active"][symbol] = False
         save_state()
-        log(f"[INITIAL STOP] {symbol} ENTRY={entry:.4f} LIVE={curr:.4f} STOP={stop_price:.4f}")
-        return place_stop(symbol, pos_side, size, stop_price)
+        log(
+            f"[INITIAL PROTECTIVE STOP] {symbol} ENTRY={entry:.4f} "
+            f"LIVE={curr:.4f} STOP={stop_price:.4f}; trail waits for +$5"
+        )
+        return place_stop(symbol, side, size, stop_price)
+
     log(f"[INITIAL STOP FAILED] {symbol} position not confirmed; check Testnet immediately")
     return False
 
@@ -526,22 +690,32 @@ def initialize_new_position(symbol):
 def price_mismatch_ok(symbol, candle_close):
     live = get_live_price(symbol)
     if live is None or candle_close <= 0:
-        log(f"[ENTRY BLOCKED] {symbol} live/candle price unavailable")
+        log(f"[ENTRY BLOCKED] {symbol} live/candle price unavailable or stale")
         return False
     gap_pct = abs(live - candle_close) / candle_close
-    log(f"[PRICE CHECK] {symbol} CANDLE={candle_close:.4f} LIVE={live:.4f} GAP={gap_pct*100:.3f}% LIMIT={MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
+    log(
+        f"[PRICE CHECK] {symbol} CANDLE={candle_close:.4f} LIVE={live:.4f} "
+        f"GAP={gap_pct*100:.3f}% LIMIT={MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%"
+    )
     if gap_pct > MAX_CANDLE_LIVE_GAP_PCT:
-        log(f"[ENTRY BLOCKED] {symbol} candle/live price mismatch {gap_pct*100:.3f}%")
+        log(f"[ENTRY BLOCKED] {symbol} candle/live mismatch {gap_pct*100:.3f}%")
         return False
     return True
 
 def place_entry(symbol, side):
-    body = {"product_symbol": symbol, "size": ORDER_SIZES.get(symbol, ORDER_SIZE),
-            "side": side, "order_type": "market_order"}
+    body = {
+        "product_symbol": symbol,
+        "size": ORDER_SIZES.get(symbol, ORDER_SIZE),
+        "side": side,
+        "order_type": "market_order"
+    }
     res, code = api_req("POST", "/v2/orders", body=body)
     result = res.get("result", {}) if isinstance(res, dict) else {}
     if code == 200 and isinstance(res, dict) and res.get("success") is True:
-        log(f"[ENTRY ACCEPTED] {symbol} {side.upper()} SIZE={ORDER_SIZES.get(symbol, ORDER_SIZE)} RESULT={result}")
+        log(
+            f"[ENTRY ACCEPTED] {symbol} {side.upper()} "
+            f"SIZE={ORDER_SIZES.get(symbol, ORDER_SIZE)} RESULT={result}"
+        )
         return True
     log(f"[ENTRY FAILED] {symbol} HTTP={code} {res}")
     return False
@@ -553,73 +727,97 @@ def main_loop():
     log("==================================================")
     log("DELTA EXCHANGE INDIA TESTNET AUTO BOT STARTED")
     log(f"AUTO TRADING = {'ON' if ENABLE_TRADING else 'OFF'}")
+    log(f"LEVERAGE SETTING = {LEVERAGE}x (not changed by this script)")
     log("EMA 9/21/100 + RSI14 + ADX14 + MACD(12,26,9) + VOLUME MA20")
     log(f"ADX FILTER = {MIN_ADX} | PRICE GAP LIMIT = {MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
-    log(f"TRAILING STOP = {TRAIL_PCT*100:.2f}% | MAX POSITIONS = {MAX_POSITIONS}")
-    log(f"COINS = {COINS}")
+    log(
+        f"INITIAL STOP DISTANCE = {TRAIL_PCT*100:.2f}% | "
+        f"TRAIL ACTIVATION = ${TRAIL_ACTIVATE_PROFIT_USD:.2f} "
+        f"| TRAIL DISTANCE = {TRAIL_PCT*100:.2f}%"
+    )
+    log(f"MAX POSITIONS = {MAX_POSITIONS} | COINS = {COINS}")
     log("==================================================")
+
     while True:
         try:
-            # Always manage existing positions before scanning for new entries.
             handle_trailing()
             positions = get_pos()
             if positions is None:
                 log("[SCAN BLOCKED] Position API unavailable")
                 time.sleep(CHECK_INTERVAL)
                 continue
-            held = list({parse_pos_symbol(p) for p in positions if parse_pos_symbol(p) in COINS})
+
+            held = list({
+                parse_pos_symbol(p) for p in positions
+                if parse_pos_symbol(p) in COINS
+            })
             log(f"[POS HELD] {held} TOTAL={len(held)}")
+
             if not ENABLE_TRADING:
-                log("[SAFE MODE] New entries disabled; trailing management remains active")
+                log("[SAFE MODE] New entries disabled; protective stop management remains active")
                 time.sleep(CHECK_INTERVAL)
                 continue
+
             if len(held) >= MAX_POSITIONS:
                 log("[MAX POSITIONS] No new entry")
                 time.sleep(CHECK_INTERVAL)
                 continue
+
             for symbol in COINS:
                 if len(held) >= MAX_POSITIONS:
                     break
                 if symbol in held:
                     continue
+
                 last_trade = float(state["last_trade"].get(symbol, 0) or 0)
                 remaining = COOLDOWN_SECONDS - (time.time() - last_trade)
                 if remaining > 0:
                     log(f"[COOLDOWN] {symbol} {int(remaining)}s")
                     continue
+
                 candles = get_candles(symbol)
                 if not candles:
                     continue
                 signal, candle_id = check_signal(candles, symbol)
                 if candle_id is None:
                     continue
-                # One decision per completed candle, even if it produces no signal.
+
                 previous_candle = int(state["last_candle"].get(symbol, 0) or 0)
                 if candle_id <= previous_candle:
                     log(f"[CANDLE ALREADY CHECKED] {symbol} {candle_id}")
                     continue
+
                 state["last_candle"][symbol] = candle_id
                 save_state()
                 if not signal:
                     continue
+
                 log(f"[ENTRY SIGNAL] {symbol} {signal.upper()}")
-                # Verify the market/candle price relationship immediately before entry.
                 df = candles_to_df(candles)
                 if df is None or not price_mismatch_ok(symbol, float(df.iloc[-1]["close"])):
                     continue
-                # Set cooldown before sending to avoid duplicate orders if the API response is uncertain.
+
+                # Set cooldown before submission to reduce duplicate orders
+                # if the exchange response is delayed/ambiguous.
                 state["last_trade"][symbol] = time.time()
                 save_state()
+
                 if not place_entry(symbol, signal):
                     log(f"[ENTRY NOT CONFIRMED] {symbol}")
                     continue
+
                 held.append(symbol)
                 stop_ok = initialize_new_position(symbol)
-                log(f"[ENTRY COMPLETE] {symbol} STOP_VERIFIED={stop_ok}")
+                log(f"[ENTRY COMPLETE] {symbol} INITIAL_STOP_VERIFIED={stop_ok}")
                 if not stop_ok:
-                    log(f"[URGENT CHECK] {symbol}: entry accepted but stop not verified. Check Testnet position/orders immediately.")
+                    log(
+                        f"[URGENT CHECK] {symbol}: entry accepted but initial stop "
+                        "not verified. Check Testnet position/orders immediately."
+                    )
+
             log(f"--- SLEEP {CHECK_INTERVAL}s ---")
             time.sleep(CHECK_INTERVAL)
+
         except Exception as e:
             log(f"[MAIN LOOP ERROR] {e}")
             import traceback
@@ -630,5 +828,4 @@ if __name__ == "__main__":
     log("=== BOT STARTING ===")
     threading.Thread(target=run_flask, daemon=True).start()
     log("=== FLASK STARTED ===")
-
     main_loop()
