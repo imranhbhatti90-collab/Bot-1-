@@ -1,4 +1,3 @@
-import os
 import json
 import time
 import hmac
@@ -587,4 +586,5 @@ if __name__ == "__main__":
     log("=== BOT STARTING ===")
     threading.Thread(target=run_flask, daemon=True).start()
     log("=== FLASK STARTED ===")
+
     main_loop()
