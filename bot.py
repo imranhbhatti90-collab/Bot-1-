@@ -143,50 +143,77 @@ def api_req(method, path, params=None, body=None):
 # MARKET PRICE / CANDLES
 # =====================================================
 def get_live_price(symbol):
+    """
+    Use Delta's product ticker endpoint. The trades endpoint may keep
+    returning an old execution for a less-active contract like SILVERUSD.
+    """
     try:
         r = session.get(
-            BASE_URL + f"/v2/trades/{symbol}",
-            headers={"Accept": "application/json"}, timeout=(5, 10)
+            BASE_URL + f"/v2/tickers/{symbol}",
+            headers={"Accept": "application/json"},
+            timeout=(5, 10)
         )
         if r.status_code != 200:
-            log(f"[TRADE PRICE ERROR] {symbol} HTTP={r.status_code}")
-            return None
-        data = r.json()
-        if data.get("success") is not True:
-            log(f"[TRADE PRICE ERROR] {symbol}: {data}")
-            return None
-        result = data.get("result", {})
-        trades = result.get("trades", []) if isinstance(result, dict) else (
-            result if isinstance(result, list) else []
-        )
-        if not trades:
-            log(f"[NO RECENT TRADES] {symbol}")
+            log(f"[TICKER PRICE ERROR] {symbol} HTTP={r.status_code}")
             return None
 
-        def trade_ts(t):
-            raw = t.get("timestamp", t.get("t", t.get("created_at", 0)))
+        data = r.json()
+        if data.get("success") is not True:
+            log(f"[TICKER PRICE ERROR] {symbol}: {data}")
+            return None
+
+        result = data.get("result", {})
+        if isinstance(result, list):
+            result = next(
+                (item for item in result if item.get("symbol") == symbol),
+                result[0] if result else {}
+            )
+        if not isinstance(result, dict) or not result:
+            log(f"[TICKER EMPTY] {symbol}: {data}")
+            return None
+
+        # Prefer latest traded/closing price; mark_price is a logged fallback.
+        price_source = "close"
+        price_raw = result.get("close")
+        if price_raw in (None, "", 0, "0"):
+            price_raw = result.get("mark_price")
+            price_source = "mark_price_fallback"
+        price = float(price_raw or 0)
+
+        raw_ts = result.get("timestamp")
+        ts = 0.0
+        if raw_ts not in (None, ""):
             try:
-                ts = float(raw)
+                ts = float(raw_ts)
                 if ts > 1e14:
                     ts /= 1_000_000
                 elif ts > 1e11:
                     ts /= 1_000
-                return ts
-            except Exception:
-                return 0
+            except (TypeError, ValueError):
+                try:
+                    from datetime import datetime
+                    ts = datetime.fromisoformat(
+                        str(raw_ts).replace("Z", "+00:00")
+                    ).timestamp()
+                except Exception:
+                    ts = 0.0
 
-        latest = max(trades, key=trade_ts)
-        ts = trade_ts(latest)
-        price_raw = latest.get("price", latest.get("p", 0))
-        price = float(price_raw or 0)
         age = time.time() - ts if ts else 999999
         if price <= 0 or ts <= 0 or age < -10 or age > MAX_TRADE_AGE_SECONDS:
-            log(f"[STALE/INVALID PRICE] {symbol} PRICE={price} AGE={age:.1f}s")
+            log(
+                f"[STALE/INVALID TICKER] {symbol} PRICE={price} "
+                f"SOURCE={price_source} AGE={age:.1f}s"
+            )
             return None
-        log(f"[LIVE TRADE PRICE] {symbol} PRICE={price} AGE={age:.1f}s")
+
+        log(
+            f"[LIVE TICKER PRICE] {symbol} PRICE={price} "
+            f"SOURCE={price_source} AGE={age:.1f}s"
+        )
         return price
+
     except Exception as e:
-        log(f"[LIVE PRICE ERROR] {symbol}: {e}")
+        log(f"[LIVE TICKER ERROR] {symbol}: {e}")
         return None
 
 def get_candles(symbol):
