@@ -47,7 +47,7 @@ VOLUME_PERIOD = 20
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-CANDLE_LOOKBACK_SECONDS = 600 * 60
+CANDLE_LOOKBACK_SECONDS = 900 * 60
 
 # =====================================================
 # APP / LOGGING
@@ -171,31 +171,74 @@ def get_candles(symbol):
     return []
 
 def candles_to_df(candles):
-    if not candles:
-        return None
-    if isinstance(candles[0], dict):
-        df = pd.DataFrame(candles).copy()
-    else:
-        df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
-    required = ["high", "low", "close", "volume"]
-    if not all(c in df.columns for c in required):
-        return None
-    for c in required:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    if "time" in df.columns:
-        df["time"] = pd.to_numeric(df["time"], errors="coerce")
-        df = df.sort_values("time")
-        # Exclude the still-forming 5-minute candle. Delta candle timestamps are Unix seconds.
-        now = int(time.time())
-        if df["time"].notna().any():
-            last_ts = int(df["time"].dropna().iloc[-1])
-            if last_ts > 10_000_000_000:  # tolerate millisecond timestamps
-                last_ts //= 1000
-            if now < last_ts + 300:
-                df = df.iloc[:-1]
-    df = df.dropna(subset=required).reset_index(drop=True)
-    return df if len(df) >= 120 else None
+    try:
+        if not candles:
+            return None
 
+        if isinstance(candles[0], dict):
+            df = pd.DataFrame(candles).copy()
+        else:
+            df = pd.DataFrame(
+                candles,
+                columns=["time", "open", "high", "low", "close", "volume"]
+            )
+
+        required = ["high", "low", "close", "volume"]
+
+        if not all(c in df.columns for c in required):
+            log(f"[CANDLE INVALID] Missing columns: {list(df.columns)}")
+            return None
+
+        for c in required:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        if "time" not in df.columns:
+            log("[CANDLE INVALID] Timestamp column missing")
+            return None
+
+        df["time"] = pd.to_numeric(df["time"], errors="coerce")
+        df = df.dropna(subset=["time"]).copy()
+
+        if df.empty:
+            return None
+
+        # Normalize timestamp: seconds, milliseconds or microseconds
+        def normalize_ts(value):
+            value = float(value)
+
+            if value > 1e14:
+                value = value / 1_000_000
+            elif value > 1e11:
+                value = value / 1_000
+
+            return int(value)
+
+        df["time"] = df["time"].apply(normalize_ts)
+        df = df.sort_values("time").drop_duplicates("time")
+
+        now = int(time.time())
+        candle_seconds = 300
+
+        # Keep only fully closed candles
+        df = df[df["time"] + candle_seconds <= now]
+
+        df = df.dropna(subset=required).reset_index(drop=True)
+
+        log(
+            f"[CANDLE CHECK] rows={len(df)} "
+            f"last_time={int(df['time'].iloc[-1]) if len(df) else 'NONE'} "
+            f"now={now}"
+        )
+
+        if len(df) < 120:
+            log(f"[CANDLE INSUFFICIENT] Only {len(df)} closed candles")
+            return None
+
+        return df
+
+    except Exception as e:
+        log(f"[CANDLE PARSE ERROR] {e}")
+        return None
 # =====================================================
 # INDICATORS / SIGNAL
 # =====================================================
