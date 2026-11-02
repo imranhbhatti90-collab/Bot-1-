@@ -20,6 +20,7 @@ API_SECRET = os.getenv("DELTA_API_SECRET", "")
 
 COINS = ["BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "SILVERUSD"]
 TIMEFRAME = "5m"
+TREND_TIMEFRAME = "15m"
 ORDER_SIZE = 40
 ORDER_SIZES = {
     "BTCUSD": 40, "ETHUSD": 40, "SOLUSD": 40,
@@ -38,16 +39,19 @@ MIN_STOP_GAP_PCT = 0.0005
 MAX_CANDLE_LIVE_GAP_PCT = 0.005
 MAX_TRADE_AGE_SECONDS = 30
 ADX_PERIOD = 14
-MIN_ADX = 25.0
-EMA_FAST = 9
-EMA_SLOW = 21
-EMA_TREND = 100
+MIN_ADX = 20.0
+EMA_FAST = 20
+EMA_SLOW = 50
+EMA_TREND = 200
+BREAKOUT_LOOKBACK = 20
+RETEST_ATR_TOLERANCE = 0.35
+MIN_VOLUME_MULTIPLIER = 1.0
 RSI_PERIOD = 14
 VOLUME_PERIOD = 20
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-CANDLE_LOOKBACK_SECONDS = 900 * 60
+CANDLE_LOOKBACK_SECONDS = 2 * 24 * 60 * 60
 
 # =====================================================
 # APP / LOGGING
@@ -68,6 +72,7 @@ def health():
     return jsonify({
         "status": "ok", "bot": "running", "environment": "TESTNET",
         "automatic_trading": ENABLE_TRADING, "max_positions": MAX_POSITIONS,
+        "strategy": "5m breakout-retest + 15m trend confirmation",
         "trailing_method": "ATR-based breakeven + chandelier trail",
         "atr_multiplier": ATR_STOP_MULTIPLIER
     }), 200
@@ -257,11 +262,14 @@ def get_live_price(symbol):
         log(f"[TICKER PRICE ERROR] {symbol}: {e}")
         return None
 
-def get_candles(symbol):
+def get_candles(symbol, resolution=TIMEFRAME):
     end = int(time.time())
+    # Keep the original 15-hour 5m window for trailing ATR; use 10 days
+    # for 15m trend confirmation so EMA200 has enough closed candles.
+    lookback = CANDLE_LOOKBACK_SECONDS if resolution == "5m" else 10 * 24 * 60 * 60
     params = {
-        "resolution": TIMEFRAME, "symbol": symbol,
-        "start": str(end - CANDLE_LOOKBACK_SECONDS), "end": str(end)
+        "resolution": resolution, "symbol": symbol,
+        "start": str(end - lookback), "end": str(end)
     }
     res, code = api_req("GET", "/v2/history/candles", params=params)
     if code == 200 and isinstance(res, dict) and res.get("success") and res.get("result"):
@@ -269,7 +277,7 @@ def get_candles(symbol):
     log(f"[CANDLE ERROR] {symbol} HTTP={code} {res}")
     return []
 
-def candles_to_df(candles):
+def candles_to_df(candles, resolution="5m"):
     try:
         if not candles:
             return None
@@ -304,7 +312,8 @@ def candles_to_df(candles):
         df["time"] = df["time"].apply(normalize_ts)
         df = df.sort_values("time").drop_duplicates("time")
         now = int(time.time())
-        df = df[df["time"] + 300 <= now]
+        interval_seconds = 900 if resolution == "15m" else 300
+        df = df[df["time"] + interval_seconds <= now]
         df = df.dropna(subset=required).reset_index(drop=True)
         log(
             f"[CANDLE CHECK] rows={len(df)} "
@@ -324,9 +333,9 @@ def candles_to_df(candles):
 def add_indicators(df):
     df = df.copy()
     close, high, low = df["close"], df["high"], df["low"]
-    df["ema9"] = close.ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema21"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
-    df["ema100"] = close.ewm(span=EMA_TREND, adjust=False).mean()
+    df["ema20"] = close.ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema50"] = close.ewm(span=EMA_SLOW, adjust=False).mean()
+    df["ema200"] = close.ewm(span=EMA_TREND, adjust=False).mean()
 
     delta = close.diff()
     gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
@@ -365,52 +374,73 @@ def add_indicators(df):
     return df
 
 def check_signal(candles, symbol):
-    df = candles_to_df(candles)
-    if df is None:
-        log(f"[SCAN] {symbol} insufficient/invalid/unfinished candle data")
+    """Intraday chart setup: 5m breakout/retest + 15m trend confirmation."""
+    df = candles_to_df(candles, resolution="5m")
+    if df is None or len(df) < 220:
+        log(f"[SCAN] {symbol} 5m candles insufficient for EMA200")
         return None, None
+
+    trend_candles = get_candles(symbol, resolution=TREND_TIMEFRAME)
+    trend_df = candles_to_df(trend_candles, resolution="15m") if trend_candles else None
+    if trend_df is None or len(trend_df) < 220:
+        log(f"[NO TRADE] {symbol} 15m trend candles insufficient for EMA200")
+        return None, int(df.iloc[-1]["time"])
+
     try:
         df = add_indicators(df)
+        trend_df = add_indicators(trend_df)
         last = df.iloc[-1]
-        fields = [
-            "ema9", "ema21", "ema100", "rsi", "vol_avg",
-            "adx", "macd", "macd_signal", "atr"
-        ]
-        if any(pd.isna(last[x]) for x in fields):
-            log(f"[SCAN] {symbol} indicator data not ready")
-            return None, None
+        prev = df.iloc[-2]
+        htf = trend_df.iloc[-1]
+        needed = ["ema20", "ema50", "ema200", "rsi", "vol_avg", "adx", "macd", "macd_signal", "atr"]
+        if any(pd.isna(last[x]) for x in needed) or any(pd.isna(htf[x]) for x in ["ema20", "ema50", "ema200"]):
+            log(f"[SCAN] {symbol} indicators not ready")
+            return None, int(last["time"])
+
         close_px = float(last["close"])
-        ema9, ema21, ema100 = (
-            float(last["ema9"]), float(last["ema21"]), float(last["ema100"])
-        )
-        rsi = float(last["rsi"])
-        vol, vol_avg, adx = float(last["volume"]), float(last["vol_avg"]), float(last["adx"])
-        macd, macd_sig = float(last["macd"]), float(last["macd_signal"])
+        high, low = float(last["high"]), float(last["low"])
+        ema20, ema50, ema200 = float(last["ema20"]), float(last["ema50"]), float(last["ema200"])
+        rsi, adx = float(last["rsi"]), float(last["adx"])
+        volume, vol_avg = float(last["volume"]), float(last["vol_avg"])
+        macd, macd_sig, atr = float(last["macd"]), float(last["macd_signal"]), float(last["atr"])
+        htf_close = float(htf["close"])
+        htf_bull = htf_close > float(htf["ema200"]) and float(htf["ema20"]) > float(htf["ema50"])
+        htf_bear = htf_close < float(htf["ema200"]) and float(htf["ema20"]) < float(htf["ema50"])
+
+        # Use only the preceding 20 closed candles to define the breakout level.
+        prior = df.iloc[-(BREAKOUT_LOOKBACK + 1):-1]
+        resistance = float(prior["high"].max())
+        support = float(prior["low"].min())
+        tolerance = max(atr * RETEST_ATR_TOLERANCE, close_px * 0.0005)
+        volume_ok = vol_avg > 0 and volume >= vol_avg * MIN_VOLUME_MULTIPLIER
+        trend_up = close_px > ema200 and ema20 > ema50
+        trend_down = close_px < ema200 and ema20 < ema50
+
+        # Retest candle must touch/approach the broken level and close back
+        # beyond it. A plain late breakout without a retest is not chased.
+        buy_retest = low <= resistance + tolerance and close_px > resistance
+        sell_retest = high >= support - tolerance and close_px < support
+        buy = (htf_bull and trend_up and buy_retest and 50 <= rsi <= 68
+               and adx >= MIN_ADX and macd > macd_sig and volume_ok)
+        sell = (htf_bear and trend_down and sell_retest and 32 <= rsi <= 50
+                and adx >= MIN_ADX and macd < macd_sig and volume_ok)
         candle_id = int(last["time"])
+
         log(
-            f"[SCAN] {symbol} Candle={candle_id} Close={close_px:.4f} "
-            f"EMA9={ema9:.4f} EMA21={ema21:.4f} EMA100={ema100:.4f} "
-            f"RSI={rsi:.1f} VOL={vol:.0f}/{vol_avg:.0f} ADX={adx:.1f} "
-            f"MACD={macd:.5f}/{macd_sig:.5f}"
-        )
-        if adx < MIN_ADX:
-            log(f"[NO TRADE] {symbol} ADX={adx:.1f} BELOW {MIN_ADX}")
-            return None, candle_id
-        buy = (
-            ema9 > ema21 and close_px > ema100 and 45 <= rsi <= 70
-            and macd > macd_sig and vol > vol_avg * 0.6
-        )
-        sell = (
-            ema9 < ema21 and close_px < ema100 and 30 <= rsi <= 55
-            and macd < macd_sig and vol > vol_avg * 0.6
+            f"[INTRADAY SCAN] {symbol} Candle={candle_id} Close={close_px:.4f} "
+            f"EMA20/50/200={ema20:.4f}/{ema50:.4f}/{ema200:.4f} "
+            f"15m={'BULL' if htf_bull else 'BEAR' if htf_bear else 'SIDEWAYS'} "
+            f"RSI={rsi:.1f} ADX={adx:.1f} MACD={macd:.5f}/{macd_sig:.5f} "
+            f"VOL={volume:.0f}/{vol_avg:.0f} RES={resistance:.4f} SUP={support:.4f} "
+            f"RETEST_TOL={tolerance:.5f}"
         )
         if buy:
-            log(f"[SIGNAL BUY] {symbol} ADX={adx:.1f}")
+            log(f"[INTRADAY SIGNAL BUY] {symbol} 5m breakout-retest + 15m bullish trend")
             return "buy", candle_id
         if sell:
-            log(f"[SIGNAL SELL] {symbol} ADX={adx:.1f}")
+            log(f"[INTRADAY SIGNAL SELL] {symbol} 5m breakdown-retest + 15m bearish trend")
             return "sell", candle_id
-        log(f"[NO TRADE] {symbol} filters not satisfied")
+        log(f"[NO TRADE] {symbol} intraday setup not fully confirmed")
         return None, candle_id
     except Exception as e:
         log(f"[SIGNAL ERROR] {symbol}: {e}")
@@ -788,10 +818,11 @@ def main_loop():
     log("DELTA EXCHANGE INDIA TESTNET AUTO BOT STARTED")
     log(f"AUTO TRADING = {'ON' if ENABLE_TRADING else 'OFF'}")
     log(f"LEVERAGE SETTING = {LEVERAGE}x (not changed by this script)")
-    log("EMA 9/21/100 + RSI14 + ADX14 + MACD(12,26,9) + VOLUME MA20")
+    log("INTRADAY: 5m breakout/retest + 15m EMA20/50/200 trend; RSI14 + ADX14 + MACD + VOLUME MA20")
     log(f"TRAIL PRICE SOURCE = LAST TRADED PRICE | STOP TRIGGER = {STOP_TRIGGER_METHOD}")
     log(f"TRAIL METHOD = ATR({ATR_PERIOD}) x {ATR_STOP_MULTIPLIER}; BE after one initial gap; then trail peak by same gap")
-    log(f"ADX FILTER = {MIN_ADX} | PRICE GAP LIMIT = {MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
+    log(f"ADX FILTER = {MIN_ADX} | BREAKOUT LOOKBACK = {BREAKOUT_LOOKBACK} | VOLUME >= {MIN_VOLUME_MULTIPLIER}x MA20")
+    log(f"RETEST TOLERANCE = {RETEST_ATR_TOLERANCE} x ATR | PRICE GAP LIMIT = {MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
     log(
         f"INITIAL/TRAIL GAP = {ATR_STOP_MULTIPLIER} x ATR({ATR_PERIOD}) on 5m candles | "
         "BREAKEVEN TRIGGER = one favourable initial gap"
