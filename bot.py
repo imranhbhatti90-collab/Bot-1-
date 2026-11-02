@@ -1,4 +1,4 @@
-import os
+ import os
 import json
 import time
 import hmac
@@ -29,7 +29,22 @@ MAX_POSITIONS = 6
 ENABLE_TRADING = True
 LEVERAGE = 50  # Informational setting; this script does not change account leverage.
 TRAIL_PCT = 0.003
-TRAIL_ACTIVATE_PROFIT_USD = 5.0
+STOP_TRIGGER_METHOD = "last_traded_price"  # Matches the active SILVERUSD stop
+TRAIL_ACTIVATE_PROFIT_USD = 5.0  # NET estimated PnL after entry + projected exit fees
+
+# Observed fee ratios from the user's uploaded Delta Testnet order-history CSV.
+# These are conservative estimates, not exchange-guaranteed fee schedules.
+# Re-check if Delta changes fees or the CSV's fee calculation changes.
+ESTIMATED_FEE_RATE = {
+    "BTCUSD": 0.05015, "ETHUSD": 0.05015, "SOLUSD": 0.05015,
+    "XAUTUSD": 0.01003, "PAXGUSD": 0.01003, "SILVERUSD": 0.01003,
+}
+# Contract multipliers inferred from the same CSV's Order Value / (Qty * Exec.Price).
+# Used only to estimate USD notional and fee drag for net-profit protection.
+CONTRACT_MULTIPLIER = {
+    "BTCUSD": 0.001, "ETHUSD": 0.01, "SOLUSD": 1.0,
+    "XAUTUSD": 0.001, "PAXGUSD": 0.001, "SILVERUSD": 0.1,
+}
 COOLDOWN_SECONDS = 300
 CHECK_INTERVAL = 30
 STATE_FILE = "state.json"
@@ -95,6 +110,12 @@ def load_state():
         return default
 
 state = load_state()
+# The previous bot activated trailing on gross PnL. Do not carry that activation
+# into the new fee-aware NET-PnL rule after an upgrade/restart.
+FEE_MODEL_VERSION = "csv_fee_estimate_v1"
+if state.get("fee_model_version") != FEE_MODEL_VERSION:
+    state["trail_active"] = {}
+    state["fee_model_version"] = FEE_MODEL_VERSION
 state_lock = threading.Lock()
 
 def save_state():
@@ -142,26 +163,100 @@ def api_req(method, path, params=None, body=None):
 # =====================================================
 # MARKET PRICE / CANDLES
 # =====================================================
+def _parse_market_timestamp(raw_ts):
+    """Convert Delta seconds/ms/us or ISO timestamp to Unix seconds."""
+    if raw_ts in (None, ""):
+        return 0.0
+    try:
+        ts = float(raw_ts)
+        if ts > 1e14:
+            ts /= 1_000_000
+        elif ts > 1e11:
+            ts /= 1_000
+        return ts
+    except (TypeError, ValueError):
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(
+                str(raw_ts).replace("Z", "+00:00")
+            ).timestamp()
+        except Exception:
+            return 0.0
+
+
+def _fresh_price(price_raw, raw_ts, symbol, source):
+    try:
+        price = float(price_raw or 0)
+    except (TypeError, ValueError):
+        return None
+    ts = _parse_market_timestamp(raw_ts)
+    age = time.time() - ts if ts else 999999
+    if price <= 0 or ts <= 0 or age < -10 or age > MAX_TRADE_AGE_SECONDS:
+        log(
+            f"[STALE/INVALID LAST PRICE] {symbol} PRICE={price} "
+            f"SOURCE={source} AGE={age:.1f}s"
+        )
+        return None
+    log(
+        f"[LIVE LAST PRICE] {symbol} PRICE={price:.8f} "
+        f"SOURCE={source} AGE={age:.1f}s"
+    )
+    return price
+
+
 def get_live_price(symbol):
+    """Return a fresh LAST traded price, never mark_price.
+
+    The exchange stop shown in the user's account is triggered by Last Price.
+    If no fresh trade/ticker close is available, return None so trailing and
+    new entries pause while the exchange-side protective stop remains intact.
     """
-    Use Delta's product ticker endpoint. The trades endpoint may keep
-    returning an old execution for a less-active contract like SILVERUSD.
-    """
+    # First choice: latest actual execution from the public trades endpoint.
+    try:
+        r = session.get(
+            BASE_URL + f"/v2/trades/{symbol}",
+            headers={"Accept": "application/json"}, timeout=(5, 10)
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("success") is True:
+                result = data.get("result", {})
+                trades = result.get("trades", []) if isinstance(result, dict) else (
+                    result if isinstance(result, list) else []
+                )
+                if trades:
+                    latest = max(
+                        trades,
+                        key=lambda t: _parse_market_timestamp(
+                            t.get("timestamp", t.get("t", t.get("created_at")))
+                        )
+                    )
+                    price = _fresh_price(
+                        latest.get("price", latest.get("p")),
+                        latest.get("timestamp", latest.get("t", latest.get("created_at"))),
+                        symbol, "recent_trade"
+                    )
+                    if price is not None:
+                        return price
+        else:
+            log(f"[TRADE PRICE HTTP] {symbol} HTTP={r.status_code}")
+    except Exception as e:
+        log(f"[TRADE PRICE ERROR] {symbol}: {e}")
+
+    # Fallback: ticker close is the last traded/closing price. Do not use
+    # mark_price here because the active exchange stop is set to Last Price.
     try:
         r = session.get(
             BASE_URL + f"/v2/tickers/{symbol}",
-            headers={"Accept": "application/json"},
-            timeout=(5, 10)
+            headers={"Accept": "application/json"}, timeout=(5, 10)
         )
         if r.status_code != 200:
             log(f"[TICKER PRICE ERROR] {symbol} HTTP={r.status_code}")
             return None
-
         data = r.json()
         if data.get("success") is not True:
             log(f"[TICKER PRICE ERROR] {symbol}: {data}")
             return None
-
         result = data.get("result", {})
         if isinstance(result, list):
             result = next(
@@ -171,49 +266,15 @@ def get_live_price(symbol):
         if not isinstance(result, dict) or not result:
             log(f"[TICKER EMPTY] {symbol}: {data}")
             return None
-
-        # Prefer latest traded/closing price; mark_price is a logged fallback.
-        price_source = "close"
-        price_raw = result.get("close")
-        if price_raw in (None, "", 0, "0"):
-            price_raw = result.get("mark_price")
-            price_source = "mark_price_fallback"
-        price = float(price_raw or 0)
-
-        raw_ts = result.get("timestamp")
-        ts = 0.0
-        if raw_ts not in (None, ""):
-            try:
-                ts = float(raw_ts)
-                if ts > 1e14:
-                    ts /= 1_000_000
-                elif ts > 1e11:
-                    ts /= 1_000
-            except (TypeError, ValueError):
-                try:
-                    from datetime import datetime
-                    ts = datetime.fromisoformat(
-                        str(raw_ts).replace("Z", "+00:00")
-                    ).timestamp()
-                except Exception:
-                    ts = 0.0
-
-        age = time.time() - ts if ts else 999999
-        if price <= 0 or ts <= 0 or age < -10 or age > MAX_TRADE_AGE_SECONDS:
-            log(
-                f"[STALE/INVALID TICKER] {symbol} PRICE={price} "
-                f"SOURCE={price_source} AGE={age:.1f}s"
-            )
+        close_price = result.get("close")
+        if close_price in (None, "", 0, "0"):
+            log(f"[NO FRESH LAST PRICE] {symbol}; mark_price intentionally ignored")
             return None
-
-        log(
-            f"[LIVE TICKER PRICE] {symbol} PRICE={price} "
-            f"SOURCE={price_source} AGE={age:.1f}s"
+        return _fresh_price(
+            close_price, result.get("timestamp"), symbol, "ticker_close"
         )
-        return price
-
     except Exception as e:
-        log(f"[LIVE TICKER ERROR] {symbol}: {e}")
+        log(f"[TICKER PRICE ERROR] {symbol}: {e}")
         return None
 
 def get_candles(symbol):
@@ -484,7 +545,7 @@ def place_stop(symbol, position_side, size, stop_price):
         "product_symbol": symbol, "size": sz, "side": stop_side,
         "order_type": "market_order", "stop_order_type": "stop_loss_order",
         "stop_price": f"{float(stop_price):.2f}", "reduce_only": True,
-        "stop_trigger_method": "last_traded_price"
+        "stop_trigger_method": STOP_TRIGGER_METHOD
     }
     res, code = api_req("POST", "/v2/orders", body=body)
     result = res.get("result", {}) if isinstance(res, dict) else {}
@@ -520,7 +581,7 @@ def place_stop(symbol, position_side, size, stop_price):
 # PROFIT-TRIGGERED TRAILING STOP
 # =====================================================
 def position_unrealized_pnl(position):
-    # Delta margined positions document exposes unrealized_pnl in USD.
+    """Gross unrealized PnL in USD as reported by Delta's position API."""
     for key in ("unrealized_pnl", "unrealizedPnl"):
         value = position.get(key)
         if value not in (None, ""):
@@ -529,6 +590,38 @@ def position_unrealized_pnl(position):
             except (TypeError, ValueError):
                 pass
     return None
+
+
+def estimate_round_trip_fees(symbol, size, entry_price, exit_price):
+    """Estimate entry + exit fees using observed CSV fee rates and contract multipliers."""
+    rate = ESTIMATED_FEE_RATE.get(symbol)
+    multiplier = CONTRACT_MULTIPLIER.get(symbol)
+    if rate is None or multiplier is None or entry_price <= 0 or exit_price <= 0:
+        return None
+    qty = abs(float(size))
+    entry_notional = qty * entry_price * multiplier
+    exit_notional = qty * exit_price * multiplier
+    return (entry_notional + exit_notional) * rate
+
+
+def stop_price_for_min_net_profit(symbol, side, size, entry, min_net_profit):
+    """Stop level estimated to retain at least min_net_profit after both-side fees."""
+    rate = ESTIMATED_FEE_RATE.get(symbol)
+    multiplier = CONTRACT_MULTIPLIER.get(symbol)
+    qty = abs(float(size))
+    if not rate or not multiplier or qty <= 0 or entry <= 0:
+        return None
+    exposure = qty * multiplier
+    entry_fee = entry * exposure * rate
+    if side == "buy":
+        # (stop-entry)*exposure - entry fee - stop*exposure*fee >= target
+        denom = exposure * (1.0 - rate)
+        if denom <= 0:
+            return None
+        return (entry * exposure + entry_fee + min_net_profit) / denom
+    # (entry-stop)*exposure - entry fee - stop*exposure*fee >= target
+    denom = exposure * (1.0 + rate)
+    return (entry * exposure - entry_fee - min_net_profit) / denom
 
 def recover_stop_state(symbol, position_side, orders):
     """Recover the exchange's active stop after a Render restart."""
@@ -589,12 +682,21 @@ def handle_trailing():
                 log(f"[TRAIL SKIP] {symbol} stale/unavailable live price")
                 continue
 
-            pnl = position_unrealized_pnl(p)
-            if pnl is None:
-                log(f"[PROFIT DATA MISSING] {symbol}; cannot activate $5 trail safely")
+            gross_pnl = position_unrealized_pnl(p)
+            if gross_pnl is None:
+                log(f"[PROFIT DATA MISSING] {symbol}; cannot activate net $5 trail safely")
                 continue
 
+            estimated_fees = estimate_round_trip_fees(symbol, size, entry, curr)
+            if estimated_fees is None:
+                log(f"[FEE ESTIMATE MISSING] {symbol}; trailing activation blocked")
+                continue
+            net_pnl = gross_pnl - estimated_fees
             side = "buy" if size > 0 else "sell"
+            log(
+                f"[NET PNL CHECK] {symbol} GROSS=${gross_pnl:.2f} "
+                f"EST_ROUND_TRIP_FEES=${estimated_fees:.2f} NET_EST=${net_pnl:.2f}"
+            )
             old_stop, exchange_stop_found = recover_stop_state(symbol, side, orders)
 
             # Rebuild peak conservatively after restart. Never discard an
@@ -606,11 +708,11 @@ def handle_trailing():
                 peak = min(old_peak, entry, curr)
 
             was_active = bool(state["trail_active"].get(symbol, False))
-            if not was_active and pnl >= TRAIL_ACTIVATE_PROFIT_USD:
+            if not was_active and net_pnl >= TRAIL_ACTIVATE_PROFIT_USD:
                 state["trail_active"][symbol] = True
                 was_active = True
                 log(
-                    f"[TRAIL ACTIVATED] {symbol} PNL=${pnl:.2f} "
+                    f"[TRAIL ACTIVATED] {symbol} NET_EST=${net_pnl:.2f} "
                     f">= ${TRAIL_ACTIVATE_PROFIT_USD:.2f}"
                 )
 
@@ -619,7 +721,7 @@ def handle_trailing():
             # Before +$5, retain the initial protective stop; do not trail.
             if not was_active:
                 log(
-                    f"[WAIT $5] {symbol} PNL=${pnl:.2f} "
+                    f"[WAIT NET $5] {symbol} NET_EST=${net_pnl:.2f} "
                     f"TARGET=${TRAIL_ACTIVATE_PROFIT_USD:.2f} "
                     f"STOP={old_stop or 'not recorded'}"
                 )
@@ -630,6 +732,20 @@ def handle_trailing():
                 peak * (1 - TRAIL_PCT) if side == "buy"
                 else peak * (1 + TRAIL_PCT)
             )
+
+            # Once net +$5 is reached, combine the 0.30% trailing stop with
+            # a fee-aware minimum-profit stop. This is an estimate; slippage,
+            # gaps and fee changes can still reduce the realised result.
+            profit_floor = stop_price_for_min_net_profit(
+                symbol, side, size, entry, TRAIL_ACTIVATE_PROFIT_USD
+            )
+            if profit_floor is None:
+                log(f"[NET LOCK BLOCKED] {symbol}; fee/contract model unavailable")
+                continue
+            if side == "buy":
+                candidate = max(candidate, profit_floor)
+            else:
+                candidate = min(candidate, profit_floor)
 
             # Enforce monotonic protection: a LONG stop can only rise;
             # a SHORT stop can only fall. Never reset an old stop to zero
@@ -651,7 +767,7 @@ def handle_trailing():
                 else old_stop <= 0 or candidate < old_stop
             )
             log(
-                f"[TRAIL] {symbol} SIDE={side.upper()} PNL=${pnl:.2f} "
+                f"[TRAIL] {symbol} SIDE={side.upper()} NET_EST=${net_pnl:.2f} "
                 f"PEAK={peak:.4f} OLD_STOP={old_stop:.4f} "
                 f"NEW_STOP={candidate:.4f}"
             )
@@ -756,6 +872,9 @@ def main_loop():
     log(f"AUTO TRADING = {'ON' if ENABLE_TRADING else 'OFF'}")
     log(f"LEVERAGE SETTING = {LEVERAGE}x (not changed by this script)")
     log("EMA 9/21/100 + RSI14 + ADX14 + MACD(12,26,9) + VOLUME MA20")
+    log(f"TRAIL PRICE SOURCE = LAST TRADED PRICE | STOP TRIGGER = {STOP_TRIGGER_METHOD}")
+    log("NET PROFIT MODEL = observed CSV fee rates + inferred contract multipliers (estimate)")
+    log(f"ESTIMATED FEE RATES = {ESTIMATED_FEE_RATE}")
     log(f"ADX FILTER = {MIN_ADX} | PRICE GAP LIMIT = {MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
     log(
         f"INITIAL STOP DISTANCE = {TRAIL_PCT*100:.2f}% | "
@@ -856,3 +975,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     log("=== FLASK STARTED ===")
     main_loop()
+  
