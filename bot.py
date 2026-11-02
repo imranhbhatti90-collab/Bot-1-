@@ -28,23 +28,9 @@ ORDER_SIZES = {
 MAX_POSITIONS = 6
 ENABLE_TRADING = True
 LEVERAGE = 50  # Informational setting; this script does not change account leverage.
-TRAIL_PCT = 0.003
+ATR_STOP_MULTIPLIER = 1.5
+ATR_PERIOD = 14
 STOP_TRIGGER_METHOD = "last_traded_price"  # Matches the active SILVERUSD stop
-TRAIL_ACTIVATE_PROFIT_USD = 5.0  # NET estimated PnL after entry + projected exit fees
-
-# Observed fee ratios from the user's uploaded Delta Testnet order-history CSV.
-# These are conservative estimates, not exchange-guaranteed fee schedules.
-# Re-check if Delta changes fees or the CSV's fee calculation changes.
-ESTIMATED_FEE_RATE = {
-    "BTCUSD": 0.05015, "ETHUSD": 0.05015, "SOLUSD": 0.05015,
-    "XAUTUSD": 0.01003, "PAXGUSD": 0.01003, "SILVERUSD": 0.01003,
-}
-# Contract multipliers inferred from the same CSV's Order Value / (Qty * Exec.Price).
-# Used only to estimate USD notional and fee drag for net-profit protection.
-CONTRACT_MULTIPLIER = {
-    "BTCUSD": 0.001, "ETHUSD": 0.01, "SOLUSD": 1.0,
-    "XAUTUSD": 0.001, "PAXGUSD": 0.001, "SILVERUSD": 0.1,
-}
 COOLDOWN_SECONDS = 300
 CHECK_INTERVAL = 30
 STATE_FILE = "state.json"
@@ -74,7 +60,7 @@ def log(message):
 
 @app.route("/")
 def home():
-    return ("DELTA TESTNET AUTO BOT | $5 PROFIT TRAIL ACTIVATION | "
+    return ("DELTA TESTNET AUTO BOT | ATR BREAKEVEN TRAILING STOP | "
             "EMA + RSI + ADX + MACD + VOLUME")
 
 @app.route("/health")
@@ -82,8 +68,8 @@ def health():
     return jsonify({
         "status": "ok", "bot": "running", "environment": "TESTNET",
         "automatic_trading": ENABLE_TRADING, "max_positions": MAX_POSITIONS,
-        "trail_activation_profit_usd": TRAIL_ACTIVATE_PROFIT_USD,
-        "trail_distance_pct": TRAIL_PCT * 100
+        "trailing_method": "ATR-based breakeven + chandelier trail",
+        "atr_multiplier": ATR_STOP_MULTIPLIER
     }), 200
 
 def run_flask():
@@ -95,7 +81,7 @@ def run_flask():
 def load_state():
     default = {
         "peaks": {}, "stops": {}, "last_trade": {}, "last_candle": {},
-        "trail_active": {}
+        "trail_active": {}, "initial_gaps": {}
     }
     try:
         with open(STATE_FILE, "r") as f:
@@ -110,12 +96,6 @@ def load_state():
         return default
 
 state = load_state()
-# The previous bot activated trailing on gross PnL. Do not carry that activation
-# into the new fee-aware NET-PnL rule after an upgrade/restart.
-FEE_MODEL_VERSION = "csv_fee_estimate_v1"
-if state.get("fee_model_version") != FEE_MODEL_VERSION:
-    state["trail_active"] = {}
-    state["fee_model_version"] = FEE_MODEL_VERSION
 state_lock = threading.Lock()
 
 def save_state():
@@ -578,57 +558,29 @@ def place_stop(symbol, position_side, size, stop_price):
     return True
 
 # =====================================================
-# PROFIT-TRIGGERED TRAILING STOP
+# ATR-BASED BREAKEVEN + TRAILING STOP
 # =====================================================
-def position_unrealized_pnl(position):
-    """Gross unrealized PnL in USD as reported by Delta's position API."""
-    for key in ("unrealized_pnl", "unrealizedPnl"):
-        value = position.get(key)
-        if value not in (None, ""):
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                pass
-    return None
-
-
-def estimate_round_trip_fees(symbol, size, entry_price, exit_price):
-    """Estimate entry + exit fees using observed CSV fee rates and contract multipliers."""
-    rate = ESTIMATED_FEE_RATE.get(symbol)
-    multiplier = CONTRACT_MULTIPLIER.get(symbol)
-    if rate is None or multiplier is None or entry_price <= 0 or exit_price <= 0:
+def get_atr_gap(symbol):
+    """Read the latest CLOSED 5m ATR(14); return 1.5x ATR as this trade's fixed gap."""
+    candles = get_candles(symbol)
+    df = candles_to_df(candles) if candles else None
+    if df is None:
         return None
-    qty = abs(float(size))
-    entry_notional = qty * entry_price * multiplier
-    exit_notional = qty * exit_price * multiplier
-    return (entry_notional + exit_notional) * rate
-
-
-def stop_price_for_min_net_profit(symbol, side, size, entry, min_net_profit):
-    """Stop level estimated to retain at least min_net_profit after both-side fees."""
-    rate = ESTIMATED_FEE_RATE.get(symbol)
-    multiplier = CONTRACT_MULTIPLIER.get(symbol)
-    qty = abs(float(size))
-    if not rate or not multiplier or qty <= 0 or entry <= 0:
+    df = add_indicators(df)
+    atr = float(df.iloc[-1].get("atr", 0) or 0)
+    if atr <= 0:
+        log(f"[ATR INVALID] {symbol} ATR={atr}")
         return None
-    exposure = qty * multiplier
-    entry_fee = entry * exposure * rate
-    if side == "buy":
-        # (stop-entry)*exposure - entry fee - stop*exposure*fee >= target
-        denom = exposure * (1.0 - rate)
-        if denom <= 0:
-            return None
-        return (entry * exposure + entry_fee + min_net_profit) / denom
-    # (entry-stop)*exposure - entry fee - stop*exposure*fee >= target
-    denom = exposure * (1.0 + rate)
-    return (entry * exposure - entry_fee - min_net_profit) / denom
+    gap = atr * ATR_STOP_MULTIPLIER
+    log(f"[ATR GAP] {symbol} ATR14={atr:.8f} MULT={ATR_STOP_MULTIPLIER} GAP={gap:.8f}")
+    return gap
+
 
 def recover_stop_state(symbol, position_side, orders):
-    """Recover the exchange's active stop after a Render restart."""
+    """Recover the tightest active exchange stop after a Render restart."""
     stops = [o for o in (orders or []) if is_active_stop(o, symbol)]
     if not stops:
         return float(state["stops"].get(symbol, 0) or 0), False
-
     parsed = []
     for order in stops:
         try:
@@ -637,25 +589,20 @@ def recover_stop_state(symbol, position_side, orders):
             continue
     if not parsed:
         return float(state["stops"].get(symbol, 0) or 0), False
-
-    # For LONG keep the highest protective stop; for SHORT the lowest.
     chosen_price, chosen_order = (
         max(parsed, key=lambda x: x[0]) if position_side == "buy"
         else min(parsed, key=lambda x: x[0])
     )
     state["stops"][symbol] = chosen_price
     state.setdefault("stop_order_ids", {})[symbol] = str(chosen_order.get("id", ""))
-    # An exchange-side protective stop indicates trailing/stop management
-    # was already initialized before a process restart.
-    state["trail_active"][symbol] = bool(state["trail_active"].get(symbol, False))
     return chosen_price, True
+
 
 def handle_trailing():
     positions = get_pos()
     if positions is None:
         log("[TRAIL BLOCKED] Position API unavailable")
         return
-
     orders = get_orders()
     if orders is None:
         log("[TRAIL BLOCKED] Cannot read open orders; leaving stops untouched")
@@ -671,120 +618,88 @@ def handle_trailing():
             if symbol not in COINS:
                 continue
             active_symbols.add(symbol)
-
             entry = float(p.get("entry_price") or p.get("average_price") or 0)
             if entry <= 0:
                 log(f"[TRAIL ERROR] {symbol} entry missing")
                 continue
-
             curr = get_live_price(symbol)
             if curr is None:
-                log(f"[TRAIL SKIP] {symbol} stale/unavailable live price")
+                log(f"[TRAIL SKIP] {symbol} stale/unavailable live price; exchange stop retained")
                 continue
 
-            gross_pnl = position_unrealized_pnl(p)
-            if gross_pnl is None:
-                log(f"[PROFIT DATA MISSING] {symbol}; cannot activate net $5 trail safely")
-                continue
-
-            estimated_fees = estimate_round_trip_fees(symbol, size, entry, curr)
-            if estimated_fees is None:
-                log(f"[FEE ESTIMATE MISSING] {symbol}; trailing activation blocked")
-                continue
-            net_pnl = gross_pnl - estimated_fees
             side = "buy" if size > 0 else "sell"
-            log(
-                f"[NET PNL CHECK] {symbol} GROSS=${gross_pnl:.2f} "
-                f"EST_ROUND_TRIP_FEES=${estimated_fees:.2f} NET_EST=${net_pnl:.2f}"
-            )
             old_stop, exchange_stop_found = recover_stop_state(symbol, side, orders)
+            gap = float(state.get("initial_gaps", {}).get(symbol, 0) or 0)
 
-            # Rebuild peak conservatively after restart. Never discard an
-            # exchange-side active stop. Do not lower a previously stored peak.
+            # For positions carried over from the old bot, derive the original
+            # risk gap from its existing exchange stop where possible.
+            if gap <= 0 and old_stop > 0:
+                gap = (entry - old_stop) if side == "buy" else (old_stop - entry)
+                if gap > 0:
+                    state.setdefault("initial_gaps", {})[symbol] = gap
+                    log(f"[GAP RECOVERED FROM EXCHANGE STOP] {symbol} GAP={gap:.8f}")
+
+            if gap <= 0:
+                gap = get_atr_gap(symbol) or 0
+                if gap > 0:
+                    state.setdefault("initial_gaps", {})[symbol] = gap
+                    initial = entry - gap if side == "buy" else entry + gap
+                    if old_stop <= 0:
+                        log(f"[INITIAL STOP MISSING] {symbol}; placing ATR stop={initial:.8f}")
+                        if not place_stop(symbol, side, size, initial):
+                            log(f"[URGENT] {symbol} ATR initial stop could not be verified")
+                            continue
+                        old_stop = initial
+                else:
+                    log(f"[TRAIL PAUSED] {symbol} ATR unavailable and no recoverable stop gap; existing stop untouched")
+                    continue
+
             old_peak = float(state["peaks"].get(symbol, entry) or entry)
-            if side == "buy":
-                peak = max(old_peak, entry, curr)
-            else:
-                peak = min(old_peak, entry, curr)
-
-            was_active = bool(state["trail_active"].get(symbol, False))
-            if not was_active and net_pnl >= TRAIL_ACTIVATE_PROFIT_USD:
-                state["trail_active"][symbol] = True
-                was_active = True
-                log(
-                    f"[TRAIL ACTIVATED] {symbol} NET_EST=${net_pnl:.2f} "
-                    f">= ${TRAIL_ACTIVATE_PROFIT_USD:.2f}"
-                )
-
+            peak = max(old_peak, entry, curr) if side == "buy" else min(old_peak, entry, curr)
             state["peaks"][symbol] = peak
 
-            # Before +$5, retain the initial protective stop; do not trail.
-            if not was_active:
+            # Do not move to breakeven until price has moved favourably by
+            # one full initial ATR gap. Then trail the peak by that same gap.
+            favourable_move = (peak - entry) if side == "buy" else (entry - peak)
+            if favourable_move < gap:
                 log(
-                    f"[WAIT NET $5] {symbol} NET_EST=${net_pnl:.2f} "
-                    f"TARGET=${TRAIL_ACTIVATE_PROFIT_USD:.2f} "
-                    f"STOP={old_stop or 'not recorded'}"
+                    f"[WAIT BREAKEVEN] {symbol} SIDE={side.upper()} ENTRY={entry:.8f} "
+                    f"PEAK={peak:.8f} MOVE={favourable_move:.8f} REQUIRED={gap:.8f} "
+                    f"STOP={old_stop:.8f}"
                 )
                 save_state()
                 continue
 
-            candidate = (
-                peak * (1 - TRAIL_PCT) if side == "buy"
-                else peak * (1 + TRAIL_PCT)
-            )
-
-            # Once net +$5 is reached, combine the 0.30% trailing stop with
-            # a fee-aware minimum-profit stop. This is an estimate; slippage,
-            # gaps and fee changes can still reduce the realised result.
-            profit_floor = stop_price_for_min_net_profit(
-                symbol, side, size, entry, TRAIL_ACTIVATE_PROFIT_USD
-            )
-            if profit_floor is None:
-                log(f"[NET LOCK BLOCKED] {symbol}; fee/contract model unavailable")
-                continue
-            if side == "buy":
-                candidate = max(candidate, profit_floor)
-            else:
-                candidate = min(candidate, profit_floor)
-
-            # Enforce monotonic protection: a LONG stop can only rise;
-            # a SHORT stop can only fall. Never reset an old stop to zero
-            # just because price has crossed it; let exchange order state decide.
+            candidate = peak - gap if side == "buy" else peak + gap
+            # At first trigger this is approximately entry; afterwards it
+            # follows the best price. A stop is never loosened.
+            candidate = max(candidate, entry) if side == "buy" else min(candidate, entry)
             if old_stop > 0:
                 candidate = max(candidate, old_stop) if side == "buy" else min(candidate, old_stop)
 
             if not valid_stop_price(side, candidate, curr):
-                log(
-                    f"[TRAIL WAIT] {symbol} candidate={candidate:.4f} "
-                    f"live={curr:.4f}; existing stop retained"
-                )
+                log(f"[TRAIL WAIT] {symbol} candidate={candidate:.8f} LAST={curr:.8f}; current exchange stop retained")
                 save_state()
                 continue
 
-            improvement = (
-                old_stop <= 0 or candidate > old_stop
-                if side == "buy"
-                else old_stop <= 0 or candidate < old_stop
-            )
+            improvement = (old_stop <= 0 or candidate > old_stop) if side == "buy" else (old_stop <= 0 or candidate < old_stop)
             log(
-                f"[TRAIL] {symbol} SIDE={side.upper()} NET_EST=${net_pnl:.2f} "
-                f"PEAK={peak:.4f} OLD_STOP={old_stop:.4f} "
-                f"NEW_STOP={candidate:.4f}"
+                f"[ATR TRAIL] {symbol} SIDE={side.upper()} ENTRY={entry:.8f} "
+                f"PEAK={peak:.8f} GAP={gap:.8f} OLD_STOP={old_stop:.8f} NEW_STOP={candidate:.8f}"
             )
             if improvement:
                 place_stop(symbol, side, size, candidate)
             save_state()
-
         except Exception as e:
             log(f"[TRAIL ERROR] {p.get('product_symbol', '?')}: {e}")
 
-    # Clear only local state for symbols no longer in open positions.
-    # Exchange orders are not cancelled here; manual/exchange review is safer.
+    # Clear local tracking only. Never cancel exchange-side stops here.
     for symbol in list(state["peaks"].keys()):
         if symbol in COINS and symbol not in active_symbols:
             state["peaks"].pop(symbol, None)
             state["stops"].pop(symbol, None)
             state.get("trail_active", {}).pop(symbol, None)
+            state.get("initial_gaps", {}).pop(symbol, None)
             state.get("stop_order_ids", {}).pop(symbol, None)
     save_state()
 
@@ -803,32 +718,34 @@ def initialize_new_position(symbol):
             continue
         size = float(position.get("size", 0) or 0)
         entry = float(position.get("entry_price") or position.get("average_price") or 0)
-        curr = get_live_price(symbol)
-        if not size or entry <= 0 or curr is None:
+        if not size or entry <= 0:
             continue
 
-        if size > 0:
-            stop_price = curr * (1 - TRAIL_PCT)
-            state["peaks"][symbol] = max(entry, curr)
-            side = "buy"
-        else:
-            stop_price = curr * (1 + TRAIL_PCT)
-            state["peaks"][symbol] = min(entry, curr)
-            side = "sell"
+        gap = get_atr_gap(symbol)
+        if gap is None or gap <= 0:
+            log(f"[INITIAL STOP FAILED] {symbol}: ATR unavailable; check Testnet position and protect it manually")
+            return False
 
+        side = "buy" if size > 0 else "sell"
+        stop_price = entry - gap if side == "buy" else entry + gap
+        curr = get_live_price(symbol)
+        if curr is None:
+            log(f"[INITIAL STOP FAILED] {symbol}: live last price unavailable")
+            return False
+
+        state.setdefault("initial_gaps", {})[symbol] = gap
+        state["peaks"][symbol] = max(entry, curr) if side == "buy" else min(entry, curr)
         state["trail_active"][symbol] = False
         save_state()
         log(
-            f"[INITIAL PROTECTIVE STOP] {symbol} ENTRY={entry:.4f} "
-            f"LIVE={curr:.4f} STOP={stop_price:.4f}; trail waits for +$5"
+            f"[INITIAL ATR STOP] {symbol} ENTRY={entry:.8f} ATR_GAP={gap:.8f} "
+            f"STOP={stop_price:.8f}; breakeven triggers after favourable move={gap:.8f}"
         )
         return place_stop(symbol, side, size, stop_price)
 
     log(f"[INITIAL STOP FAILED] {symbol} position not confirmed; check Testnet immediately")
     return False
 
-# =====================================================
-# ENTRY GUARDS / ORDER
 # =====================================================
 def price_mismatch_ok(symbol, candle_close):
     live = get_live_price(symbol)
@@ -873,13 +790,11 @@ def main_loop():
     log(f"LEVERAGE SETTING = {LEVERAGE}x (not changed by this script)")
     log("EMA 9/21/100 + RSI14 + ADX14 + MACD(12,26,9) + VOLUME MA20")
     log(f"TRAIL PRICE SOURCE = LAST TRADED PRICE | STOP TRIGGER = {STOP_TRIGGER_METHOD}")
-    log("NET PROFIT MODEL = observed CSV fee rates + inferred contract multipliers (estimate)")
-    log(f"ESTIMATED FEE RATES = {ESTIMATED_FEE_RATE}")
+    log(f"TRAIL METHOD = ATR({ATR_PERIOD}) x {ATR_STOP_MULTIPLIER}; BE after one initial gap; then trail peak by same gap")
     log(f"ADX FILTER = {MIN_ADX} | PRICE GAP LIMIT = {MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
     log(
-        f"INITIAL STOP DISTANCE = {TRAIL_PCT*100:.2f}% | "
-        f"TRAIL ACTIVATION = ${TRAIL_ACTIVATE_PROFIT_USD:.2f} "
-        f"| TRAIL DISTANCE = {TRAIL_PCT*100:.2f}%"
+        f"INITIAL/TRAIL GAP = {ATR_STOP_MULTIPLIER} x ATR({ATR_PERIOD}) on 5m candles | "
+        "BREAKEVEN TRIGGER = one favourable initial gap"
     )
     log(f"MAX POSITIONS = {MAX_POSITIONS} | COINS = {COINS}")
     log("==================================================")
@@ -975,3 +890,4 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     log("=== FLASK STARTED ===")
     main_loop()
+    
