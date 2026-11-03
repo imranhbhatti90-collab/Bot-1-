@@ -763,7 +763,7 @@ def main_loop():
     log(f"TRAIL PRICE SOURCE = LAST TRADED PRICE | STOP TRIGGER = {STOP_TRIGGER_METHOD}")
     log(f"TRAIL METHOD = ATR({ATR_PERIOD}) x {ATR_STOP_MULTIPLIER}; BE after one initial gap; then trail peak by same gap")
     log("ENTRY FILTERS: no RSI/ADX/MACD/volume/breakout filters; crossover only")
-    log(f"RETEST TOLERANCE = {RETEST_ATR_TOLERANCE} x ATR | PRICE GAP LIMIT = {MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
+    log(f"PRICE GAP LIMIT = {MAX_CANDLE_LIVE_GAP_PCT*100:.2f}%")
     log(
         f"INITIAL/TRAIL GAP = {ATR_STOP_MULTIPLIER} x ATR({ATR_PERIOD}) on 15m candles | "
         "BREAKEVEN TRIGGER = one favourable initial gap"
