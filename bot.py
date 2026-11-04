@@ -115,6 +115,46 @@ def save_state():
     except Exception as e:
         log(f"[STATE SAVE ERROR] {e}")
 
+# =====================================================
+# TEMPORARY SECURE STATE VIEW
+# =====================================================
+
+STATE_VIEW_USER = os.getenv("STATE_VIEW_USER", "")
+STATE_VIEW_PASSWORD = os.getenv("STATE_VIEW_PASSWORD", "")
+
+
+@app.route("/state", methods=["GET"])
+def view_state():
+    if not STATE_VIEW_USER or not STATE_VIEW_PASSWORD:
+        return jsonify({"error": "State viewer not configured"}), 503
+
+    auth = request.authorization
+
+    if (
+        not auth
+        or not hmac.compare_digest(auth.username or "", STATE_VIEW_USER)
+        or not hmac.compare_digest(auth.password or "", STATE_VIEW_PASSWORD)
+    ):
+        response = jsonify({"error": "Authentication required"})
+        response.status_code = 401
+        response.headers["WWW-Authenticate"] = 'Basic realm="Bot State Viewer"'
+        return response
+
+    try:
+        with state_lock:
+            snapshot = json.loads(json.dumps(state))
+
+        # Only bot state is returned. API credentials are never included.
+        return jsonify({
+            "status": "ok",
+            "file": STATE_FILE,
+            "state": snapshot
+        }), 200
+
+    except Exception as e:
+        log(f"[STATE VIEW ERROR] {e}")
+        return jsonify({"error": "Could not read state"}), 500
+
 
 # =====================================================
 # API REQUEST / AUTH
