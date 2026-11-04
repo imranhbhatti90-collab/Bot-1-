@@ -29,7 +29,7 @@ MAX_POSITIONS = 6
 ENABLE_TRADING = True  # TESTNET ONLY
 LEVERAGE = 50  # Informational only; this script does not set leverage.
 
-ATR_STOP_MULTIPLIER = 1.5
+ATR_STOP_MULTIPLIER = 1.2
 ATR_PERIOD = 14
 STOP_TRIGGER_METHOD = "last_traded_price"
 COOLDOWN_SECONDS = 300
