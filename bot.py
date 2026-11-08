@@ -37,12 +37,14 @@ EMA_ENTRY_SLOW = 20
 EMA_TREND_FAST = 50
 EMA_TREND_SLOW = 200
 
-# Fixed PRICE POINTS (not contract quantity)
+# ATR-based protective stop/trailing; fixed price points are used ONLY for partial TP.
+ATR_PERIOD = 14
+ATR_MULTIPLIER = 1.2  # Testnet trial setting; not validated for live trading.
 POINTS = {
-    "BTCUSD": {"sl": 200.0, "tp": 300.0, "trail": 260.0, "decimals": 2},
-    "ETHUSD": {"sl": 20.0, "tp": 20.0, "trail": 10.0, "decimals": 2},
-    "PAXGUSD": {"sl": 15.0, "tp": 15.0, "trail": 7.0, "decimals": 2},
-    "SILVERUSD": {"sl": 0.30, "tp": 0.30, "trail": 0.15, "decimals": 3},
+    "BTCUSD": {"tp": 200.0, "decimals": 2},
+    "ETHUSD": {"tp": 15.0, "decimals": 2},
+    "PAXGUSD": {"tp": 10.0, "decimals": 2},
+    "SILVERUSD": {"tp": 0.20, "decimals": 3},
 }
 PARTIAL_TP_PERCENT = 0.50
 STOP_TRIGGER_METHOD = "last_traded_price"
@@ -129,7 +131,7 @@ def require_dashboard_auth():
 def home():
     return (
         "DELTA TESTNET AI MULTI-AGENT BOT | EMA50/200 TREND FILTER "
-        "+ EMA10/20 ENTRY CONFIRMATION | FIXED POINT SL/TP"
+        "+ EMA10/20 ENTRY CONFIRMATION | ATR(14) x 1.2 SL/TRAIL | FIXED PARTIAL TP"
     )
 
 @app.route("/health")
@@ -143,7 +145,9 @@ def health():
         "timeframe": TIMEFRAME,
         "trend_filter": "EMA50/EMA200",
         "entry_confirmation": "EMA10/EMA20 two closed candles",
-        "fixed_points": POINTS,
+        "atr_period": ATR_PERIOD,
+        "atr_multiplier": ATR_MULTIPLIER,
+        "partial_tp_points": POINTS,
         "order_sizes": ORDER_SIZES,
         "partial_tp_percent": PARTIAL_TP_PERCENT * 100,
         "dashboard": "/dashboard (Basic Auth required)",
@@ -166,7 +170,7 @@ table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px 6px;
 small{color:#9aa8ba}.scroll{overflow:auto}.foot{color:#8190a4;font-size:12px;margin:16px 0}
 </style></head><body><div class="wrap">
 <div class="top"><div><small>DELTA EXCHANGE INDIA · TESTNET</small><h1>🤖 AI MULTI-AGENT TRADING TERMINAL</h1>
-<div class="muted">EMA 50/200 trend · EMA 10/20 entry · fixed-point risk</div></div>
+<div class="muted">EMA 50/200 trend · EMA 10/20 entry · ATR(14) × 1.2 SL/trailing · fixed partial TP</div></div>
 <div class="pill" id="run">CONNECTING</div></div>
 <div class="grid">
 <div class="card"><small>Open positions</small><div class="big" id="positions">--</div></div>
@@ -402,6 +406,34 @@ def get_indicators(candles, symbol):
         "ema50": float(last["ema50"]), "ema200": float(last["ema200"]),
         "close": float(last["close"]), "candle_id": int(last["time"]),
     }
+
+def get_atr(symbol):
+    """Return Wilder ATR(14) from closed 15m candles only; None blocks stop changes."""
+    candles = get_candles(symbol)
+    df = candles_to_df(candles, symbol)
+    if df is None or len(df) < max(MIN_CLOSED_CANDLES, ATR_PERIOD + 2):
+        log(f"[ATR UNAVAILABLE] {symbol}: insufficient closed candles")
+        return None
+    try:
+        high = df["high"].astype(float)
+        low = df["low"].astype(float)
+        close = df["close"].astype(float)
+        previous_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1 / ATR_PERIOD, adjust=False, min_periods=ATR_PERIOD).mean().iloc[-1]
+        value = float(atr)
+        if not pd.notna(value) or value <= 0:
+            log(f"[ATR UNAVAILABLE] {symbol}: invalid ATR value {value}")
+            return None
+        return value
+    except Exception as e:
+        log(f"[ATR CALC ERROR] {symbol}: {e}")
+        return None
+
 
 def check_signal(candles, symbol):
     agent("scanner", "SCAN", f"Scanning {symbol} on {TIMEFRAME}")
@@ -649,15 +681,20 @@ def handle_trailing():
             if current is None:
                 log(f"[TRAIL SKIP] {symbol}: fresh price unavailable")
                 continue
-            cfg = POINTS[symbol]
-            sl_gap, tp_gap, trail_gap = cfg["sl"], cfg["tp"], cfg["trail"]
+            atr = get_atr(symbol)
+            if atr is None:
+                log(f"[ATR STOP HOLD] {symbol}: ATR unavailable; existing exchange stop retained, no new stop/trail")
+                continue
+            atr_gap = atr * ATR_MULTIPLIER
+            tp_gap = POINTS[symbol]["tp"]
             old_stop, has_stop = recover_stop(symbol, side, orders)
             if not has_stop:
-                initial = entry - sl_gap if side == "buy" else entry + sl_gap
+                initial = entry - atr_gap if side == "buy" else entry + atr_gap
                 if not place_stop(symbol, side, signed_size, initial):
-                    log(f"[URGENT] {symbol}: initial protective stop not verified")
+                    log(f"[URGENT] {symbol}: ATR initial protective stop not verified")
                     continue
                 old_stop = initial
+                log(f"[INITIAL ATR STOP] {symbol} ATR={atr:.8f} MULT={ATR_MULTIPLIER} GAP={atr_gap:.8f} STOP={initial:.8f}")
             peak = float(state["peaks"].get(symbol, entry) or entry)
             peak = max(peak, current, entry) if side == "buy" else min(peak, current, entry)
             state["peaks"][symbol] = peak
@@ -676,6 +713,7 @@ def handle_trailing():
                 log(f"[WAIT PARTIAL TARGET] {symbol} MOVE={favourable:.6f} REQUIRED={tp_gap:.6f} STOP={old_stop:.6f}")
                 save_state()
                 continue
+            trail_gap = atr_gap
             candidate = peak - trail_gap if side == "buy" else peak + trail_gap
             candidate = max(candidate, entry) if side == "buy" else min(candidate, entry)
             old_stop = float(state["stops"].get(symbol, old_stop) or old_stop)
@@ -686,17 +724,15 @@ def handle_trailing():
                 continue
             improved = candidate > old_stop if side == "buy" else candidate < old_stop
             if improved:
-                log(f"[FIXED TRAIL] {symbol} SIDE={side.upper()} PEAK={peak:.6f} GAP={trail_gap:.6f} OLD={old_stop:.6f} NEW={candidate:.6f}")
+                log(f"[ATR TRAIL] {symbol} SIDE={side.upper()} ATR={atr:.6f} MULT={ATR_MULTIPLIER} PEAK={peak:.6f} GAP={trail_gap:.6f} OLD={old_stop:.6f} NEW={candidate:.6f}")
                 place_stop(symbol, side, signed_size, candidate)
             save_state()
         except Exception as e:
             log(f"[TRAIL ERROR] {e}")
-    for symbol in COINS:
-        if symbol not in active:
-            for key in ("peaks", "stops", "trail_active", "stop_order_ids",
-                        "partial_tp_done", "original_sizes", "entry_prices"):
-                state[key].pop(symbol, None)
-            state["partial_tp_pending"].pop(symbol, None)
+    # Do not auto-clear position/partial-TP state merely because a symbol is
+    # absent from one positions response. A transient API omission must never
+    # erase an unresolved partial-TP lock. Confirmed full closes are cleared by
+    # close_position_safely(); a new confirmed entry resets its own state.
     save_state()
     agent("executor", "LIVE", f"Managing {len(active)} open position(s)")
 
@@ -715,7 +751,11 @@ def initialize_new_position(symbol):
         if current is None:
             log(f"[INITIAL STOP FAILED] {symbol}: live price unavailable")
             return False
-        gap = POINTS[symbol]["sl"]
+        atr = get_atr(symbol)
+        if atr is None:
+            log(f"[INITIAL STOP BLOCKED] {symbol}: ATR unavailable; no fixed-point fallback used")
+            return False
+        gap = atr * ATR_MULTIPLIER
         stop = entry - gap if side == "buy" else entry + gap
         state["peaks"][symbol] = max(entry, current) if side == "buy" else min(entry, current)
         state["partial_tp_done"].pop(symbol, None)
@@ -723,7 +763,7 @@ def initialize_new_position(symbol):
         state["entry_prices"][symbol] = entry
         state["original_sizes"][symbol] = abs(size)
         save_state()
-        log(f"[INITIAL FIXED STOP] {symbol} ENTRY={entry:.8f} SL_POINTS={gap} STOP={stop:.8f} TP_POINTS={POINTS[symbol]['tp']} TRAIL={POINTS[symbol]['trail']}")
+        log(f"[INITIAL ATR STOP] {symbol} ENTRY={entry:.8f} ATR={atr:.8f} MULT={ATR_MULTIPLIER} GAP={gap:.8f} STOP={stop:.8f} PARTIAL_TP_POINTS={POINTS[symbol]['tp']}")
         return place_stop(symbol, side, size, stop)
     log(f"[INITIAL STOP FAILED] {symbol}: position not confirmed")
     return False
@@ -813,8 +853,9 @@ def main_loop():
     log(f"ORDER SIZES={ORDER_SIZES} | MAX POSITIONS={MAX_POSITIONS}")
     log(f"TIMEFRAME={TIMEFRAME} | TREND EMA={EMA_TREND_FAST}/{EMA_TREND_SLOW}")
     log(f"ENTRY EMA={EMA_ENTRY_FAST}/{EMA_ENTRY_SLOW} TWO CLOSED CANDLES")
-    log(f"FIXED POINT SETTINGS={POINTS}")
-    log("PARTIAL TP=50%; REMAINING SL=BREAKEVEN THEN FIXED TRAIL")
+    log(f"ATR STOP/TRAIL=ATR({ATR_PERIOD}) x {ATR_MULTIPLIER}; NO FIXED-POINT SL FALLBACK")
+    log(f"FIXED PARTIAL TP TARGETS={POINTS}")
+    log("PARTIAL TP=50%; REMAINING SL=BREAKEVEN THEN ATR TRAIL")
     log("TESTNET ONLY")
     log("==================================================")
     agent("logger", "OK", "Trade decisions are logged to trade_log.jsonl")
