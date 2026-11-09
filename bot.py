@@ -26,7 +26,7 @@ MAX_POSITIONS = 4
 
 # SAFETY: new entries are OFF until the revised signals are observed in logs.
 # Existing positions are still monitored and their protective stops are managed.
-ENABLE_TRADING = true 
+ENABLE_TRADING = True 
 
 TIMEFRAME = "15m"
 CANDLE_SECONDS = 900
