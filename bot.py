@@ -26,7 +26,7 @@ MAX_POSITIONS = 4
 
 # SAFETY: new entries are OFF until the revised signals are observed in logs.
 # Existing positions are still monitored and their protective stops are managed.
-ENABLE_TRADING = False
+ENABLE_TRADING = true 
 
 TIMEFRAME = "15m"
 CANDLE_SECONDS = 900
@@ -37,7 +37,7 @@ RSI_BUY_MIN, RSI_BUY_MAX = 50.0, 68.0
 RSI_SELL_MIN, RSI_SELL_MAX = 32.0, 50.0
 
 ATR_PERIOD = 14
-ATR_MULTIPLIER = 1.2
+ATR_MULTIPLIER = 1.0
 POINTS = {
     "BTCUSD": {"tp": 200.0, "decimals": 2},
     "ETHUSD": {"tp": 15.0, "decimals": 2},
