@@ -18,7 +18,7 @@ ORDER_SIZES = {"BTCUSD": 60, "ETHUSD": 60, "PAXGUSD": 300, "SILVERUSD": 300}
 MAX_POSITIONS = 4
 
 # SAFE MODE: validate the new signals before enabling automatic entries.
-ENABLE_TRADING = False
+ENABLE_TRADING = true
 
 TREND_TIMEFRAME = "15m"
 ENTRY_TIMEFRAME = "5m"
