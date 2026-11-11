@@ -12,10 +12,10 @@ from flask import Flask, jsonify, request, Response
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
-COINS = ["BTCUSD", "ETHUSD", "PAXGUSD", "SILVERUSD"]
-ORDER_SIZE = 60
-ORDER_SIZES = {"BTCUSD": 60, "ETHUSD": 60, "PAXGUSD": 300, "SILVERUSD": 300}
-MAX_POSITIONS = 4
+COINS = ["BTCUSD", "ETHUSD", "PAXGUSD"]
+ORDER_SIZE = 80
+ORDER_SIZES = {"BTCUSD": 80, "ETHUSD": 80, "PAXGUSD": 400}
+MAX_POSITIONS = 3
 
 # SAFE MODE: validate the new signals before enabling automatic entries.
 ENABLE_TRADING = True
@@ -40,10 +40,10 @@ BREAKOUT_LOOKBACK = 6
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 1.0
 POINTS = {
-    "BTCUSD": {"tp": 200.0, "decimals": 2},
-    "ETHUSD": {"tp": 15.0, "decimals": 2},
+    "BTCUSD": {"tp": 150.0, "decimals": 2},
+    "ETHUSD": {"tp": 10.0, "decimals": 2},
     "PAXGUSD": {"tp": 10.0, "decimals": 2},
-    "SILVERUSD": {"tp": 0.20, "decimals": 3},
+    
 }
 PARTIAL_TP_PERCENT = 0.50
 STOP_TRIGGER_METHOD = "last_traded_price"
