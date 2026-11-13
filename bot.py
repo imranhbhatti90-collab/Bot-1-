@@ -12,49 +12,75 @@ from flask import Flask, jsonify, request, Response
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
+
 COINS = ["BTCUSD", "ETHUSD", "PAXGUSD"]
-ORDER_SIZE = 80
-ORDER_SIZES = {"BTCUSD": 80, "ETHUSD": 80, "PAXGUSD": 400}
+
+ORDER_SIZE = 60
+ORDER_SIZES = {
+    "BTCUSD": 60,
+    "ETHUSD": 60,
+    "PAXGUSD": 300
+}
+
 MAX_POSITIONS = 3
 
-# SAFE MODE: validate the new signals before enabling automatic entries.
+# TESTNET automatic entries
 ENABLE_TRADING = True
 
+# =====================================================
+# STRATEGY SETTINGS
+# =====================================================
 TREND_TIMEFRAME = "15m"
 ENTRY_TIMEFRAME = "5m"
+
 TREND_SECONDS = 900
 ENTRY_SECONDS = 300
 
-EMA_ENTRY_FAST, EMA_ENTRY_SLOW = 10, 20
-EMA_TREND_FAST, EMA_TREND_SLOW = 50, 200
+EMA_ENTRY_FAST = 10
+EMA_ENTRY_SLOW = 20
+EMA_TREND_FAST = 50
+EMA_TREND_SLOW = 200
+
 RSI_PERIOD = 14
-RSI_BUY_MIN, RSI_BUY_MAX = 50.0, 68.0
-RSI_SELL_MIN, RSI_SELL_MAX = 32.0, 50.0
+RSI_BUY_MIN = 50.0
+RSI_BUY_MAX = 68.0
+RSI_SELL_MIN = 32.0
+RSI_SELL_MAX = 50.0
+
 VOLUME_PERIOD = 20
 VOLUME_MULTIPLIER = 1.10
+
 SWING_LOOKBACK = 20
 LEVEL_TOLERANCE_PCT = 0.0015
 BREAKOUT_LOOKBACK = 6
 
-# Risk settings preserved from the supplied bot.
+# =====================================================
+# RISK SETTINGS
+# =====================================================
 ATR_PERIOD = 14
 ATR_MULTIPLIER = 1.0
+
 POINTS = {
-    "BTCUSD": {"tp": 150.0, "decimals": 2},
-    "ETHUSD": {"tp": 10.0, "decimals": 2},
-    "PAXGUSD": {"tp": 10.0, "decimals": 2},
-    
+    "BTCUSD": {"tp": 200.0, "decimals": 2},
+    "ETHUSD": {"tp": 15.0, "decimals": 2},
+    "PAXGUSD": {"tp": 10.0, "decimals": 2}
 }
+
 PARTIAL_TP_PERCENT = 0.50
 STOP_TRIGGER_METHOD = "last_traded_price"
+
 COOLDOWN_SECONDS = 300
 CHECK_INTERVAL = 30
+
 STATE_FILE = "state.json"
 TRADE_LOG_FILE = "trade_log.jsonl"
+
 MIN_STOP_GAP_PCT = 0.0005
 MAX_CANDLE_LIVE_GAP_PCT = 0.001
 MAX_TRADE_AGE_SECONDS = 30
-MAX_CLOSED_CANDLE_AGE_SECONDS = 1200
+
+MAX_CLOSED_CANDLE_AGE_SECONDS = 360
+
 CANDLE_LOOKBACK_SECONDS = 10 * 24 * 60 * 60
 MIN_CLOSED_CANDLES = 250
 
