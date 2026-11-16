@@ -319,14 +319,13 @@ def discover_futures(force=False):
     return list(PRODUCTS.values())
 
 
+def get_asset_symbol(asset):
+    if isinstance(asset, dict):
+        return str(asset.get("symbol", "")).upper()
+    return str(asset or "").upper()
+
+
 def is_eligible_product(p):
-    """
-    Conservative eligibility:
-    - Live perpetual futures only
-    - Operational trading status
-    - USD quoting and settlement
-    - Valid product ID, tick size and contract value
-    """
     if str(p.get("contract_type", "")).lower() != "perpetual_futures":
         return False
 
@@ -334,14 +333,14 @@ def is_eligible_product(p):
         return False
 
     trading_status = str(
-        p.get("trading_status", "operational")
+        p.get("trading_status", "")
     ).lower()
 
     if trading_status not in ("operational", "live", "trading"):
         return False
 
-    quoting = str(p.get("quoting_asset", "")).upper()
-    settling = str(p.get("settling_asset", "")).upper()
+    quoting = get_asset_symbol(p.get("quoting_asset"))
+    settling = get_asset_symbol(p.get("settling_asset"))
 
     if quoting != "USD" or settling != "USD":
         return False
