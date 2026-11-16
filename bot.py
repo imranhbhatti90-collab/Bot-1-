@@ -1,190 +1,171 @@
-# FINAL FREE BOT - BINA TRADINGVIEW KE - DELTA TESTNET ONLY
-# Crash pe SELL only + TP Chart se + 138 Grid + EMA 50/200
-# Render FREE plan pe chalega, koi paid plan nahi chahiye
 
-import os, json, time, hmac, hashlib, threading, requests, pandas as pd
-from urllib.parse import urlencode, quote
-from flask import Flask, request, jsonify
+# VIDEO STRATEGY - ALL 138 COINS ENTRY - SL + TARGET SAB ME
+# User bola: 2 nahi, sab me entry lo, sab me SL + Target ho
+# Isliye MAX_POS = 138, har coin me entry, har coin me SL + TP
+# SELL: SL = Entry + 0.5% (Red Line), TP = Entry - 1.0% (Green Target)
+# BUY:  SL = Entry - 0.5%, TP = Entry + 1.0%
+# WARNING: 138 ek saath khulenge to margin zyada lagega - testnet me okay hai
 
-# =====================================================
-# FINAL COMBINED BOT - EMA TREND + KABOOM GRID
-# Dono video ka mix: Crash pe SELL only + 138 Grid positions
-# DELTA TESTNET ONLY
-# =====================================================
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-API_KEY = os.getenv("DELTA_API_KEY", "")
-API_SECRET = os.getenv("DELTA_API_SECRET", "")
-
-MODE = os.getenv("KABOOM_MODE", "Sell")  # Sell = crash pe SELL only
-COINS = ["BTCUSD","ETHUSD","PAXGUSD","SILVERUSD","BCHUSD","SOLUSD"]
-ORDER_SIZES = {"BTCUSD":40,"ETHUSD":40,"PAXGUSD":40,"SILVERUSD":40,"BCHUSD":40,"SOLUSD":40}
-MAX_POSITIONS = 138
-POINTS = {
-    "BTCUSD": {"sl": 400.0, "tp": 300.0, "grid": 200.0, "decimals": 2},
-    "ETHUSD": {"sl": 30.0, "tp": 20.0, "grid": 15.0, "decimals": 2},
-    "PAXGUSD": {"sl": 20.0, "tp": 15.0, "grid": 10.0, "decimals": 2},
-    "SILVERUSD": {"sl": 0.50, "tp": 0.30, "grid": 0.20, "decimals": 3},
-    "BCHUSD": {"sl": 5.0, "tp": 3.0, "grid": 2.0, "decimals": 2},
-    "SOLUSD": {"sl": 3.0, "tp": 2.0, "grid": 1.5, "decimals": 2},
-}
-STATE_FILE = "state.json"
-CHECK_INTERVAL = 30
+import os, time, hmac, hashlib, json, requests, threading
+from flask import Flask
 
 app = Flask(__name__)
-def log(m): print(m, flush=True)
-try:
-    with open(STATE_FILE) as f: state=json.load(f)
-except: state={"last_grid_price":{},"start_price":{},"last_trade":{}}
-for k in ["last_grid_price","start_price","last_trade"]:
-    if k not in state: state[k]={}
-def save_state():
+@app.route('/')
+def home(): return "Bot Live - ALL 138 - SL + TP Sab Me"
+@app.route('/health')
+def health(): return "OK", 200
+
+API_KEY = os.getenv("DELTA_API_KEY","")
+API_SECRET = os.getenv("DELTA_API_SECRET","")
+BASE = "https://cdn-ind.testnet.deltaex.org"
+MODE = os.getenv("MODE","Sell")
+SIZE = 40
+MAX_POS = 138  # SAB ME ENTRY - 2 ka limit hataya
+COOLDOWN = 300
+SL_PCT = 0.005  # 0.5% Stop Loss - Red Line
+TP_PCT = 0.01   # 1.0% Target - Green Line
+
+IGNORE = {"USOONUSD"}
+last_trade = {}
+
+def sign(method, path, body=""):
+    ts = str(int(time.time()))
+    msg = method + ts + path + body
+    sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return {"api-key": API_KEY, "timestamp": ts, "signature": sig, "Content-Type": "application/json"}
+
+def req(method, path, body=None):
+    b = json.dumps(body) if body else ""
+    h = sign(method, path, b)
     try:
-        with open(STATE_FILE,"w") as f: json.dump(state,f)
-    except: pass
+        if method=="GET":
+            r = requests.get(BASE+path, headers=h, timeout=15)
+        else:
+            r = requests.post(BASE+path, headers=h, data=b, timeout=15)
+        return r.json()
+    except Exception as e:
+        print(f"[REQ ERR] {e}", flush=True)
+        return {}
 
-def api_req(method, path, params=None, body=None):
-    ts=str(int(time.time()))
-    qs="?" + urlencode(params, quote_via=quote) if params else ""
-    payload=json.dumps(body) if body else ""
-    msg=method+ts+path+qs+payload
-    sig=hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-    headers={"api-key":API_KEY,"timestamp":ts,"signature":sig,"Content-Type":"application/json"}
-    try:
-        r=requests.request(method, BASE_URL+path+qs, headers=headers, data=payload or None, timeout=15)
-        return r.json(), r.status_code
-    except Exception as e: return {"error":str(e)},500
+def get_all_products():
+    r = req("GET","/v2/products")
+    prods=[]
+    for p in r.get("result",[]):
+        sym=p.get("symbol","")
+        if sym in IGNORE: continue
+        if not sym.endswith("USD"): continue
+        prods.append((sym, p.get("id")))
+    print(f"[PRODUCTS] Total {len(prods)} coins - SAB ME ENTRY", flush=True)
+    return prods
 
-def get_live(symbol):
-    try:
-        r=requests.get(BASE_URL+f"/v2/tickers/{symbol}", timeout=10)
-        res=r.json().get("result",{})
-        if isinstance(res,list): res=res[0] if res else {}
-        return float(res.get("close",0))
-    except: return 0
+def get_candles(pid):
+    r = req("GET", f"/v2/history/candles?product_id={pid}&resolution=5m&start={int(time.time())-220*300}&end={int(time.time())}")
+    return r.get("result",[])
 
-def get_candles(symbol):
-    end=int(time.time())
-    res,code=api_req("GET","/v2/history/candles", params={"resolution":"15m","symbol":symbol,"start":str(end-10*24*3600),"end":str(end)})
-    if code==200 and res.get("success"): return res.get("result",[])
-    return []
+def ema(values, period):
+    if len(values)<period: return None
+    k=2/(period+1)
+    e=sum(values[:period])/period
+    for v in values[period:]:
+        e=v*k+e*(1-k)
+    return e
 
-def check_trend(symbol):
-    # EMA wala logic - dono video ka pehla part
-    candles=get_candles(symbol)
-    if len(candles)<210: return "MIXED",0
-    df=pd.DataFrame(candles)
-    if 'close' not in df.columns: df=pd.DataFrame(candles, columns=["time","open","high","low","close","volume"])
-    df['close']=pd.to_numeric(df['close'])
-    df['ema50']=df['close'].ewm(span=50, adjust=False).mean()
-    df['ema200']=df['close'].ewm(span=200, adjust=False).mean()
-    df['ema10']=df['close'].ewm(span=10, adjust=False).mean()
-    df['ema20']=df['close'].ewm(span=20, adjust=False).mean()
-    last=df.iloc[-1]; prev=df.iloc[-2]
-    close=float(last['close']); ema50=float(last['ema50']); ema200=float(last['ema200'])
-    if ema50>ema200 and close>ema50: trend="BULLISH"
-    elif ema50<ema200 and close<ema50: trend="BEARISH"
-    else: trend="MIXED"
-    log(f"[TREND] {symbol} Close {close:.2f} EMA50 {ema50:.2f} EMA200 {ema200:.2f} -> {trend} MODE={MODE}")
-    return trend, close
+def get_positions():
+    r = req("GET","/v2/positions/margined")
+    pos={}
+    for p in r.get("result",[]):
+        sym=p.get("product_symbol") or p.get("symbol")
+        size=float(p.get("size",0) or 0)
+        if sym in IGNORE: continue
+        if size!=0: pos[sym]=size
+    return pos
 
-def get_pos():
-    res,code=api_req("GET","/v2/positions/margined")
-    if code!=200: return []
-    lst=res.get("result",[])
-    if isinstance(lst,dict): lst=[lst]
-    return [p for p in lst if float(p.get("size",0) or 0)!=0]
-def parse_sym(p): return p.get("product_symbol") or p.get("product",{}).get("symbol") or ""
-def place_stop(symbol, side, size, stop_price):
-    stop_side="sell" if side=="buy" else "buy"
-    body={"product_symbol":symbol,"size":int(abs(float(size))),"side":stop_side,"order_type":"market_order","stop_order_type":"stop_loss_order","stop_price":f"{float(stop_price):.{POINTS[symbol]['decimals']}f}","reduce_only":True,"stop_trigger_method":"last_traded_price"}
-    res,code=api_req("POST","/v2/orders", body=body)
-    log(f"[STOP] {symbol} RED LINE @ {stop_price:.2f} -> {code}")
-    return code==200
-def place_entry(symbol, side):
-    qty=ORDER_SIZES.get(symbol,40)
-    body={"product_symbol":symbol,"size":qty,"side":side,"order_type":"market_order"}
-    res,code=api_req("POST","/v2/orders", body=body)
-    log(f"[ENTRY] {symbol} {side.upper()} qty {qty} -> {code} MODE={MODE}")
-    return code==200
+def place_market(pid, side, qty):
+    body={"product_id":pid,"size":qty,"side":side,"order_type":"market_order","time_in_force":"gtc"}
+    r=req("POST","/v2/orders", body)
+    print(f"[ENTRY] {side} qty {qty} -> {r.get('success')}", flush=True)
+    return r
 
-@app.route("/")
-def home(): return f"FINAL COMBINED | EMA TREND + KABOOM GRID | MODE={MODE} | MAX 138 | TESTNET"
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        data=request.get_json(force=True) or {}
-        sym=data.get("symbol","").upper(); side=data.get("side", MODE.lower())
-        log(f"[WEBHOOK] {sym} {side}")
-        if sym in COINS:
-            if MODE.lower()=="sell" and side!="sell": return jsonify({"ok":False,"reason":"MODE Sell only"}),200
-            if MODE.lower()=="buy" and side!="buy": return jsonify({"ok":False,"reason":"MODE Buy only"}),200
-            place_entry(sym, side)
-            return jsonify({"ok":True}),200
-    except Exception as e: log(f"[WEBHOOK ERR] {e}")
-    return jsonify({"ok":False}),400
-@app.route("/health")
-def health(): return jsonify({"mode":MODE,"coins":COINS,"max":MAX_POSITIONS})
+def place_stop(pid, side, qty, stop_price):
+    # SL - Red Line
+    stop_side="buy" if side=="sell" else "sell"
+    body={"product_id":pid,"size":qty,"side":stop_side,"order_type":"stop_market_order","stop_price":str(round(stop_price,4)),"time_in_force":"gtc","reduce_only":"true"}
+    r=req("POST","/v2/orders", body)
+    print(f"[STOP] RED SL @ {stop_price} -> {r.get('success')}", flush=True)
+    return r
 
-def run_flask(): app.run(host="0.0.0.0", port=int(os.environ.get("PORT",10000)), use_reloader=False)
+def place_target(pid, side, qty, tp_price):
+    # TP - Green Target - Limit Order
+    tp_side="buy" if side=="sell" else "sell"
+    body={"product_id":pid,"size":qty,"side":tp_side,"order_type":"limit_order","limit_price":str(round(tp_price,4)),"time_in_force":"gtc","reduce_only":"true"}
+    r=req("POST","/v2/orders", body)
+    print(f"[TARGET] GREEN TP @ {tp_price} -> {r.get('success')}", flush=True)
+    return r
 
-def main_loop():
-    log(f"=== FINAL COMBINED START MODE={MODE} ===")
-    log(f"EMA50/200 TREND FILTER + KABOOM GRID 138 POS")
-    for s in COINS:
-        if s not in state["start_price"]:
-            p=get_live(s)
-            if p>0: state["start_price"][s]=p; state["last_grid_price"][s]=p
-    save_state()
+def get_live_price(pid):
+    r=req("GET", f"/v2/tickers?product_id={pid}")
+    res=r.get("result",[])
+    if res: return float(res[0].get("mark_price") or res[0].get("close") or 0)
+    return 0
+
+def trade_loop():
+    print(f"=== VIDEO STRATEGY ALL 138 MODE={MODE} SL 0.5% TP 1% ===", flush=True)
+    products=get_all_products()
     while True:
         try:
-            positions=get_pos()
-            held={}
-            for p in positions:
-                sym=parse_sym(p)
-                if sym in COINS: held[sym]=held.get(sym,0)+1
-            total=sum(held.values())
-            log(f"[POS] Total {total}/138 {held} MODE={MODE}")
-            for symbol in COINS:
-                trend, live = check_trend(symbol)
-                if live==0: live=get_live(symbol)
-                if live<=0: continue
-                last_grid=state["last_grid_price"].get(symbol, live)
-                # --- DONO KA COMBINE LOGIC ---
-                # 1) EMA TREND: Crash pe SELL only, Pump pe BUY only
-                # 2) KABOOM GRID: Har grid gap pe naya position
-                if MODE=="Sell":
-                    # Crash = BEARISH trend me hi SELL
-                    if trend=="BEARISH":
-                        # Grid: price upar gaya to naya SELL (video jaisa)
-                        if live > last_grid + POINTS[symbol]["grid"]:
-                            if total < MAX_POSITIONS:
-                                log(f"[KABOOM+EMA] {symbol} BEARISH + GRID UP {live:.2f} > {last_grid:.2f} -> SELL ADD")
-                                if place_entry(symbol,"sell"):
-                                    state["last_grid_price"][symbol]=live
-                                    place_stop(symbol,"sell",ORDER_SIZES[symbol], live+POINTS[symbol]["sl"])
-                                    total+=1; save_state()
-                        elif live < last_grid - POINTS[symbol]["tp"]:
-                            state["last_grid_price"][symbol]=live; save_state()
-                    elif trend=="BULLISH":
-                        log(f"[NO SELL] {symbol} UPTREND hai - crash nahi hai, SELL nahi karega")
-                    else:
-                        log(f"[NO TRADE] {symbol} MIXED trend - wait")
-                else: # Buy mode
-                    if trend=="BULLISH":
-                        if live < last_grid - POINTS[symbol]["grid"]:
-                            if total < MAX_POSITIONS:
-                                log(f"[KABOOM+EMA] {symbol} BULLISH + GRID DOWN -> BUY ADD")
-                                if place_entry(symbol,"buy"):
-                                    state["last_grid_price"][symbol]=live
-                                    place_stop(symbol,"buy",ORDER_SIZES[symbol], live-POINTS[symbol]["sl"])
-                                    total+=1; save_state()
-                    else:
-                        log(f"[NO BUY] {symbol} Trend {trend} - pump nahi hai, BUY nahi karega")
-            log(f"--- SLEEP {CHECK_INTERVAL}s ---")
-            time.sleep(CHECK_INTERVAL)
+            pos=get_positions()
+            print(f"[POS] Total {len(pos)}/{MAX_POS} MODE={MODE} SCAN={len(products)}", flush=True)
+            for sym,pid in products:
+                if sym in pos:
+                    continue
+                if sym in last_trade and time.time()-last_trade[sym]<COOLDOWN:
+                    continue
+                candles=get_candles(pid)
+                if len(candles)<60: continue
+                closes=[float(c.get("close")) for c in candles]
+                live=get_live_price(pid) or closes[-1]
+                ema50=ema(closes,50)
+                ema200=ema(closes,200) if len(closes)>=200 else ema50
+                is_below=live<ema50
+                is_above=live>ema50
+                trend="BEARISH" if is_below else "BULLISH"
+                print(f"[TREND] {sym} Close {live:.4f} EMA50 {ema50:.4f} -> {trend}", flush=True)
+                should_sell=False
+                should_buy=False
+                if MODE=="Sell" and is_below: should_sell=True
+                elif MODE=="Buy" and is_above: should_buy=True
+                elif MODE=="Both":
+                    if is_below: should_sell=True
+                    if is_above: should_buy=True
+                if should_sell:
+                    print(f"[SIGNAL] {sym} SELL - Entry {live}", flush=True)
+                    r=place_market(pid,"sell",SIZE)
+                    if r.get("success"):
+                        last_trade[sym]=time.time()
+                        sl=live*(1+SL_PCT)
+                        tp=live*(1-TP_PCT)
+                        print(f"[LEVELS] {sym} Entry {live:.4f} SL {sl:.4f} TP {tp:.4f}", flush=True)
+                        place_stop(pid,"sell",SIZE,sl)
+                        place_target(pid,"sell",SIZE,tp)
+                elif should_buy:
+                    print(f"[SIGNAL] {sym} BUY - Entry {live}", flush=True)
+                    r=place_market(pid,"buy",SIZE)
+                    if r.get("success"):
+                        last_trade[sym]=time.time()
+                        sl=live*(1-SL_PCT)
+                        tp=live*(1+TP_PCT)
+                        print(f"[LEVELS] {sym} Entry {live:.4f} SL {sl:.4f} TP {tp:.4f}", flush=True)
+                        place_stop(pid,"buy",SIZE,sl)
+                        place_target(pid,"buy",SIZE,tp)
+                else:
+                    print(f"[NO TRADE] {sym} wait - Price EMA50 ke upar/niche nahi", flush=True)
+            print("--- SLEEP 30s ---", flush=True)
+            time.sleep(30)
         except Exception as e:
-            log(f"[ERR] {e}"); time.sleep(10)
+            print(f"[LOOP ERR] {e}", flush=True)
+            time.sleep(10)
 
-if True:
-    threading.Thread(target=run_flask, daemon=True).start()
-    main_loop()
+if __name__=="__main__":
+    threading.Thread(target=trade_loop, daemon=True).start()
+    port=int(os.getenv("PORT","10000"))
+    app.run(host="0.0.0.0", port=port)
