@@ -18,10 +18,8 @@ from flask import Flask, jsonify, request, Response
 # DELTA EXCHANGE INDIA - TESTNET ONLY
 # ============================================================
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-
 API_KEY = os.getenv("DELTA_API_KEY", "").strip()
 API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
-
 APP_PORT = int(os.getenv("PORT", "10000"))
 
 VIEW_USER = os.getenv("STATE_VIEW_USER", "admin")
@@ -34,8 +32,8 @@ ENABLE_TRADING = os.getenv("ENABLE_TRADING", "true").lower() == "true"
 # ============================================================
 MARGIN_PER_TRADE_USD = 20.0
 MAX_POSITIONS = 10
-BALANCE_BUFFER_USD = 5.0
 MAX_ACCOUNT_MARGIN_USE_USD = 200.0
+BALANCE_BUFFER_USD = 5.0
 
 # ============================================================
 # STRATEGY
@@ -45,7 +43,6 @@ ENTRY_TIMEFRAME = "5m"
 
 EMA_TREND_FAST = 50
 EMA_TREND_SLOW = 200
-
 EMA_ENTRY_FAST = 10
 EMA_ENTRY_SLOW = 20
 
@@ -59,19 +56,25 @@ RSI_BUY_MAX = 68
 RSI_SELL_MIN = 32
 RSI_SELL_MAX = 50
 
+# EMA ALIGNMENT MODE:
+# 5m EMA10 > EMA20 = buy alignment
+# 5m EMA10 < EMA20 = sell alignment
+# A fresh crossover is NOT required.
+REQUIRE_FRESH_CROSS = False
+
 # ============================================================
 # RISK MANAGEMENT
 # ============================================================
 ATR_STOP_MULTIPLIER = 1.0
 ATR_TRAIL_MULTIPLIER = 1.0
 ATR_PARTIAL_MULTIPLIER = 1.0
-
 PARTIAL_CLOSE_PERCENT = 0.50
 
 FIXED_PARTIAL_TARGETS = {
     "BTCUSD": 200.0,
     "ETHUSD": 15.0,
     "PAXGUSD": 10.0,
+    "SILVERUSD": 0.20,
 }
 
 CHECK_INTERVAL = 30
@@ -80,7 +83,6 @@ DISCOVERY_INTERVAL = 900
 
 CANDLE_LOOKBACK_DAYS = 10
 MIN_CLOSED_CANDLES = 250
-
 MAX_CANDLE_LIVE_GAP_PCT = 0.005
 MAX_MARKET_SCAN_PER_CYCLE = 100
 
@@ -88,6 +90,7 @@ REQUEST_TIMEOUT = 15
 
 STATE_FILE = "state.json"
 TRADE_LOG_FILE = "trade_log.jsonl"
+POSITION_META_FILE = "position_meta.json"
 
 # ============================================================
 # LOGGING / APP
@@ -96,15 +99,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-
 log = logging.getLogger("DELTA_TESTNET_BOT")
 
 app = Flask(__name__)
-
 session = requests.Session()
-
 session.headers.update({
-    "User-Agent": "Delta-India-Testnet-MultiAgent-Bot/2.0",
+    "User-Agent": "Delta-India-Testnet-MultiAgent-Bot/3.0",
     "Accept": "application/json",
     "Content-Type": "application/json",
 })
@@ -128,12 +128,15 @@ state = {
     "losses": 0,
     "realized_pnl_estimate": 0.0,
     "events": [],
+    "account_margin_used": 0.0,
+    "available_balance": 0.0,
 }
 
 PRODUCTS = {}
 LAST_TRADE_TIME = {}
 POSITION_META = {}
 DISCOVERED_AT = 0
+POSITION_FETCH_OK = False
 
 
 # ============================================================
@@ -142,45 +145,68 @@ DISCOVERED_AT = 0
 def number(value, default=0.0):
     try:
         result = float(value)
-
         if math.isfinite(result):
             return result
-
     except Exception:
         pass
-
     return default
 
 
 def asset_symbol(asset):
     if isinstance(asset, dict):
         return str(asset.get("symbol", "")).upper()
-
     return str(asset or "").upper()
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def save_state():
     try:
         with lock:
             data = json.dumps(state, indent=2, default=str)
-
         with open(STATE_FILE, "w") as f:
             f.write(data)
-
     except Exception as e:
         log.error("STATE SAVE ERROR: %s", e)
 
 
+def save_position_meta():
+    try:
+        with lock:
+            data = json.dumps(POSITION_META, indent=2, default=str)
+        with open(POSITION_META_FILE, "w") as f:
+            f.write(data)
+    except Exception as e:
+        log.error("POSITION META SAVE ERROR: %s", e)
+
+
+def load_position_meta():
+    global POSITION_META
+    try:
+        if os.path.exists(POSITION_META_FILE):
+            with open(POSITION_META_FILE, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                POSITION_META = data
+                log.info(
+                    "POSITION META RESTORED: %s symbols",
+                    len(POSITION_META)
+                )
+    except Exception as e:
+        log.error("POSITION META LOAD ERROR: %s", e)
+
+
 def event(message):
     log.info(message)
-
     with lock:
         state["events"].append({
-            "time": datetime.now(timezone.utc).isoformat(),
+            "time": utc_now(),
             "message": str(message)
         })
-
         state["events"] = state["events"][-100:]
+    save_state()
 
 
 def agent(name, status, detail=""):
@@ -188,7 +214,7 @@ def agent(name, status, detail=""):
         state["agent_status"][name] = {
             "status": status,
             "detail": str(detail),
-            "time": datetime.now(timezone.utc).isoformat()
+            "time": utc_now()
         }
 
 
@@ -196,7 +222,6 @@ def write_trade_log(data):
     try:
         with open(TRADE_LOG_FILE, "a") as f:
             f.write(json.dumps(data, default=str) + "\n")
-
     except Exception as e:
         log.error("TRADE LOG ERROR: %s", e)
 
@@ -204,7 +229,6 @@ def write_trade_log(data):
 def api_response(response):
     try:
         data = response.json()
-
     except Exception:
         raise RuntimeError(
             f"API returned non-JSON response: {response.status_code}"
@@ -214,7 +238,6 @@ def api_response(response):
         raise RuntimeError(
             f"Delta API error {response.status_code}: {data}"
         )
-
     return data
 
 
@@ -225,17 +248,13 @@ def api_request(method, path, params=None, body=None, auth=True):
     method = method.upper()
     params = params or {}
 
-    query = urlencode(sorted(params.items()))
-
+    # The exact same query string is signed and sent.
+    query = urlencode(sorted(params.items()), doseq=True)
     request_path = path + (("?" + query) if query else "")
 
     body_text = ""
-
     if body is not None:
-        body_text = json.dumps(
-            body,
-            separators=(",", ":")
-        )
+        body_text = json.dumps(body, separators=(",", ":"))
 
     headers = {}
 
@@ -246,7 +265,6 @@ def api_request(method, path, params=None, body=None, auth=True):
             )
 
         timestamp = str(int(time.time()))
-
         signature_data = (
             method + timestamp + request_path + body_text
         )
@@ -263,12 +281,12 @@ def api_request(method, path, params=None, body=None, auth=True):
             "signature": signature,
         }
 
-    url = BASE_URL + path
+    # Do not pass params separately: send the exact signed query.
+    url = BASE_URL + request_path
 
     response = session.request(
         method=method,
         url=url,
-        params=params if params else None,
         data=body_text if body is not None else None,
         headers=headers,
         timeout=REQUEST_TIMEOUT,
@@ -296,21 +314,14 @@ def is_eligible_product(p):
     if str(p.get("state", "")).lower() != "live":
         return False
 
-    trading_status = str(
-        p.get("trading_status", "")
-    ).lower()
-
-    if trading_status not in (
-        "operational",
-        "live",
-        "trading"
-    ):
+    status = str(p.get("trading_status", "")).lower()
+    if status not in ("operational", "live", "trading"):
         return False
 
-    quoting = asset_symbol(p.get("quoting_asset"))
-    settling = asset_symbol(p.get("settling_asset"))
+    if asset_symbol(p.get("quoting_asset")) != "USD":
+        return False
 
-    if quoting != "USD" or settling != "USD":
+    if asset_symbol(p.get("settling_asset")) != "USD":
         return False
 
     if not p.get("id"):
@@ -334,16 +345,12 @@ def discover_futures(force=False):
     ):
         return list(PRODUCTS.values())
 
-    agent(
-        "Scanner",
-        "RUNNING",
-        "Refreshing Delta product list"
-    )
+    agent("Scanner", "RUNNING", "Refreshing Delta product list")
 
     found = []
     after = None
 
-    for page in range(20):
+    for _ in range(20):
         params = {
             "contract_types": "perpetual_futures",
             "states": "live",
@@ -354,36 +361,14 @@ def discover_futures(force=False):
             params["after"] = after
 
         data = public_get("/v2/products", params)
-
         rows = data.get("result", [])
 
         if isinstance(rows, dict):
             rows = [rows]
 
-        for p in rows[:5]:
-            log.info(
-                "[PRODUCT DIAGNOSTIC] %s",
-                json.dumps({
-                    "symbol": p.get("symbol"),
-                    "id": p.get("id"),
-                    "contract_type": p.get("contract_type"),
-                    "state": p.get("state"),
-                    "trading_status": p.get("trading_status"),
-                    "quoting_asset": p.get("quoting_asset"),
-                    "settling_asset": p.get("settling_asset"),
-                    "underlying_asset": p.get("underlying_asset"),
-                    "contract_value": p.get("contract_value"),
-                    "contract_unit_currency": p.get(
-                        "contract_unit_currency"
-                    ),
-                    "tick_size": p.get("tick_size"),
-                })
-            )
-
         found.extend(rows)
 
         after = (data.get("meta") or {}).get("after")
-
         if not after or not rows:
             break
 
@@ -391,13 +376,10 @@ def discover_futures(force=False):
 
     for p in found:
         symbol = str(p.get("symbol", "")).upper()
-
-        if not symbol:
-            continue
-
-        if is_eligible_product(p):
+        if symbol and is_eligible_product(p):
             new_products[symbol] = p
 
+    # Do not erase the old list if discovery unexpectedly returns zero.
     if new_products:
         PRODUCTS = new_products
 
@@ -405,11 +387,8 @@ def discover_futures(force=False):
 
     with lock:
         state["discovered_markets"] = [
-            p.get("symbol")
-            for p in found
-            if p.get("symbol")
+            p.get("symbol") for p in found if p.get("symbol")
         ]
-
         state["eligible_markets"] = list(PRODUCTS.keys())
 
     event(
@@ -419,12 +398,11 @@ def discover_futures(force=False):
 
     agent(
         "Scanner",
-        "OK",
+        "OK" if PRODUCTS else "BLOCKED",
         f"{len(PRODUCTS)} eligible perpetual markets"
     )
 
     save_state()
-
     return list(PRODUCTS.values())
 
 
@@ -438,11 +416,9 @@ def get_ticker(symbol):
     )
 
     rows = data.get("result", [])
-
     for row in rows:
         if str(row.get("symbol", "")).upper() == symbol:
             return row
-
     return {}
 
 
@@ -450,10 +426,8 @@ def get_live_price(symbol):
     ticker = get_ticker(symbol)
 
     price = number(ticker.get("close"))
-
     if price <= 0:
         price = number(ticker.get("mark_price"))
-
     if price <= 0:
         price = number(ticker.get("spot_price"))
 
@@ -462,7 +436,6 @@ def get_live_price(symbol):
 
 def get_candles(symbol, resolution):
     end = int(time.time())
-
     start = end - CANDLE_LOOKBACK_DAYS * 86400
 
     data = public_get(
@@ -476,45 +449,31 @@ def get_candles(symbol, resolution):
     )
 
     rows = data.get("result", [])
-
     if not rows:
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
 
-    required = [
-        "open",
-        "high",
-        "low",
-        "close"
-    ]
-
+    required = ["open", "high", "low", "close"]
     if not all(c in df.columns for c in required):
         return pd.DataFrame()
 
     for col in required:
-        df[col] = pd.to_numeric(
-            df[col],
-            errors="coerce"
-        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "volume" not in df.columns:
         df["volume"] = 0.0
-
     else:
         df["volume"] = pd.to_numeric(
-            df["volume"],
-            errors="coerce"
+            df["volume"], errors="coerce"
         ).fillna(0)
 
     if "time" in df.columns:
         df = df.sort_values("time")
 
-    df = df.dropna(
-        subset=required
-    ).reset_index(drop=True)
+    df = df.dropna(subset=required).reset_index(drop=True)
 
-    # Exclude current forming candle.
+    # Exclude the currently forming candle.
     if len(df) > 1:
         df = df.iloc[:-1].copy()
 
@@ -548,7 +507,6 @@ def add_indicators(df):
     ).mean()
 
     delta = df["close"].diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -563,10 +521,7 @@ def add_indicators(df):
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, 1e-12)
-
-    df["rsi"] = 100 - (
-        100 / (1 + rs)
-    )
+    df["rsi"] = 100 - (100 / (1 + rs))
 
     prev_close = df["close"].shift(1)
 
@@ -596,15 +551,8 @@ def add_indicators(df):
 # ============================================================
 def check_signal(symbol):
     try:
-        trend_df = get_candles(
-            symbol,
-            TREND_TIMEFRAME
-        )
-
-        entry_df = get_candles(
-            symbol,
-            ENTRY_TIMEFRAME
-        )
+        trend_df = get_candles(symbol, TREND_TIMEFRAME)
+        entry_df = get_candles(symbol, ENTRY_TIMEFRAME)
 
         if len(trend_df) < MIN_CLOSED_CANDLES:
             return None, "NOT_ENOUGH_15M_CANDLES"
@@ -619,17 +567,16 @@ def check_signal(symbol):
         e = entry_df.iloc[-1]
         prev = entry_df.iloc[-2]
 
-        if (
-            pd.isna(t["ema200"])
-            or pd.isna(e["ema20"])
-            or pd.isna(e["rsi"])
-            or pd.isna(e["volume_avg"])
-        ):
+        required_values = [
+            t["ema50"], t["ema200"], t["atr"],
+            e["ema10"], e["ema20"], e["rsi"],
+            e["volume_avg"]
+        ]
+
+        if any(pd.isna(v) for v in required_values):
             return None, "INDICATORS_NOT_READY"
 
-        # ----------------------------------------------------
-        # 15M TREND
-        # ----------------------------------------------------
+        # 15-minute direction.
         trend = "MIXED"
 
         if (
@@ -644,9 +591,10 @@ def check_signal(symbol):
         ):
             trend = "BEARISH"
 
-        # ----------------------------------------------------
-        # 5M EMA CROSS
-        # ----------------------------------------------------
+        # 5-minute EMA alignment.
+        aligned_buy = e["ema10"] > e["ema20"]
+        aligned_sell = e["ema10"] < e["ema20"]
+
         crossed_up = (
             prev["ema10"] <= prev["ema20"]
             and e["ema10"] > e["ema20"]
@@ -657,22 +605,11 @@ def check_signal(symbol):
             and e["ema10"] < e["ema20"]
         )
 
-        # ----------------------------------------------------
-        # RSI
-        # ----------------------------------------------------
         rsi = number(e["rsi"])
 
-        buy_rsi_ok = (
-            RSI_BUY_MIN <= rsi <= RSI_BUY_MAX
-        )
+        buy_rsi_ok = RSI_BUY_MIN <= rsi <= RSI_BUY_MAX
+        sell_rsi_ok = RSI_SELL_MIN <= rsi <= RSI_SELL_MAX
 
-        sell_rsi_ok = (
-            RSI_SELL_MIN <= rsi <= RSI_SELL_MAX
-        )
-
-        # ----------------------------------------------------
-        # VOLUME
-        # ----------------------------------------------------
         volume = number(e["volume"])
         volume_avg = number(e["volume_avg"])
 
@@ -681,30 +618,19 @@ def check_signal(symbol):
             and volume > volume_avg * VOLUME_MULTIPLIER
         )
 
-        # ----------------------------------------------------
-        # PRICE VALIDATION
-        # ----------------------------------------------------
         live_price = get_live_price(symbol)
         candle_close = number(e["close"])
 
         if live_price <= 0 or candle_close <= 0:
             return None, "NO_LIVE_PRICE"
 
-        gap = (
-            abs(live_price - candle_close)
-            / candle_close
-        )
-
+        gap = abs(live_price - candle_close) / candle_close
         gap_ok = gap <= MAX_CANDLE_LIVE_GAP_PCT
 
         atr = number(t["atr"])
-
         if atr <= 0:
             return None, "INVALID_ATR"
 
-        # ----------------------------------------------------
-        # FIRST BLOCKING REASON
-        # ----------------------------------------------------
         signal = None
         reason = "NO_ALIGNED_SIGNAL"
 
@@ -712,36 +638,31 @@ def check_signal(symbol):
             reason = "TREND_MIXED"
 
         elif trend == "BULLISH":
-
-            if not crossed_up:
+            if not aligned_buy:
+                reason = "EMA_NOT_BULLISH_ALIGNED"
+            elif REQUIRE_FRESH_CROSS and not crossed_up:
                 reason = "NO_BULLISH_EMA_CROSS"
-
             elif not buy_rsi_ok:
                 reason = "BUY_RSI_OUT_OF_RANGE"
-
             elif not volume_ok:
                 reason = "VOLUME_TOO_LOW"
-
             else:
                 signal = "buy"
                 reason = "BUY_SETUP_CONFIRMED"
 
         elif trend == "BEARISH":
-
-            if not crossed_down:
+            if not aligned_sell:
+                reason = "EMA_NOT_BEARISH_ALIGNED"
+            elif REQUIRE_FRESH_CROSS and not crossed_down:
                 reason = "NO_BEARISH_EMA_CROSS"
-
             elif not sell_rsi_ok:
                 reason = "SELL_RSI_OUT_OF_RANGE"
-
             elif not volume_ok:
                 reason = "VOLUME_TOO_LOW"
-
             else:
                 signal = "sell"
                 reason = "SELL_SETUP_CONFIRMED"
 
-        # Price gap is checked independently.
         if not gap_ok:
             signal = None
             reason = "LIVE_PRICE_TOO_FAR_FROM_CANDLE"
@@ -760,6 +681,8 @@ def check_signal(symbol):
             "ema20_5m": number(e["ema20"]),
             "previous_ema10_5m": number(prev["ema10"]),
             "previous_ema20_5m": number(prev["ema20"]),
+            "aligned_buy": bool(aligned_buy),
+            "aligned_sell": bool(aligned_sell),
             "crossed_up": bool(crossed_up),
             "crossed_down": bool(crossed_down),
             "rsi": rsi,
@@ -769,39 +692,29 @@ def check_signal(symbol):
             "volume_avg": volume_avg,
             "volume_ok": bool(volume_ok),
             "atr": atr,
-            "time": datetime.now(timezone.utc).isoformat(),
+            "time": utc_now(),
         }
 
         with lock:
             state["last_signals"][symbol] = result
 
         log.info(
-            "[SIGNAL DIAGNOSTIC] %s "
-            "TREND=%s EMA50=%.8f EMA200=%.8f "
+            "[SIGNAL DIAGNOSTIC] %s TREND=%s "
+            "EMA50=%.8f EMA200=%.8f "
             "EMA10=%.8f EMA20=%.8f "
+            "ALIGNED_BUY=%s ALIGNED_SELL=%s "
             "CROSS_UP=%s CROSS_DOWN=%s "
             "RSI=%.2f BUY_RSI=%s SELL_RSI=%s "
             "VOL=%.4f VOL_AVG=%.4f VOL_OK=%s "
-            "GAP=%.4f%% GAP_OK=%s "
-            "FINAL=%s REASON=%s",
-            symbol,
-            trend,
-            number(t["ema50"]),
-            number(t["ema200"]),
-            number(e["ema10"]),
-            number(e["ema20"]),
-            crossed_up,
-            crossed_down,
-            rsi,
-            buy_rsi_ok,
-            sell_rsi_ok,
-            volume,
-            volume_avg,
-            volume_ok,
-            gap * 100,
-            gap_ok,
-            signal,
-            reason
+            "GAP=%.4f%% GAP_OK=%s FINAL=%s REASON=%s",
+            symbol, trend,
+            number(t["ema50"]), number(t["ema200"]),
+            number(e["ema10"]), number(e["ema20"]),
+            aligned_buy, aligned_sell,
+            crossed_up, crossed_down,
+            rsi, buy_rsi_ok, sell_rsi_ok,
+            volume, volume_avg, volume_ok,
+            gap * 100, gap_ok, signal, reason
         )
 
         return result, reason
@@ -815,91 +728,85 @@ def check_signal(symbol):
 # ACCOUNT / POSITIONS / ORDERS
 # ============================================================
 def get_positions():
+    """
+    Fail closed: if any product position request fails,
+    do not return a potentially incomplete position list.
+    """
     all_positions = []
 
     for symbol, product in PRODUCTS.items():
-        try:
-            data = api_request(
-                "GET",
-                "/v2/positions",
-                params={
-                    "product_id": int(product["id"])
-                }
-            )
+        data = api_request(
+            "GET",
+            "/v2/positions",
+            params={"product_id": int(product["id"])}
+        )
 
-            result = data.get("result", {})
+        result = data.get("result", {})
 
-            if isinstance(result, list):
-                rows = result
-            else:
-                rows = [result] if result else []
+        if isinstance(result, list):
+            rows = result
+        else:
+            rows = [result] if result else []
 
-            for p in rows:
-                size = number(p.get("size"))
-
-                if size != 0:
-                    p["symbol"] = symbol
-                    p["product_id"] = product["id"]
-
-                    all_positions.append(p)
-
-        except Exception as e:
-            log.warning(
-                "POSITION FETCH %s: %s",
-                symbol,
-                e
-            )
+        for p in rows:
+            size = number(p.get("size"))
+            if size != 0:
+                p["symbol"] = symbol
+                p["product_id"] = product["id"]
+                all_positions.append(p)
 
     return all_positions
 
 
 def get_active_orders():
-    try:
-        data = api_request(
-            "GET",
-            "/v2/orders"
-        )
-
-        rows = data.get("result", [])
-
-        return rows if isinstance(rows, list) else []
-
-    except Exception as e:
-        log.error("ACTIVE ORDERS ERROR: %s", e)
-        return []
-
-
-def get_wallet_balances():
-    data = api_request(
-        "GET",
-        "/v2/wallet/balances"
-    )
-
+    data = api_request("GET", "/v2/orders")
     rows = data.get("result", [])
-
     return rows if isinstance(rows, list) else []
 
 
-def available_usd_balance():
+def get_wallet_balances():
+    data = api_request("GET", "/v2/wallet/balances")
+    rows = data.get("result", [])
+    return rows if isinstance(rows, list) else []
+
+
+def usd_wallet_row():
     rows = get_wallet_balances()
 
     for row in rows:
-        asset = str(
-            row.get(
-                "asset_symbol",
-                row.get("asset", "")
-            )
-        ).upper()
+        asset = str(row.get("asset_symbol", "")).upper()
+        if asset == "USD":
+            return row
 
-        if asset in ("USD", "USDT", "USDC"):
-            available = row.get("available_balance")
+    raise RuntimeError("USD wallet balance not found")
 
-            if available is None:
-                available = row.get("balance")
 
-            return number(available)
+def available_usd_balance():
+    row = usd_wallet_row()
+    return number(row.get("available_balance"))
 
-    return 0.0
+
+def exchange_margin_used_usd():
+    """
+    Uses exchange-reported wallet margin fields.
+    blocked_margin is treated as the aggregate when available.
+    Otherwise uses the component fields.
+    """
+    row = usd_wallet_row()
+
+    blocked = number(row.get("blocked_margin"))
+
+    components = (
+        number(row.get("position_margin"))
+        + number(row.get("order_margin"))
+        + number(row.get("cross_position_margin"))
+        + number(row.get("cross_order_margin"))
+        + number(row.get("cross_commission"))
+        + number(row.get("commission"))
+        + number(row.get("cross_locked_collateral"))
+    )
+
+    return max(blocked, components)
 
 
 def get_product_leverage(product_id):
@@ -909,15 +816,10 @@ def get_product_leverage(product_id):
     )
 
     result = data.get("result", {})
-
-    leverage = number(
-        result.get("leverage")
-    )
+    leverage = number(result.get("leverage"))
 
     if leverage <= 0:
-        raise RuntimeError(
-            "Actual leverage unavailable"
-        )
+        raise RuntimeError("Actual leverage unavailable")
 
     return leverage
 
@@ -926,36 +828,32 @@ def get_product_leverage(product_id):
 # CONTRACT SIZING - FAIL CLOSED
 # ============================================================
 def contract_notional_usd_per_contract(product, price):
-    value = number(
-        product.get("contract_value")
-    )
-
+    value = number(product.get("contract_value"))
     unit = str(
         product.get("contract_unit_currency", "")
     ).upper()
 
-    underlying = asset_symbol(
-        product.get("underlying_asset")
-    )
+    underlying = asset_symbol(product.get("underlying_asset"))
+    settling = asset_symbol(product.get("settling_asset"))
 
     if value <= 0 or price <= 0:
         return 0.0
 
-    # Contract value is already USD.
-    if unit == "USD":
+    # Contract value already expressed in settlement currency.
+    if unit == "USD" and settling == "USD":
         return value
 
-    # Contract value represents units of underlying asset.
+    # Contract value represents underlying units.
     if unit and underlying and unit == underlying:
         return value * price
 
-    # Unknown conversion must never be guessed.
     log.warning(
-        "[SIZING BLOCK] %s unsupported unit=%s underlying=%s "
+        "[SIZING BLOCK] %s unit=%s underlying=%s settling=%s "
         "contract_value=%s",
         product.get("symbol"),
         unit,
         underlying,
+        settling,
         value
     )
 
@@ -964,8 +862,7 @@ def contract_notional_usd_per_contract(product, price):
 
 def calculate_order_size(product, price, leverage):
     per_contract = contract_notional_usd_per_contract(
-        product,
-        price
+        product, price
     )
 
     if per_contract <= 0:
@@ -973,33 +870,20 @@ def calculate_order_size(product, price, leverage):
             "Unsupported contract unit; refusing guessed quantity"
         )
 
-    target_notional = (
-        MARGIN_PER_TRADE_USD * leverage
-    )
-
+    target_notional = MARGIN_PER_TRADE_USD * leverage
     raw_size = target_notional / per_contract
-
-    size = int(
-        math.floor(raw_size)
-    )
+    size = int(math.floor(raw_size))
 
     if size < 1:
         raise RuntimeError(
-            "20 USD margin cannot buy minimum one contract"
+            "Configured margin cannot buy minimum one contract"
         )
 
-    actual_notional = (
-        size * per_contract
-    )
-
-    actual_margin = (
-        actual_notional / leverage
-    )
+    actual_notional = size * per_contract
+    actual_margin = actual_notional / leverage
 
     if actual_margin > MARGIN_PER_TRADE_USD * 1.001:
-        raise RuntimeError(
-            "Calculated margin exceeds budget"
-        )
+        raise RuntimeError("Calculated margin exceeds trade budget")
 
     return size, actual_margin, per_contract
 
@@ -1007,62 +891,33 @@ def calculate_order_size(product, price, leverage):
 # ============================================================
 # ACCOUNT MARGIN GUARD
 # ============================================================
-def estimated_position_margin(position):
-    """
-    Prefer exchange-provided margin fields.
-    If not available, reserve the configured $20 per open position.
-    This is a conservative local estimate, not exchange-confirmed margin.
-    """
-    for key in (
-        "initial_margin",
-        "margin",
-        "position_margin",
-        "margin_requirement"
-    ):
-        value = number(position.get(key))
-
-        if value > 0:
-            return value
-
-    return MARGIN_PER_TRADE_USD
-
-
-def account_margin_guard(positions=None):
+def account_margin_guard():
     balance = available_usd_balance()
+    used_margin = exchange_margin_used_usd()
+
+    with lock:
+        state["available_balance"] = balance
+        state["account_margin_used"] = used_margin
 
     if balance <= 0:
-        raise RuntimeError(
-            "Could not verify available USD balance"
-        )
+        raise RuntimeError("Could not verify available USD balance")
 
     if balance < MARGIN_PER_TRADE_USD + BALANCE_BUFFER_USD:
         raise RuntimeError(
             f"Insufficient available balance: {balance:.2f} USD"
         )
 
-    if positions is None:
-        positions = get_positions()
-
-    used_margin = sum(
-        estimated_position_margin(p)
-        for p in positions
-        if number(p.get("size")) != 0
-    )
-
-    remaining_cap = (
-        MAX_ACCOUNT_MARGIN_USE_USD - used_margin
-    )
+    remaining_cap = MAX_ACCOUNT_MARGIN_USE_USD - used_margin
 
     if remaining_cap < MARGIN_PER_TRADE_USD:
         raise RuntimeError(
-            f"Account margin cap reached: "
-            f"estimated_used={used_margin:.2f} "
+            f"Account margin cap reached: used={used_margin:.2f} "
             f"cap={MAX_ACCOUNT_MARGIN_USE_USD:.2f}"
         )
 
     if balance - BALANCE_BUFFER_USD < MARGIN_PER_TRADE_USD:
         raise RuntimeError(
-            "Available balance after buffer is below trade margin"
+            "Available balance after buffer below trade margin"
         )
 
     return balance
@@ -1073,25 +928,15 @@ def account_margin_guard(positions=None):
 # ============================================================
 def round_to_tick(price, tick_size):
     tick = number(tick_size)
-
     if tick <= 0:
         return price
-
-    return round(
-        round(price / tick) * tick,
-        10
-    )
+    return round(round(price / tick) * tick, 10)
 
 
 # ============================================================
 # ORDER PLACEMENT
 # ============================================================
-def place_market_order(
-    product_id,
-    side,
-    size,
-    reduce_only=False
-):
+def place_market_order(product_id, side, size, reduce_only=False):
     body = {
         "product_id": int(product_id),
         "size": int(size),
@@ -1111,39 +956,28 @@ def place_market_order(
 
 def close_position_market(symbol, position_size):
     product = PRODUCTS.get(symbol)
-
     if not product:
-        return False
+        raise RuntimeError(f"Product unavailable for close: {symbol}")
 
     size = abs(int(position_size))
-
     if size <= 0:
         return False
 
-    side = (
-        "sell"
-        if position_size > 0
-        else "buy"
-    )
+    side = "sell" if position_size > 0 else "buy"
 
     result = place_market_order(
-        product["id"],
-        side,
-        size,
-        reduce_only=True
+        product["id"], side, size, reduce_only=True
     )
 
-    event(
-        f"CLOSE ORDER {symbol} side={side} size={size}"
-    )
+    event(f"CLOSE ORDER SENT {symbol} side={side} size={size}")
 
     write_trade_log({
-        "event": "CLOSE",
+        "event": "CLOSE_ORDER",
         "symbol": symbol,
         "side": side,
         "size": size,
         "result": result,
-        "time": datetime.now(timezone.utc).isoformat()
+        "time": utc_now()
     })
 
     return True
@@ -1153,54 +987,39 @@ def partial_close_position(symbol, position_size):
     total = abs(int(position_size))
 
     if total < 2:
-        event(
-            f"PARTIAL SKIPPED {symbol}: "
-            "position below 2 contracts"
-        )
+        event(f"PARTIAL SKIPPED {symbol}: below 2 contracts")
         return False
 
     close_size = max(
         1,
         int(math.floor(total * PARTIAL_CLOSE_PERCENT))
     )
-
-    close_size = min(
-        close_size,
-        total - 1
-    )
-
-    side = (
-        "sell"
-        if position_size > 0
-        else "buy"
-    )
+    close_size = min(close_size, total - 1)
 
     product = PRODUCTS.get(symbol)
-
     if not product:
-        return False
+        raise RuntimeError(f"Product unavailable for partial close: {symbol}")
+
+    side = "sell" if position_size > 0 else "buy"
 
     result = place_market_order(
-        product["id"],
-        side,
-        close_size,
-        reduce_only=True
+        product["id"], side, close_size, reduce_only=True
     )
 
     event(
-        f"PARTIAL CLOSE {symbol} size={close_size} "
-        f"remaining_est={total-close_size}"
+        f"PARTIAL CLOSE ORDER SENT {symbol} "
+        f"size={close_size}; awaiting position confirmation"
     )
 
     write_trade_log({
-        "event": "PARTIAL_CLOSE",
+        "event": "PARTIAL_CLOSE_ORDER",
         "symbol": symbol,
         "size": close_size,
         "result": result,
-        "time": datetime.now(timezone.utc).isoformat()
+        "time": utc_now()
     })
 
-    return True
+    return close_size
 
 
 # ============================================================
@@ -1208,14 +1027,8 @@ def partial_close_position(symbol, position_size):
 # ============================================================
 def initialize_position_metadata(position):
     symbol = position["symbol"]
-
-    size = number(
-        position.get("size")
-    )
-
-    entry = number(
-        position.get("entry_price")
-    )
+    size = number(position.get("size"))
+    entry = number(position.get("entry_price"))
 
     if not entry or not size:
         return
@@ -1223,36 +1036,17 @@ def initialize_position_metadata(position):
     if symbol in POSITION_META:
         return
 
-    product = PRODUCTS.get(symbol)
-
-    if not product:
-        return
-
     try:
-        candles = get_candles(
-            symbol,
-            TREND_TIMEFRAME
-        )
-
+        candles = get_candles(symbol, TREND_TIMEFRAME)
         if len(candles) < 30:
             return
 
-        candles = add_indicators(candles)
-
-        atr = number(
-            candles.iloc[-1]["atr"]
-        )
-
+        atr = number(add_indicators(candles).iloc[-1]["atr"])
         if atr <= 0:
             return
 
-        direction = (
-            1 if size > 0 else -1
-        )
-
-        stop_distance = (
-            atr * ATR_STOP_MULTIPLIER
-        )
+        direction = 1 if size > 0 else -1
+        stop_distance = atr * ATR_STOP_MULTIPLIER
 
         POSITION_META[symbol] = {
             "entry": entry,
@@ -1262,49 +1056,37 @@ def initialize_position_metadata(position):
             "best_price": entry,
             "atr": atr,
             "partial_done": False,
+            "partial_pending": False,
+            "partial_before_size": 0,
+            "exit_pending": False,
             "created_at": time.time(),
         }
 
         event(
-            f"POSITION INIT {symbol} "
-            f"entry={entry} ATR={atr} "
-            f"stop={POSITION_META[symbol]['stop']}"
+            f"POSITION INIT {symbol} entry={entry} "
+            f"ATR={atr:.8f} stop={POSITION_META[symbol]['stop']:.8f}"
         )
+        save_position_meta()
 
     except Exception as e:
-        log.error(
-            "POSITION INIT ERROR %s: %s",
-            symbol,
-            e
-        )
+        log.error("POSITION INIT ERROR %s: %s", symbol, e)
 
 
 def partial_target_distance(symbol, atr):
     if symbol in FIXED_PARTIAL_TARGETS:
         return FIXED_PARTIAL_TARGETS[symbol]
-
     return atr * ATR_PARTIAL_MULTIPLIER
 
 
 def handle_trailing(positions):
-    agent(
-        "Risk Check",
-        "RUNNING",
-        "Checking open positions"
-    )
+    agent("Risk Check", "RUNNING", "Managing open positions")
 
     active_symbols = set()
 
     for p in positions:
         symbol = p.get("symbol")
-
-        size = number(
-            p.get("size")
-        )
-
-        entry = number(
-            p.get("entry_price")
-        )
+        size = number(p.get("size"))
+        entry = number(p.get("entry_price"))
 
         if not symbol or size == 0 or entry <= 0:
             continue
@@ -1315,189 +1097,139 @@ def handle_trailing(positions):
             continue
 
         initialize_position_metadata(p)
-
         meta = POSITION_META.get(symbol)
 
         if not meta:
             continue
 
         try:
-            price = get_live_price(symbol)
+            if meta.get("exit_pending"):
+                log.warning("[EXIT PENDING] %s waiting for exchange update", symbol)
+                continue
 
+            price = get_live_price(symbol)
             if price <= 0:
                 continue
 
             product = PRODUCTS[symbol]
+            tick = number(product.get("tick_size"))
+            direction = 1 if size > 0 else -1
 
-            tick = number(
-                product.get("tick_size")
-            )
+            # Confirm partial close using actual position size.
+            current_abs_size = abs(int(size))
 
-            direction = (
-                1 if size > 0 else -1
-            )
+            if meta.get("partial_pending"):
+                before_size = int(meta.get("partial_before_size", 0))
 
-            atr = number(
-                meta["atr"]
-            )
+                if before_size > 0 and current_abs_size < before_size:
+                    meta["partial_pending"] = False
+                    meta["partial_done"] = True
 
-            candles = get_candles(
-                symbol,
-                TREND_TIMEFRAME
-            )
+                    if direction == 1:
+                        meta["stop"] = max(meta["stop"], entry)
+                    else:
+                        meta["stop"] = min(meta["stop"], entry)
 
+                    event(f"PARTIAL CONFIRMED {symbol} remaining={current_abs_size}")
+                    save_position_meta()
+
+                else:
+                    log.info(
+                        "[PARTIAL WAIT] %s current=%s expected_below=%s",
+                        symbol, current_abs_size, before_size
+                    )
+                    continue
+
+            atr = number(meta.get("atr"))
+
+            candles = get_candles(symbol, TREND_TIMEFRAME)
             if len(candles) >= 30:
                 latest_atr = number(
                     add_indicators(candles).iloc[-1]["atr"]
                 )
-
                 if latest_atr > 0:
                     atr = latest_atr
                     meta["atr"] = atr
 
-            # ------------------------------------------------
-            # LONG
-            # ------------------------------------------------
+            if atr <= 0:
+                continue
+
             if direction == 1:
                 meta["best_price"] = max(
-                    meta["best_price"],
-                    price
+                    number(meta["best_price"]), price
                 )
-
                 profit_move = price - entry
-
                 trail_stop = (
-                    meta["best_price"]
-                    - atr * ATR_TRAIL_MULTIPLIER
+                    meta["best_price"] - atr * ATR_TRAIL_MULTIPLIER
                 )
+                meta["stop"] = max(number(meta["stop"]), trail_stop)
 
-                meta["stop"] = max(
-                    meta["stop"],
-                    trail_stop
-                )
-
-            # ------------------------------------------------
-            # SHORT
-            # ------------------------------------------------
             else:
                 meta["best_price"] = min(
-                    meta["best_price"],
-                    price
+                    number(meta["best_price"]), price
                 )
-
                 profit_move = entry - price
-
                 trail_stop = (
-                    meta["best_price"]
-                    + atr * ATR_TRAIL_MULTIPLIER
+                    meta["best_price"] + atr * ATR_TRAIL_MULTIPLIER
                 )
+                meta["stop"] = min(number(meta["stop"]), trail_stop)
 
-                meta["stop"] = min(
-                    meta["stop"],
-                    trail_stop
-                )
+            partial_distance = partial_target_distance(symbol, atr)
 
-            partial_distance = partial_target_distance(
-                symbol,
-                atr
-            )
-
-            # ------------------------------------------------
-            # PARTIAL TAKE PROFIT
-            # ------------------------------------------------
             if (
-                not meta["partial_done"]
+                not meta.get("partial_done")
+                and not meta.get("partial_pending")
                 and profit_move >= partial_distance
             ):
-                completed = partial_close_position(
-                    symbol,
-                    size
-                )
+                close_size = partial_close_position(symbol, size)
 
-                if completed:
-                    meta["partial_done"] = True
+                if close_size:
+                    meta["partial_pending"] = True
+                    meta["partial_before_size"] = current_abs_size
+                    save_position_meta()
 
-                    if direction == 1:
-                        meta["stop"] = max(
-                            meta["stop"],
-                            entry
-                        )
+            meta["stop"] = round_to_tick(meta["stop"], tick)
 
-                    else:
-                        meta["stop"] = min(
-                            meta["stop"],
-                            entry
-                        )
-
-                    event(
-                        f"PARTIAL TARGET HIT {symbol} "
-                        f"move={profit_move:.6f} "
-                        f"target={partial_distance:.6f}"
-                    )
-
-            meta["stop"] = round_to_tick(
-                meta["stop"],
-                tick
+            stop_hit = (
+                price <= meta["stop"]
+                if direction == 1
+                else price >= meta["stop"]
             )
 
-            # Recalculate stop hit AFTER partial stop update.
-            if direction == 1:
-                stop_hit = price <= meta["stop"]
-            else:
-                stop_hit = price >= meta["stop"]
-
-            # ------------------------------------------------
-            # STOP EXIT
-            # ------------------------------------------------
             if stop_hit:
                 event(
                     f"BOT STOP HIT {symbol} "
-                    f"price={price} stop={meta['stop']}"
+                    f"price={price:.8f} stop={meta['stop']:.8f}"
                 )
 
-                closed = close_position_market(
-                    symbol,
-                    size
-                )
+                meta["exit_pending"] = True
+                save_position_meta()
 
-                if closed:
-                    POSITION_META.pop(
-                        symbol,
-                        None
-                    )
-
+                close_position_market(symbol, size)
                 continue
 
             log.info(
-                "[TRAIL] %s side=%s price=%.8f "
-                "entry=%.8f move=%.8f "
-                "partial=%.8f stop=%.8f",
+                "[TRAIL] %s side=%s price=%.8f entry=%.8f "
+                "move=%.8f partial=%.8f stop=%.8f "
+                "partial_done=%s",
                 symbol,
                 "LONG" if direction == 1 else "SHORT",
-                price,
-                entry,
-                profit_move,
-                partial_distance,
-                meta["stop"]
+                price, entry, profit_move,
+                partial_distance, meta["stop"],
+                meta.get("partial_done")
             )
+
+            save_position_meta()
 
         except Exception as e:
-            log.exception(
-                "TRAIL ERROR %s: %s",
-                symbol,
-                e
-            )
+            log.exception("TRAIL ERROR %s: %s", symbol, e)
 
-    # Remove metadata for positions no longer open.
     for symbol in list(POSITION_META.keys()):
         if symbol not in active_symbols:
             POSITION_META.pop(symbol, None)
 
-    agent(
-        "Risk Check",
-        "OK",
-        "Position management cycle complete"
-    )
+    save_position_meta()
+    agent("Risk Check", "OK", "Position management cycle complete")
 
 
 # ============================================================
@@ -1505,117 +1237,74 @@ def handle_trailing(positions):
 # ============================================================
 def has_symbol_position(symbol, positions):
     return any(
-        p.get("symbol") == symbol
-        and number(p.get("size")) != 0
+        p.get("symbol") == symbol and number(p.get("size")) != 0
         for p in positions
     )
 
 
 def has_symbol_active_order(symbol, orders):
     product = PRODUCTS.get(symbol)
-
     if not product:
         return True
 
-    product_id = str(
-        product.get("id")
-    )
+    product_id = str(product.get("id"))
 
     for order in orders:
-        if str(order.get("product_id")) == product_id:
-            status = str(
-                order.get("state", "")
-            ).lower()
+        if str(order.get("product_id")) != product_id:
+            continue
 
-            if status not in (
-                "closed",
-                "cancelled",
-                "rejected"
-            ):
-                return True
+        status = str(order.get("state", "")).lower()
+        if status not in ("closed", "cancelled", "rejected"):
+            return True
 
     return False
 
 
 def cooldown_active(symbol):
-    last = LAST_TRADE_TIME.get(
-        symbol,
-        0
-    )
-
-    return (
-        time.time() - last
-        < COOLDOWN_SECONDS
-    )
+    last = LAST_TRADE_TIME.get(symbol, 0)
+    return time.time() - last < COOLDOWN_SECONDS
 
 
 # ============================================================
 # ENTRY EXECUTOR
 # ============================================================
-def enter_trade(signal, positions=None):
+def enter_trade(signal):
     symbol = signal["symbol"]
-
     product = PRODUCTS.get(symbol)
 
     if not product:
-        raise RuntimeError(
-            "Product not found"
-        )
+        raise RuntimeError("Product not found")
 
     side = signal["signal"]
+    price = number(signal["price"])
 
-    price = number(
-        signal["price"]
-    )
-
-    if side not in ("buy", "sell"):
+    if side not in ("buy", "sell") or price <= 0:
         return
 
-    agent(
-        "Position Sizer",
-        "RUNNING",
-        symbol
-    )
+    agent("Position Sizer", "RUNNING", symbol)
 
-    balance = account_margin_guard(
-        positions
-    )
-
-    leverage = get_product_leverage(
-        product["id"]
-    )
+    balance = account_margin_guard()
+    leverage = get_product_leverage(product["id"])
 
     size, margin, per_contract = calculate_order_size(
-        product,
-        price,
-        leverage
+        product, price, leverage
     )
 
     event(
-        f"SIZE {symbol} contracts={size} "
-        f"margin={margin:.4f} "
-        f"leverage={leverage} "
-        f"contract_notional={per_contract:.8f}"
+        f"SIZE {symbol} contracts={size} margin={margin:.4f} "
+        f"leverage={leverage} per_contract_notional={per_contract:.8f}"
     )
 
     agent(
         "Position Sizer",
         "OK",
-        f"{symbol}: {size} contracts / "
-        f"{margin:.2f} USD margin"
+        f"{symbol}: {size} contracts / {margin:.2f} USD"
     )
 
-    agent(
-        "Executor",
-        "RUNNING",
-        f"Submitting {side} {symbol}"
-    )
+    agent("Executor", "RUNNING", f"Submitting {side} {symbol}")
 
     result = place_market_order(
-        product["id"],
-        side,
-        size,
-        reduce_only=False
+        product["id"], side, size, reduce_only=False
     )
 
     LAST_TRADE_TIME[symbol] = time.time()
@@ -1624,14 +1313,13 @@ def enter_trade(signal, positions=None):
         state["trade_count"] += 1
 
     event(
-        f"ENTRY ORDER SENT {symbol} "
-        f"side={side} size={size} "
-        f"margin={margin:.2f} "
+        f"ENTRY ORDER SUBMITTED {symbol} side={side} "
+        f"size={size} margin_est={margin:.2f} "
         f"available_balance={balance:.2f}"
     )
 
     write_trade_log({
-        "event": "ENTRY",
+        "event": "ENTRY_ORDER",
         "symbol": symbol,
         "side": side,
         "size": size,
@@ -1639,14 +1327,10 @@ def enter_trade(signal, positions=None):
         "leverage": leverage,
         "price_reference": price,
         "order_result": result,
-        "time": datetime.now(timezone.utc).isoformat()
+        "time": utc_now()
     })
 
-    agent(
-        "Executor",
-        "OK",
-        f"{symbol} order submitted"
-    )
+    agent("Executor", "OK", f"{symbol} order submitted")
 
 
 # ============================================================
@@ -1661,17 +1345,17 @@ def trading_loop():
                 with lock:
                     state["status"] = "API KEYS MISSING"
 
-                agent(
-                    "Executor",
-                    "BLOCKED",
-                    "API credentials missing"
-                )
-
+                agent("Executor", "BLOCKED", "API credentials missing")
                 time.sleep(30)
                 continue
 
             discover_futures()
 
+            if not PRODUCTS:
+                raise RuntimeError("No eligible markets discovered")
+
+            # Position request must complete for every product.
+            # If it fails, the loop blocks new entries.
             positions = get_positions()
             orders = get_active_orders()
 
@@ -1679,10 +1363,9 @@ def trading_loop():
                 state["positions"] = positions
                 state["active_orders"] = orders
 
-            # Manage existing positions first.
             handle_trailing(positions)
 
-            # Refresh positions after management.
+            # Refresh after any close/partial-close order.
             positions = get_positions()
             orders = get_active_orders()
 
@@ -1693,44 +1376,25 @@ def trading_loop():
             if not ENABLE_TRADING:
                 with lock:
                     state["status"] = "SCANNER ONLY"
-
                 time.sleep(CHECK_INTERVAL)
                 continue
 
             if len(positions) >= MAX_POSITIONS:
                 event(
-                    f"MAX POSITIONS REACHED "
-                    f"{len(positions)}/{MAX_POSITIONS}"
+                    f"MAX POSITIONS REACHED {len(positions)}/{MAX_POSITIONS}"
                 )
-
                 time.sleep(CHECK_INTERVAL)
                 continue
 
             try:
-                balance = account_margin_guard(
-                    positions
-                )
-
+                balance = account_margin_guard()
             except Exception as e:
-                agent(
-                    "Equity",
-                    "BLOCKED",
-                    str(e)
-                )
-
-                log.warning(
-                    "[EQUITY BLOCK] %s",
-                    e
-                )
-
+                agent("Equity", "BLOCKED", str(e))
+                log.warning("[EQUITY BLOCK] %s", e)
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            agent(
-                "Equity",
-                "OK",
-                f"Available balance {balance:.2f} USD"
-            )
+            agent("Equity", "OK", f"Available balance {balance:.2f} USD")
 
             open_symbols = {
                 p.get("symbol")
@@ -1750,39 +1414,25 @@ def trading_loop():
                 scanned += 1
 
                 if symbol in open_symbols:
-                    log.info(
-                        "[SCAN SKIP] %s REASON=POSITION_ALREADY_OPEN",
-                        symbol
-                    )
+                    log.info("[SCAN SKIP] %s POSITION_ALREADY_OPEN", symbol)
                     continue
 
                 if has_symbol_active_order(symbol, orders):
-                    log.info(
-                        "[SCAN SKIP] %s REASON=ACTIVE_ORDER",
-                        symbol
-                    )
+                    log.info("[SCAN SKIP] %s ACTIVE_ORDER", symbol)
                     continue
 
                 if cooldown_active(symbol):
-                    log.info(
-                        "[SCAN SKIP] %s REASON=COOLDOWN",
-                        symbol
-                    )
+                    log.info("[SCAN SKIP] %s COOLDOWN", symbol)
                     continue
 
                 signal, reason = check_signal(symbol)
 
                 if not signal or not signal.get("signal"):
-                    log.info(
-                        "[SCAN] %s SIGNAL=NONE REASON=%s",
-                        symbol,
-                        reason
-                    )
+                    log.info("[SCAN] %s SIGNAL=NONE REASON=%s", symbol, reason)
                     continue
 
                 log.info(
-                    "[SIGNAL] %s %s TREND=%s "
-                    "PRICE=%.8f RSI=%.2f ATR=%.8f",
+                    "[SIGNAL] %s %s TREND=%s PRICE=%.8f RSI=%.2f ATR=%.8f",
                     symbol,
                     signal["signal"].upper(),
                     signal["trend"],
@@ -1792,32 +1442,29 @@ def trading_loop():
                 )
 
                 try:
-                    # Re-check positions and orders before entry.
+                    # Recheck account positions and orders immediately.
                     fresh_positions = get_positions()
                     fresh_orders = get_active_orders()
 
                     if len(fresh_positions) >= MAX_POSITIONS:
                         break
 
-                    if has_symbol_position(
-                        symbol,
-                        fresh_positions
-                    ):
+                    if has_symbol_position(symbol, fresh_positions):
                         continue
 
-                    if has_symbol_active_order(
-                        symbol,
-                        fresh_orders
-                    ):
+                    if has_symbol_active_order(symbol, fresh_orders):
                         continue
 
-                    # Recheck margin before order submission.
-                    enter_trade(
-                        signal,
-                        fresh_positions
-                    )
+                    # Check the exchange margin cap again just before entry.
+                    account_margin_guard()
+                    enter_trade(signal)
 
                     positions = get_positions()
+                    orders = get_active_orders()
+
+                    with lock:
+                        state["positions"] = positions
+                        state["active_orders"] = orders
 
                     open_symbols = {
                         p.get("symbol")
@@ -1826,48 +1473,27 @@ def trading_loop():
                     }
 
                 except Exception as e:
-                    log.exception(
-                        "ENTRY BLOCKED %s: %s",
-                        symbol,
-                        e
-                    )
-
-                    agent(
-                        "Executor",
-                        "BLOCKED",
-                        f"{symbol}: {e}"
-                    )
+                    log.exception("ENTRY BLOCKED %s: %s", symbol, e)
+                    agent("Executor", "BLOCKED", f"{symbol}: {e}")
 
                 time.sleep(0.2)
 
             with lock:
-                state["last_scan"] = datetime.now(
-                    timezone.utc
-                ).isoformat()
-
+                state["last_scan"] = utc_now()
                 state["status"] = "TESTNET LIVE"
 
             save_state()
-
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
-            log.exception(
-                "MAIN LOOP ERROR"
-            )
+            log.exception("MAIN LOOP ERROR")
 
             with lock:
                 state["last_error"] = str(e)
                 state["status"] = "ERROR - RETRYING"
 
-            agent(
-                "Scanner",
-                "ERROR",
-                str(e)
-            )
-
+            agent("Scanner", "ERROR", str(e))
             save_state()
-
             time.sleep(10)
 
 
@@ -1879,7 +1505,6 @@ def dashboard_auth():
         return True
 
     auth = request.authorization
-
     return bool(
         auth
         and auth.username == VIEW_USER
@@ -1910,7 +1535,7 @@ def health():
         "ok": True,
         "status": state.get("status"),
         "mode": "TESTNET ONLY",
-        "time": datetime.now(timezone.utc).isoformat()
+        "time": utc_now()
     })
 
 
@@ -1923,10 +1548,7 @@ def dashboard():
         return Response(
             "Authentication required",
             401,
-            {
-                "WWW-Authenticate":
-                'Basic realm="Dashboard"'
-            }
+            {"WWW-Authenticate": 'Basic realm="Dashboard"'}
         )
 
     html = """
@@ -1957,7 +1579,6 @@ def dashboard():
     </head>
     <body>
       <h2>DELTA EXCHANGE INDIA - TESTNET</h2>
-
       <div class="card" id="status">Loading...</div>
 
       <div class="card">
@@ -2001,6 +1622,8 @@ def dashboard():
               '\\nMODE: ' + d.mode +
               '\\nPOSITIONS: ' + d.positions.length +
               '\\nTRADE COUNT: ' + d.trade_count +
+              '\\nAVAILABLE BALANCE: ' + d.available_balance +
+              '\\nACCOUNT MARGIN USED: ' + d.account_margin_used +
               '\\nLAST SCAN: ' + d.last_scan +
               '\\nERROR: ' + d.last_error;
 
@@ -2023,8 +1646,7 @@ def dashboard():
               JSON.stringify(d.events.slice(-20), null, 2);
 
           } catch(e) {
-            document.getElementById('status').innerText =
-              String(e);
+            document.getElementById('status').innerText = String(e);
           }
         }
 
@@ -2035,10 +1657,7 @@ def dashboard():
     </html>
     """
 
-    return Response(
-        html,
-        mimetype="text/html"
-    )
+    return Response(html, mimetype="text/html")
 
 
 # ============================================================
@@ -2047,15 +1666,10 @@ def dashboard():
 @app.route("/dashboard-data")
 def dashboard_data():
     if not dashboard_auth():
-        return Response(
-            "Unauthorized",
-            401
-        )
+        return Response("Unauthorized", 401)
 
     with lock:
-        snapshot = json.loads(
-            json.dumps(state, default=str)
-        )
+        snapshot = json.loads(json.dumps(state, default=str))
 
     return jsonify(snapshot)
 
@@ -2064,58 +1678,28 @@ def dashboard_data():
 # STARTUP
 # ============================================================
 def start_bot():
+    load_position_meta()
+
     thread = threading.Thread(
         target=trading_loop,
         daemon=True,
         name="delta-testnet-trading-loop"
     )
-
     thread.start()
 
-    log.info(
-        "TRADING ENGINE THREAD STARTED"
-    )
+    log.info("TRADING ENGINE THREAD STARTED")
 
 
 if __name__ == "__main__":
-    log.info(
-        "DELTA INDIA TESTNET BOT STARTING"
-    )
-
-    log.info(
-        "TESTNET BASE URL: %s",
-        BASE_URL
-    )
-
-    log.info(
-        "API KEY PRESENT: %s",
-        bool(API_KEY)
-    )
-
-    log.info(
-        "API SECRET PRESENT: %s",
-        bool(API_SECRET)
-    )
-
-    log.info(
-        "ENABLE TRADING: %s",
-        ENABLE_TRADING
-    )
-
-    log.info(
-        "MAX POSITIONS: %s",
-        MAX_POSITIONS
-    )
-
-    log.info(
-        "MARGIN PER TRADE: %.2f USD",
-        MARGIN_PER_TRADE_USD
-    )
-
-    log.info(
-        "MAX ACCOUNT MARGIN: %.2f USD",
-        MAX_ACCOUNT_MARGIN_USE_USD
-    )
+    log.info("DELTA INDIA TESTNET BOT STARTING")
+    log.info("TESTNET BASE URL: %s", BASE_URL)
+    log.info("API KEY PRESENT: %s", bool(API_KEY))
+    log.info("API SECRET PRESENT: %s", bool(API_SECRET))
+    log.info("ENABLE TRADING: %s", ENABLE_TRADING)
+    log.info("MAX POSITIONS: %s", MAX_POSITIONS)
+    log.info("MARGIN PER TRADE: %.2f USD", MARGIN_PER_TRADE_USD)
+    log.info("MAX ACCOUNT MARGIN: %.2f USD", MAX_ACCOUNT_MARGIN_USE_USD)
+    log.info("EMA ALIGNMENT MODE: %s", not REQUIRE_FRESH_CROSS)
 
     start_bot()
 
