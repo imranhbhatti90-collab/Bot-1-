@@ -239,57 +239,7 @@ def public_get(path, params=None):
     )
 
 
-def discover_futures(force=False):
-    global PRODUCTS, DISCOVERED_AT
 
-    if not force and time.time() - DISCOVERED_AT < DISCOVERY_INTERVAL:
-        return list(PRODUCTS.values())
-
-    agent("Scanner", "RUNNING", "Refreshing Delta product list")
-
-    found = []
-    after = None
-for _ in range(20):
-        params = {
-            "contract_types": "perpetual_futures",
-            "states": "live",
-            "page_size": 100,
-        }
-        if after:
-            params["after"] = after
-
-        data = public_get("/v2/products", params)
-        rows = data.get("result", [])
-
-        if isinstance(rows, dict):
-            rows = [rows]
-
-        found.extend(rows)
- for p in rows[:5]:
-    log.info(
-        "[PRODUCT DIAGNOSTIC] %s",
-        json.dumps({
-            "symbol": p.get("symbol"),
-            "contract_type": p.get("contract_type"),
-            "state": p.get("state"),
-            "trading_status": p.get("trading_status"),
-            "quoting_asset": p.get("quoting_asset"),
-            "settling_asset": p.get("settling_asset"),
-            "contract_value": p.get("contract_value"),
-            "contract_unit_currency": p.get("contract_unit_currency"),
-            "tick_size": p.get("tick_size"),
-        })
-    )
-        after = (data.get("meta") or {}).get("after")
-        if not after or not rows:
-            break
-
-    PRODUCTS = {}
-
-    for p in found:
-        symbol = str(p.get("symbol", "")).upper()
-        if not symbol:
-            continue
 
         if not is_eligible_product(p):
             continue
@@ -312,6 +262,88 @@ for _ in range(20):
     save_state()
     return list(PRODUCTS.values())
 
+
+def discover_futures(force=False):
+    global PRODUCTS, DISCOVERED_AT
+
+    if not force and time.time() - DISCOVERED_AT < DISCOVERY_INTERVAL:
+        return list(PRODUCTS.values())
+
+    agent("Scanner", "RUNNING", "Refreshing Delta product list")
+
+    found = []
+    after = None
+
+    for _ in range(20):
+        params = {
+            "contract_types": "perpetual_futures",
+            "states": "live",
+            "page_size": 100,
+        }
+
+        if after:
+            params["after"] = after
+
+        data = public_get("/v2/products", params)
+        rows = data.get("result", [])
+
+        if isinstance(rows, dict):
+            rows = [rows]
+
+        for p in rows[:5]:
+            log.info(
+                "[PRODUCT DIAGNOSTIC] %s",
+                json.dumps({
+                    "symbol": p.get("symbol"),
+                    "contract_type": p.get("contract_type"),
+                    "state": p.get("state"),
+                    "trading_status": p.get("trading_status"),
+                    "quoting_asset": p.get("quoting_asset"),
+                    "settling_asset": p.get("settling_asset"),
+                    "contract_value": p.get("contract_value"),
+                    "contract_unit_currency": p.get("contract_unit_currency"),
+                    "tick_size": p.get("tick_size"),
+                })
+            )
+
+        found.extend(rows)
+
+        after = (data.get("meta") or {}).get("after")
+        if not after or not rows:
+            break
+
+    PRODUCTS = {}
+
+    for p in found:
+        symbol = str(p.get("symbol", "")).upper()
+
+        if not symbol:
+            continue
+
+        if is_eligible_product(p):
+            PRODUCTS[symbol] = p
+
+    DISCOVERED_AT = time.time()
+
+    with lock:
+        state["discovered_markets"] = [
+            p.get("symbol") for p in found if p.get("symbol")
+        ]
+        state["eligible_markets"] = list(PRODUCTS.keys())
+
+    event(
+        f"DISCOVERY COMPLETE total={len(found)} "
+        f"eligible={len(PRODUCTS)}"
+    )
+
+    agent(
+        "Scanner",
+        "OK",
+        f"{len(PRODUCTS)} eligible perpetual markets"
+    )
+
+    save_state()
+    return list(PRODUCTS.values())
 
 def is_eligible_product(p):
     """
