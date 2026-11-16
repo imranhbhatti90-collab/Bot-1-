@@ -1,14 +1,14 @@
 
-# FINAL - SIRF PERPETUAL FUTURES - OPTIONS HATAYE
-# Problem: Delta 746 bhejta hai, usme 720 Options (C-BTC-, P-BTC-) hain, bot unme atak gaya
-# Fix: Sirf Perpetual Futures lega - BTCUSD, ETHUSD, SOLUSD jaisi - Options bilkul nahi
-# Entry sab me, SL 0.5% Red, TP 1% Green, MAX 138
+# FINAL FIX - CANDLE API FIX - PERP ONLY - SL + TP SAB ME
+# Problem: [SKIP] candles kam 0 sab me - kyunki candle API me product_id bhej rahe the, Delta ko symbol chahiye
+# Fix: Ab candles symbol se lega: /v2/history/candles?symbol=BTCUSD&resolution=5m&start=&end=
+# + Agar ek tareeka fail ho to dusra try karega
 
 import os, time, hmac, hashlib, json, requests, threading
 from flask import Flask
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot Live - Perp Only - SL + TP"
+def home(): return "Bot Live - Candle Fix - Perp Only"
 @app.route('/health')
 def health(): return "OK", 200
 
@@ -51,26 +51,33 @@ def get_all_products():
     for p in all_res:
         sym=p.get("symbol","")
         ctype=str(p.get("contract_type","")).lower()
-        # === SIRF PERPETUAL FILTER ===
-        # 1. USOON ignore
         if sym in IGNORE: continue
-        # 2. Options hatao - C- se shuru, P- se shuru, MV- se shuru
         if sym.startswith("C-") or sym.startswith("P-") or sym.startswith("MV-"): continue
-        # 3. Dash / underscore wale hatao - BTC_USDT, BTC_INR nahi chahiye
         if "-" in sym or "_" in sym: continue
-        # 4. Sirf USD wale
         if not sym.endswith("USD"): continue
-        # 5. Sirf perpetual_futures - agar contract_type hai to check karo
-        # Delta me perpetual ka contract_type = perpetual_futures hota hai
-        if ctype and "perpetual" not in ctype and "future" not in ctype:
-            continue
+        if ctype and "perpetual" not in ctype and "future" not in ctype: continue
         prods.append((sym, p.get("id")))
-    print(f"[PRODUCTS] Perpetual Only Total {len(prods)} coins: {[s for s,_ in prods]}", flush=True)
+    print(f"[PRODUCTS] Perpetual Only Total {len(prods)}: {[s for s,_ in prods]}", flush=True)
     return prods
 
-def get_candles(pid):
-    r = req("GET", f"/v2/history/candles?product_id={pid}&resolution=5m&start={int(time.time())-220*300}&end={int(time.time())}")
-    return r.get("result",[])
+def get_candles(sym, pid):
+    # TRY 1: symbol se - Delta ka sahi tareeka
+    now = int(time.time())
+    start = now - 220*300
+    # Symbol wala
+    r = req("GET", f"/v2/history/candles?symbol={sym}&resolution=5m&start={start}&end={now}")
+    candles = r.get("result",[]) or []
+    if len(candles) >= 60:
+        return candles
+    print(f"[CANDLE TRY1 FAIL] {sym} symbol se {len(candles)} mili", flush=True)
+    # TRY 2: product_id se
+    r2 = req("GET", f"/v2/history/candles?product_id={pid}&resolution=5m&start={start}&end={now}")
+    candles2 = r2.get("result",[]) or []
+    if len(candles2) >= 60:
+        return candles2
+    print(f"[CANDLE TRY2 FAIL] {sym} product_id se {len(candles2)} mili, raw={str(r)[:200]}", flush=True)
+    # TRY 3: tickers se last price se fake candles nahi - khali return
+    return candles2 if candles2 else candles
 
 def ema(values, period):
     if len(values)<period: return None
@@ -117,7 +124,7 @@ def get_live_price(pid):
     return 0
 
 def trade_loop():
-    print(f"=== PERP ONLY MODE={MODE} SL 0.5% TP 1% ===", flush=True)
+    print(f"=== CANDLE FIX PERP ONLY MODE={MODE} SL 0.5% TP 1% ===", flush=True)
     products=get_all_products()
     while True:
         try:
@@ -126,9 +133,9 @@ def trade_loop():
             for sym,pid in products:
                 if sym in pos: continue
                 if sym in last_trade and time.time()-last_trade[sym]<COOLDOWN: continue
-                candles=get_candles(pid)
+                candles=get_candles(sym,pid)
                 if len(candles)<60:
-                    print(f"[SKIP] {sym} candles kam {len(candles)}", flush=True)
+                    print(f"[SKIP] {sym} candles kam {len(candles)} - API se candle nahi aayi", flush=True)
                     continue
                 closes=[float(c.get("close")) for c in candles]
                 live=get_live_price(pid) or closes[-1]
@@ -136,7 +143,7 @@ def trade_loop():
                 is_below=live<ema50
                 is_above=live>ema50
                 trend="BEARISH" if is_below else "BULLISH"
-                print(f"[TREND] {sym} Close {live:.4f} EMA50 {ema50:.4f} -> {trend}", flush=True)
+                print(f"[TREND] {sym} Close {live:.4f} EMA50 {ema50:.4f} -> {trend} candles={len(candles)}", flush=True)
                 should_sell=False
                 should_buy=False
                 if MODE=="Sell" and is_below: should_sell=True
