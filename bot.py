@@ -1,14 +1,14 @@
 
-# VIDEO STRATEGY - ALL COINS - SCAN FIX - SL + TP SAB ME
-# Problem: SCAN=16 aa raha tha, 138 nahi - kyunki pehle wala bot sirf USD filter kar raha tha
-# Fix: Ab saare products lega, USD / USDT / sab, aur log me saare naam print karega
+# FINAL - SIRF PERPETUAL FUTURES - OPTIONS HATAYE
+# Problem: Delta 746 bhejta hai, usme 720 Options (C-BTC-, P-BTC-) hain, bot unme atak gaya
+# Fix: Sirf Perpetual Futures lega - BTCUSD, ETHUSD, SOLUSD jaisi - Options bilkul nahi
 # Entry sab me, SL 0.5% Red, TP 1% Green, MAX 138
 
 import os, time, hmac, hashlib, json, requests, threading
 from flask import Flask
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot Live - ALL Coins - SL + TP"
+def home(): return "Bot Live - Perp Only - SL + TP"
 @app.route('/health')
 def health(): return "OK", 200
 
@@ -48,15 +48,24 @@ def get_all_products():
     all_res = r.get("result",[])
     print(f"[DEBUG] Delta ne total {len(all_res)} products bheje", flush=True)
     prods=[]
-    for p in r.get("result",[]):
+    for p in all_res:
         sym=p.get("symbol","")
-        # USOON chor ke sab lo - USD, USDT, sab
+        ctype=str(p.get("contract_type","")).lower()
+        # === SIRF PERPETUAL FILTER ===
+        # 1. USOON ignore
         if sym in IGNORE: continue
-        # Sirf perpetual / futures jisme trading hoti hai
-        ctype = p.get("contract_type","")
-        # state check nahi karenge - sab try karenge
+        # 2. Options hatao - C- se shuru, P- se shuru, MV- se shuru
+        if sym.startswith("C-") or sym.startswith("P-") or sym.startswith("MV-"): continue
+        # 3. Dash / underscore wale hatao - BTC_USDT, BTC_INR nahi chahiye
+        if "-" in sym or "_" in sym: continue
+        # 4. Sirf USD wale
+        if not sym.endswith("USD"): continue
+        # 5. Sirf perpetual_futures - agar contract_type hai to check karo
+        # Delta me perpetual ka contract_type = perpetual_futures hota hai
+        if ctype and "perpetual" not in ctype and "future" not in ctype:
+            continue
         prods.append((sym, p.get("id")))
-    print(f"[PRODUCTS] Total {len(prods)} coins loaded - LIST: {[s for s,_ in prods]}", flush=True)
+    print(f"[PRODUCTS] Perpetual Only Total {len(prods)} coins: {[s for s,_ in prods]}", flush=True)
     return prods
 
 def get_candles(pid):
@@ -108,7 +117,7 @@ def get_live_price(pid):
     return 0
 
 def trade_loop():
-    print(f"=== ALL COINS SCAN FIX MODE={MODE} SL 0.5% TP 1% ===", flush=True)
+    print(f"=== PERP ONLY MODE={MODE} SL 0.5% TP 1% ===", flush=True)
     products=get_all_products()
     while True:
         try:
