@@ -1370,10 +1370,11 @@ def start_bot():
     )
     thread.start()
 
-
 if __name__ == "__main__":
-    start_bot()
+    port = int(os.getenv("PORT", "10000"))
     app.run(
         host="0.0.0.0",
-        port=APP_PORT,
-        threaded=True
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
