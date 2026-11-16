@@ -268,6 +268,21 @@ def discover_futures(force=False):
 
         found.extend(rows)
 
+    for p in rows[:5]:
+    log.info(
+        "[PRODUCT DIAGNOSTIC] %s",
+        json.dumps({
+            "symbol": p.get("symbol"),
+            "contract_type": p.get("contract_type"),
+            "state": p.get("state"),
+            "trading_status": p.get("trading_status"),
+            "quoting_asset": p.get("quoting_asset"),
+            "settling_asset": p.get("settling_asset"),
+            "contract_value": p.get("contract_value"),
+            "contract_unit_currency": p.get("contract_unit_currency"),
+            "tick_size": p.get("tick_size"),
+        })
+    )
         after = (data.get("meta") or {}).get("after")
         if not after or not rows:
             break
