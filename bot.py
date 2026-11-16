@@ -265,7 +265,6 @@ for _ in range(20):
             rows = [rows]
 
         found.extend(rows)
-
  for p in rows[:5]:
     log.info(
         "[PRODUCT DIAGNOSTIC] %s",
