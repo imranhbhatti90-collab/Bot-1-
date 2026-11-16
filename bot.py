@@ -238,10 +238,7 @@ def public_get(path, params=None):
         "GET", path, params=params, auth=False
     )
 
-
-
-
-        if not is_eligible_product(p):
+     if not is_eligible_product(p):
             continue
 
         PRODUCTS[symbol] = p
