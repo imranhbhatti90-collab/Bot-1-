@@ -233,31 +233,11 @@ def api_request(method, path, params=None, body=None, auth=True):
 # ============================================================
 # PUBLIC MARKET DATA
 # ============================================================
+
 def public_get(path, params=None):
     return api_request(
         "GET", path, params=params, auth=False
     )
-
-     if not is_eligible_product(p):
-            continue
-
-        PRODUCTS[symbol] = p
-
-    DISCOVERED_AT = time.time()
-
-    with lock:
-        state["discovered_markets"] = [
-            p.get("symbol") for p in found if p.get("symbol")
-        ]
-        state["eligible_markets"] = list(PRODUCTS.keys())
-
-    event(
-        f"DISCOVERY COMPLETE total={len(found)} "
-        f"eligible={len(PRODUCTS)}"
-    )
-    agent("Scanner", "OK", f"{len(PRODUCTS)} eligible perpetual markets")
-    save_state()
-    return list(PRODUCTS.values())
 
 
 def discover_futures(force=False):
@@ -304,8 +284,8 @@ def discover_futures(force=False):
             )
 
         found.extend(rows)
-
         after = (data.get("meta") or {}).get("after")
+
         if not after or not rows:
             break
 
@@ -333,14 +313,11 @@ def discover_futures(force=False):
         f"eligible={len(PRODUCTS)}"
     )
 
-    agent(
-        "Scanner",
-        "OK",
-        f"{len(PRODUCTS)} eligible perpetual markets"
-    )
-
+    agent("Scanner", "OK", f"{len(PRODUCTS)} eligible perpetual markets")
     save_state()
+
     return list(PRODUCTS.values())
+
 
 def is_eligible_product(p):
     """
