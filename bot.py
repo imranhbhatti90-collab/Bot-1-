@@ -1369,12 +1369,16 @@ def start_bot():
         name="delta-testnet-trading-loop"
     )
     thread.start()
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
+    log.info("DELTA INDIA TESTNET BOT STARTING")
+    log.info("API KEY PRESENT: %s", bool(API_KEY))
+    log.info("API SECRET PRESENT: %s", bool(API_SECRET))
+
+    start_bot()
+
     app.run(
         host="0.0.0.0",
-        port=port,
+        port=APP_PORT,
         debug=False,
         use_reloader=False
     )
