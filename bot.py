@@ -788,50 +788,45 @@ def check_signal(symbol):
 # ============================================================
 # ACCOUNT / POSITIONS / ORDERS
 # ============================================================
+
 def get_positions():
     """
-    Fetch account-wide positions in one request.
-    If the request fails, the caller blocks new entries.
+    Fetch every eligible market position using its product_id.
+    If even one request fails, raise an error and block new entries.
     """
-    data = api_request("GET", "/v2/positions")
-    rows = data.get("result", [])
-
-    if isinstance(rows, dict):
-        if isinstance(rows.get("positions"), list):
-            rows = rows["positions"]
-        else:
-            rows = [rows]
-
-    if not isinstance(rows, list):
-        raise RuntimeError("Unexpected positions API response")
-
     all_positions = []
 
-    for p in rows:
-        if not isinstance(p, dict):
-            continue
+    for symbol, product in PRODUCTS.items():
+        product_id = int(product["id"])
 
-        size = number(p.get("size"))
+        data = api_request(
+            "GET",
+            "/v2/positions",
+            params={"product_id": product_id}
+        )
 
-        if size == 0:
-            continue
+        result = data.get("result", {})
 
-        product_id = str(p.get("product_id", ""))
-        symbol = PRODUCT_ID_TO_SYMBOL.get(product_id)
+        if isinstance(result, list):
+            rows = result
+        elif isinstance(result, dict):
+            rows = [result]
+        else:
+            rows = []
 
-        if not symbol:
-            symbol = str(p.get("product_symbol", "")).upper()
+        for p in rows:
+            if not isinstance(p, dict):
+                continue
 
-        if not symbol:
-            symbol = f"UNKNOWN_PRODUCT_{product_id}"
+            size = number(p.get("size"))
 
-        p["symbol"] = symbol
-        p["product_id"] = product_id
-
-        all_positions.append(p)
+            if size != 0:
+                position = dict(p)
+                position["symbol"] = symbol
+                position["product_id"] = product_id
+                all_positions.append(position)
 
     return all_positions
-
 
 def get_active_orders():
     data = api_request("GET", "/v2/orders")
