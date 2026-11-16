@@ -1,17 +1,14 @@
 
-# VIDEO STRATEGY - ALL 138 COINS ENTRY - SL + TARGET SAB ME
-# User bola: 2 nahi, sab me entry lo, sab me SL + Target ho
-# Isliye MAX_POS = 138, har coin me entry, har coin me SL + TP
-# SELL: SL = Entry + 0.5% (Red Line), TP = Entry - 1.0% (Green Target)
-# BUY:  SL = Entry - 0.5%, TP = Entry + 1.0%
-# WARNING: 138 ek saath khulenge to margin zyada lagega - testnet me okay hai
+# VIDEO STRATEGY - ALL COINS - SCAN FIX - SL + TP SAB ME
+# Problem: SCAN=16 aa raha tha, 138 nahi - kyunki pehle wala bot sirf USD filter kar raha tha
+# Fix: Ab saare products lega, USD / USDT / sab, aur log me saare naam print karega
+# Entry sab me, SL 0.5% Red, TP 1% Green, MAX 138
 
 import os, time, hmac, hashlib, json, requests, threading
 from flask import Flask
-
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot Live - ALL 138 - SL + TP Sab Me"
+def home(): return "Bot Live - ALL Coins - SL + TP"
 @app.route('/health')
 def health(): return "OK", 200
 
@@ -20,11 +17,10 @@ API_SECRET = os.getenv("DELTA_API_SECRET","")
 BASE = "https://cdn-ind.testnet.deltaex.org"
 MODE = os.getenv("MODE","Sell")
 SIZE = 40
-MAX_POS = 138  # SAB ME ENTRY - 2 ka limit hataya
+MAX_POS = 138
 COOLDOWN = 300
-SL_PCT = 0.005  # 0.5% Stop Loss - Red Line
-TP_PCT = 0.01   # 1.0% Target - Green Line
-
+SL_PCT = 0.005
+TP_PCT = 0.01
 IGNORE = {"USOONUSD"}
 last_trade = {}
 
@@ -49,13 +45,18 @@ def req(method, path, body=None):
 
 def get_all_products():
     r = req("GET","/v2/products")
+    all_res = r.get("result",[])
+    print(f"[DEBUG] Delta ne total {len(all_res)} products bheje", flush=True)
     prods=[]
     for p in r.get("result",[]):
         sym=p.get("symbol","")
+        # USOON chor ke sab lo - USD, USDT, sab
         if sym in IGNORE: continue
-        if not sym.endswith("USD"): continue
+        # Sirf perpetual / futures jisme trading hoti hai
+        ctype = p.get("contract_type","")
+        # state check nahi karenge - sab try karenge
         prods.append((sym, p.get("id")))
-    print(f"[PRODUCTS] Total {len(prods)} coins - SAB ME ENTRY", flush=True)
+    print(f"[PRODUCTS] Total {len(prods)} coins loaded - LIST: {[s for s,_ in prods]}", flush=True)
     return prods
 
 def get_candles(pid):
@@ -87,7 +88,6 @@ def place_market(pid, side, qty):
     return r
 
 def place_stop(pid, side, qty, stop_price):
-    # SL - Red Line
     stop_side="buy" if side=="sell" else "sell"
     body={"product_id":pid,"size":qty,"side":stop_side,"order_type":"stop_market_order","stop_price":str(round(stop_price,4)),"time_in_force":"gtc","reduce_only":"true"}
     r=req("POST","/v2/orders", body)
@@ -95,7 +95,6 @@ def place_stop(pid, side, qty, stop_price):
     return r
 
 def place_target(pid, side, qty, tp_price):
-    # TP - Green Target - Limit Order
     tp_side="buy" if side=="sell" else "sell"
     body={"product_id":pid,"size":qty,"side":tp_side,"order_type":"limit_order","limit_price":str(round(tp_price,4)),"time_in_force":"gtc","reduce_only":"true"}
     r=req("POST","/v2/orders", body)
@@ -109,23 +108,22 @@ def get_live_price(pid):
     return 0
 
 def trade_loop():
-    print(f"=== VIDEO STRATEGY ALL 138 MODE={MODE} SL 0.5% TP 1% ===", flush=True)
+    print(f"=== ALL COINS SCAN FIX MODE={MODE} SL 0.5% TP 1% ===", flush=True)
     products=get_all_products()
     while True:
         try:
             pos=get_positions()
             print(f"[POS] Total {len(pos)}/{MAX_POS} MODE={MODE} SCAN={len(products)}", flush=True)
             for sym,pid in products:
-                if sym in pos:
-                    continue
-                if sym in last_trade and time.time()-last_trade[sym]<COOLDOWN:
-                    continue
+                if sym in pos: continue
+                if sym in last_trade and time.time()-last_trade[sym]<COOLDOWN: continue
                 candles=get_candles(pid)
-                if len(candles)<60: continue
+                if len(candles)<60:
+                    print(f"[SKIP] {sym} candles kam {len(candles)}", flush=True)
+                    continue
                 closes=[float(c.get("close")) for c in candles]
                 live=get_live_price(pid) or closes[-1]
                 ema50=ema(closes,50)
-                ema200=ema(closes,200) if len(closes)>=200 else ema50
                 is_below=live<ema50
                 is_above=live>ema50
                 trend="BEARISH" if is_below else "BULLISH"
@@ -138,27 +136,25 @@ def trade_loop():
                     if is_below: should_sell=True
                     if is_above: should_buy=True
                 if should_sell:
-                    print(f"[SIGNAL] {sym} SELL - Entry {live}", flush=True)
+                    print(f"[SIGNAL] {sym} SELL Entry {live}", flush=True)
                     r=place_market(pid,"sell",SIZE)
                     if r.get("success"):
                         last_trade[sym]=time.time()
-                        sl=live*(1+SL_PCT)
-                        tp=live*(1-TP_PCT)
+                        sl=live*(1+SL_PCT); tp=live*(1-TP_PCT)
                         print(f"[LEVELS] {sym} Entry {live:.4f} SL {sl:.4f} TP {tp:.4f}", flush=True)
                         place_stop(pid,"sell",SIZE,sl)
                         place_target(pid,"sell",SIZE,tp)
                 elif should_buy:
-                    print(f"[SIGNAL] {sym} BUY - Entry {live}", flush=True)
+                    print(f"[SIGNAL] {sym} BUY Entry {live}", flush=True)
                     r=place_market(pid,"buy",SIZE)
                     if r.get("success"):
                         last_trade[sym]=time.time()
-                        sl=live*(1-SL_PCT)
-                        tp=live*(1+TP_PCT)
+                        sl=live*(1-SL_PCT); tp=live*(1+TP_PCT)
                         print(f"[LEVELS] {sym} Entry {live:.4f} SL {sl:.4f} TP {tp:.4f}", flush=True)
                         place_stop(pid,"buy",SIZE,sl)
                         place_target(pid,"buy",SIZE,tp)
                 else:
-                    print(f"[NO TRADE] {sym} wait - Price EMA50 ke upar/niche nahi", flush=True)
+                    print(f"[NO TRADE] {sym} wait", flush=True)
             print("--- SLEEP 30s ---", flush=True)
             time.sleep(30)
         except Exception as e:
