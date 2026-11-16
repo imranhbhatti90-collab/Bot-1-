@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -250,8 +249,7 @@ def discover_futures(force=False):
 
     found = []
     after = None
-
-    for _ in range(20):
+for _ in range(20):
         params = {
             "contract_types": "perpetual_futures",
             "states": "live",
@@ -268,7 +266,7 @@ def discover_futures(force=False):
 
         found.extend(rows)
 
-    for p in rows[:5]:
+ for p in rows[:5]:
     log.info(
         "[PRODUCT DIAGNOSTIC] %s",
         json.dumps({
