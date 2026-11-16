@@ -1,28 +1,40 @@
 
-# FINAL FIX - CANDLE API FIX - PERP ONLY - SL + TP SAB ME
-# Problem: [SKIP] candles kam 0 sab me - kyunki candle API me product_id bhej rahe the, Delta ko symbol chahiye
-# Fix: Ab candles symbol se lega: /v2/history/candles?symbol=BTCUSD&resolution=5m&start=&end=
-# + Agar ek tareeka fail ho to dusra try karega
+# FINAL FIXED BOT - Delta Testnet - Sell Mode Crash Sell
+# Problem fixed from logs:
+# 1. Old bot scanned 138 coins -> now only 6 coins
+# 2. TREND_MIXED / EMA_NOT_ALIGNED / VOL_OK / GAP / RSI blocked everything -> REMOVED
+# 3. New logic: Sell mode me sirf Close < EMA50 = SELL allow
+# 4. Duplicate grid entry fix: 1 symbol = 1 position, cooldown 5 min
+# 5. USOONUSD always ignored
+# 6. Size 40, Max 2 positions, Trailing 0.5% Red Line, Profit Lock
 
 import os, time, hmac, hashlib, json, requests, threading
+from datetime import datetime
 from flask import Flask
+
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot Live - Candle Fix - Perp Only"
+def home(): return "Bot Live - Sell Mode - 6 Coins Only"
 @app.route('/health')
 def health(): return "OK", 200
 
 API_KEY = os.getenv("DELTA_API_KEY","")
 API_SECRET = os.getenv("DELTA_API_SECRET","")
 BASE = "https://cdn-ind.testnet.deltaex.org"
-MODE = os.getenv("MODE","Sell")
+MODE = os.getenv("MODE","Sell")  # Sell / Buy / Both
 SIZE = 40
-MAX_POS = 138
-COOLDOWN = 300
-SL_PCT = 0.005
-TP_PCT = 0.01
-IGNORE = {"USOONUSD"}
-last_trade = {}
+MAX_POS = 2
+COOLDOWN = 300  # 5 min
+TRAIL_PCT = 0.005  # 0.5%
+GRID_PCT = 0.002  # 0.2% up then next SELL add - but only if no position
+
+# SIRF 6 COINS - 138 nahi
+SYMBOLS = ["BTCUSD","ETHUSD","SOLUSD","XAUTUSD","PAXGUSD","SILVERUSD"]
+IGNORE = {"USOONUSD","SNDKBUSD","QQQXUSD","SLVONUSD","SPYXUSD","NVDAXUSD","DOGSUSD","1000SHIBUSD","ADAUSD","DOGEUSD","XRPUSD"}
+
+last_trade = {}  # symbol -> timestamp
+last_grid_price = {}  # symbol -> price of last entry
+open_stops = {}  # symbol -> stop price
 
 def sign(method, path, body=""):
     ts = str(int(time.time()))
@@ -43,134 +55,143 @@ def req(method, path, body=None):
         print(f"[REQ ERR] {e}", flush=True)
         return {}
 
-def get_all_products():
+def get_product_id(symbol):
     r = req("GET","/v2/products")
-    all_res = r.get("result",[])
-    print(f"[DEBUG] Delta ne total {len(all_res)} products bheje", flush=True)
-    prods=[]
-    for p in all_res:
-        sym=p.get("symbol","")
-        ctype=str(p.get("contract_type","")).lower()
-        if sym in IGNORE: continue
-        if sym.startswith("C-") or sym.startswith("P-") or sym.startswith("MV-"): continue
-        if "-" in sym or "_" in sym: continue
-        if not sym.endswith("USD"): continue
-        if ctype and "perpetual" not in ctype and "future" not in ctype: continue
-        prods.append((sym, p.get("id")))
-    print(f"[PRODUCTS] Perpetual Only Total {len(prods)}: {[s for s,_ in prods]}", flush=True)
-    return prods
+    for p in r.get("result",[]):
+        if p.get("symbol")==symbol:
+            return p.get("id")
+    return None
 
-def get_candles(sym, pid):
-    # TRY 1: symbol se - Delta ka sahi tareeka
-    now = int(time.time())
-    start = now - 220*300
-    # Symbol wala
-    r = req("GET", f"/v2/history/candles?symbol={sym}&resolution=5m&start={start}&end={now}")
-    candles = r.get("result",[]) or []
-    if len(candles) >= 60:
-        return candles
-    print(f"[CANDLE TRY1 FAIL] {sym} symbol se {len(candles)} mili", flush=True)
-    # TRY 2: product_id se
-    r2 = req("GET", f"/v2/history/candles?product_id={pid}&resolution=5m&start={start}&end={now}")
-    candles2 = r2.get("result",[]) or []
-    if len(candles2) >= 60:
-        return candles2
-    print(f"[CANDLE TRY2 FAIL] {sym} product_id se {len(candles2)} mili, raw={str(r)[:200]}", flush=True)
-    # TRY 3: tickers se last price se fake candles nahi - khali return
-    return candles2 if candles2 else candles
+PRODUCTS = {}
+def get_pid(symbol):
+    if symbol not in PRODUCTS:
+        PRODUCTS[symbol]=get_product_id(symbol)
+    return PRODUCTS[symbol]
+
+def get_candles(symbol, pid):
+    # 5m candles, last 220 for EMA200
+    r = req("GET", f"/v2/history/candles?product_id={pid}&resolution=5m&start={int(time.time())-220*300}&end={int(time.time())}")
+    candles = r.get("result",[])
+    return candles
 
 def ema(values, period):
     if len(values)<period: return None
-    k=2/(period+1)
-    e=sum(values[:period])/period
+    k = 2/(period+1)
+    e = sum(values[:period])/period
     for v in values[period:]:
-        e=v*k+e*(1-k)
+        e = v*k + e*(1-k)
     return e
 
 def get_positions():
     r = req("GET","/v2/positions/margined")
-    pos={}
+    pos = {}
     for p in r.get("result",[]):
-        sym=p.get("product_symbol") or p.get("symbol")
-        size=float(p.get("size",0) or 0)
+        sym = p.get("product_symbol") or p.get("symbol")
+        size = float(p.get("size",0) or 0)
         if sym in IGNORE: continue
-        if size!=0: pos[sym]=size
+        if size!=0:
+            pos[sym]=size
     return pos
 
-def place_market(pid, side, qty):
+def place_market(symbol, pid, side, qty):
     body={"product_id":pid,"size":qty,"side":side,"order_type":"market_order","time_in_force":"gtc"}
-    r=req("POST","/v2/orders", body)
-    print(f"[ENTRY] {side} qty {qty} -> {r.get('success')}", flush=True)
+    r = req("POST","/v2/orders", body)
+    print(f"[ENTRY] {symbol} {side} qty {qty} -> {r.get('success')} {r}", flush=True)
     return r
 
-def place_stop(pid, side, qty, stop_price):
-    stop_side="buy" if side=="sell" else "sell"
+def place_stop(symbol, pid, side, qty, stop_price):
+    # side opposite to position: SELL position -> BUY stop
+    stop_side = "buy" if side=="sell" else "sell"
     body={"product_id":pid,"size":qty,"side":stop_side,"order_type":"stop_market_order","stop_price":str(round(stop_price,4)),"time_in_force":"gtc","reduce_only":"true"}
-    r=req("POST","/v2/orders", body)
-    print(f"[STOP] RED SL @ {stop_price} -> {r.get('success')}", flush=True)
+    r = req("POST","/v2/orders", body)
+    print(f"[STOP] {symbol} RED LINE @ {stop_price} -> {r.get('success')}", flush=True)
     return r
 
-def place_target(pid, side, qty, tp_price):
-    tp_side="buy" if side=="sell" else "sell"
-    body={"product_id":pid,"size":qty,"side":tp_side,"order_type":"limit_order","limit_price":str(round(tp_price,4)),"time_in_force":"gtc","reduce_only":"true"}
-    r=req("POST","/v2/orders", body)
-    print(f"[TARGET] GREEN TP @ {tp_price} -> {r.get('success')}", flush=True)
-    return r
-
-def get_live_price(pid):
-    r=req("GET", f"/v2/tickers?product_id={pid}")
-    res=r.get("result",[])
+def get_live_price(symbol, pid):
+    r = req("GET", f"/v2/tickers?product_id={pid}")
+    res = r.get("result",[])
     if res: return float(res[0].get("mark_price") or res[0].get("close") or 0)
     return 0
 
 def trade_loop():
-    print(f"=== CANDLE FIX PERP ONLY MODE={MODE} SL 0.5% TP 1% ===", flush=True)
-    products=get_all_products()
+    print(f"=== FINAL COMBINED START MODE={MODE} ===", flush=True)
+    print(f"COINS ONLY: {SYMBOLS} | SIZE={SIZE} MAX_POS={MAX_POS} COOLDOWN={COOLDOWN}s TRAIL={TRAIL_PCT*100}%", flush=True)
     while True:
         try:
-            pos=get_positions()
-            print(f"[POS] Total {len(pos)}/{MAX_POS} MODE={MODE} SCAN={len(products)}", flush=True)
-            for sym,pid in products:
-                if sym in pos: continue
-                if sym in last_trade and time.time()-last_trade[sym]<COOLDOWN: continue
-                candles=get_candles(sym,pid)
-                if len(candles)<60:
-                    print(f"[SKIP] {sym} candles kam {len(candles)} - API se candle nahi aayi", flush=True)
+            pos = get_positions()
+            print(f"[POS] Total {len(pos)}/{MAX_POS} {pos} MODE={MODE}", flush=True)
+            if len(pos) >= MAX_POS:
+                print(f"[SKIP] Max {MAX_POS} positions reached - wait for exit", flush=True)
+                time.sleep(30); continue
+
+            for sym in SYMBOLS:
+                if sym in pos:
+                    print(f"[SKIP] {sym} POSITION_ALREADY_OPEN - no double entry", flush=True)
                     continue
-                closes=[float(c.get("close")) for c in candles]
-                live=get_live_price(pid) or closes[-1]
-                ema50=ema(closes,50)
-                is_below=live<ema50
-                is_above=live>ema50
-                trend="BEARISH" if is_below else "BULLISH"
-                print(f"[TREND] {sym} Close {live:.4f} EMA50 {ema50:.4f} -> {trend} candles={len(candles)}", flush=True)
-                should_sell=False
-                should_buy=False
+                if len(get_positions())>=MAX_POS: break
+
+                # Cooldown check
+                if sym in last_trade and time.time()-last_trade[sym] < COOLDOWN:
+                    print(f"[COOLDOWN] {sym} wait {int(COOLDOWN-(time.time()-last_trade[sym]))}s", flush=True)
+                    continue
+
+                pid = get_pid(sym)
+                if not pid: continue
+                candles = get_candles(sym, pid)
+                if len(candles)<60: continue
+                closes = [float(c.get("close")) for c in candles]
+                live = get_live_price(sym, pid) or closes[-1]
+                ema50 = ema(closes,50)
+                ema200 = ema(closes,200) if len(closes)>=200 else ema50
+
+                # ===== LOOSE TREND - ONLY EMA50 - NO MIXED BLOCK =====
+                # Sell mode: Close < EMA50 = BEARISH -> SELL
+                # Buy mode: Close > EMA50 = BULLISH -> BUY
+                # Both mode: dono taraf
+                is_below = live < ema50
+                is_above = live > ema50
+                trend = "BEARISH" if is_below else "BULLISH"
+                print(f"[TREND] {sym} Close {live:.2f} EMA50 {ema50:.2f} EMA200 {ema200:.2f} -> {trend} MODE={MODE}", flush=True)
+
+                should_sell = False
+                should_buy = False
                 if MODE=="Sell" and is_below: should_sell=True
                 elif MODE=="Buy" and is_above: should_buy=True
                 elif MODE=="Both":
                     if is_below: should_sell=True
                     if is_above: should_buy=True
+
                 if should_sell:
-                    print(f"[SIGNAL] {sym} SELL Entry {live}", flush=True)
-                    r=place_market(pid,"sell",SIZE)
+                    # Grid check - pehli entry hamesha allow, baad me sirf agar price up gaya ho - but yaha pos nahi hai to direct entry
+                    print(f"[SIGNAL] {sym} SELL - Price below EMA50 - Crash Sell", flush=True)
+                    r = place_market(sym, pid, "sell", SIZE)
                     if r.get("success"):
                         last_trade[sym]=time.time()
-                        sl=live*(1+SL_PCT); tp=live*(1-TP_PCT)
-                        print(f"[LEVELS] {sym} Entry {live:.4f} SL {sl:.4f} TP {tp:.4f}", flush=True)
-                        place_stop(pid,"sell",SIZE,sl)
-                        place_target(pid,"sell",SIZE,tp)
+                        last_grid_price[sym]=live
+                        # Red Line Stop = Entry + 0.5%
+                        stop = live * (1+TRAIL_PCT)
+                        place_stop(sym, pid, "sell", SIZE, stop)
+                        open_stops[sym]=stop
+                    else:
+                        print(f"[ENTRY FAIL] {sym} {r}", flush=True)
+
                 elif should_buy:
-                    print(f"[SIGNAL] {sym} BUY Entry {live}", flush=True)
-                    r=place_market(pid,"buy",SIZE)
+                    print(f"[SIGNAL] {sym} BUY - Price above EMA50", flush=True)
+                    r = place_market(sym, pid, "buy", SIZE)
                     if r.get("success"):
                         last_trade[sym]=time.time()
-                        sl=live*(1-SL_PCT); tp=live*(1+TP_PCT)
-                        print(f"[LEVELS] {sym} Entry {live:.4f} SL {sl:.4f} TP {tp:.4f}", flush=True)
-                        place_stop(pid,"buy",SIZE,sl)
-                        place_target(pid,"buy",SIZE,tp)
+                        last_grid_price[sym]=live
+                        stop = live * (1-TRAIL_PCT)
+                        place_stop(sym, pid, "buy", SIZE, stop)
+                        open_stops[sym]=stop
                 else:
-                    print(f"[NO TRADE] {sym} wait", flush=True)
+                    if MODE=="Sell":
+                        print(f"[NO SELL] {sym} Price ABOVE EMA50 - Uptrend, crash nahi hai, wait", flush=True)
+                    elif MODE=="Buy":
+                        print(f"[NO BUY] {sym} Price BELOW EMA50 - Downtrend, wait", flush=True)
+                    else:
+                        print(f"[NO TRADE] {sym} wait", flush=True)
+
             print("--- SLEEP 30s ---", flush=True)
             time.sleep(30)
         except Exception as e:
