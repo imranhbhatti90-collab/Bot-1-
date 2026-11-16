@@ -389,6 +389,90 @@ def get_live_price(symbol):
         return None
 
 
+# =====================================================
+# AUTOMATIC FUTURES DISCOVERY - TESTNET
+# Discovery only: new symbols are NOT enabled for trading
+# =====================================================
+
+DISCOVERED_FUTURES = {}
+
+def discover_futures():
+    found = {}
+    cursor = None
+
+    for page in range(20):
+        params = {
+            "contract_types": "futures,perpetual_futures",
+            "states": "live",
+            "page_size": 100
+        }
+
+        if cursor:
+            params["after"] = cursor
+
+        try:
+            r = session.get(
+                BASE_URL + "/v2/products",
+                params=params,
+                timeout=(5, 15)
+            )
+
+            if r.status_code != 200:
+                log(
+                    f"[FUTURES DISCOVERY ERROR] "
+                    f"HTTP={r.status_code} {r.text[:300]}"
+                )
+                break
+
+            data = r.json()
+
+            if data.get("success") is not True:
+                log(f"[FUTURES DISCOVERY ERROR] {data}")
+                break
+
+            products = data.get("result", [])
+
+            for p in products:
+                symbol = p.get("symbol")
+                contract_type = p.get("contract_type")
+                status = p.get("trading_status")
+
+                if (
+                    symbol
+                    and p.get("state") == "live"
+                    and contract_type in (
+                        "futures",
+                        "perpetual_futures"
+                    )
+                ):
+                    found[symbol] = p
+
+                    log(
+                        f"[FUTURES PRODUCT] {symbol} "
+                        f"TYPE={contract_type} "
+                        f"STATUS={status} "
+                        f"VALUE={p.get('contract_value')} "
+                        f"UNIT={p.get('contract_unit_currency')} "
+                        f"TICK={p.get('tick_size')} "
+                        f"ID={p.get('id')}"
+                    )
+
+            cursor = (data.get("meta") or {}).get("after")
+
+            if not cursor:
+                break
+
+        except Exception as e:
+            log(f"[FUTURES DISCOVERY ERROR] {e}")
+            break
+
+    log(
+        f"[FUTURES DISCOVERY COMPLETE] "
+        f"TOTAL={len(found)}"
+    )
+
+    return found
+
 def get_candles(symbol, timeframe):
     end = int(time.time())
     params = {
@@ -1165,6 +1249,16 @@ def main_loop():
 
     agent("logger", "OK", "Trade decisions in trade_log.jsonl")
     agent("equity", "WAIT", "Waiting for exchange account data")
+    
+    global DISCOVERED_FUTURES
+
+    DISCOVERED_FUTURES = discover_futures()
+
+    log(
+        f"[DISCOVERY SUMMARY] "
+        f"FOUND={len(DISCOVERED_FUTURES)} "
+        f"TRADING WHITELIST={COINS}"
+    )
 
     while True:
         try:
