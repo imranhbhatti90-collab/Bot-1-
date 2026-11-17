@@ -309,6 +309,18 @@ def manage_trailing_stops(coins_list):
                     
         save_state(state)
 
+    # 🛑 AUTOMATIC CLEANUP FOR ORPHANED STOP ORDERS (Flat symbols ke leftover stops hatane ke liye)
+    all_open_orders = get_open_orders()
+    if all_open_orders:
+        for o in all_open_orders:
+            if o.get("reduce_only"):
+                sym = o.get("product_symbol")
+                if sym not in active_symbols:
+                    oid = o.get("id")
+                    if oid:
+                        api_req("DELETE", f"/v2/orders/{oid}")
+                        log(f"[AUTO CLEANUP] Removed orphaned stop order for flat symbol {sym}")
+
     # Clean up state if position is closed
     for sym in list(state["stops"].keys()):
         if sym not in active_symbols:
@@ -333,7 +345,7 @@ def main_loop():
             # 1. Fetch active coins dynamically from exchange
             active_coins = get_active_symbols()
             
-            # 2. Manage existing positions and trailing stop-losses
+            # 2. Manage existing positions and trailing stop-losses (Includes Auto-Cleanup)
             manage_trailing_stops(active_coins)
             
             # 3. Check current open positions count
