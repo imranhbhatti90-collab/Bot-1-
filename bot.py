@@ -35,7 +35,7 @@ EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
 VOLUME_PERIOD = 20
-TRAIL_PCT = 0.008  # Safety buffer ke sath 0.8% trailing distance
+TRAIL_PCT = 0.008
 STOP_TRIGGER_METHOD = "last_traded_price"
 
 # ==================================================
@@ -254,8 +254,21 @@ def place_stop_order(symbol, entry_side, size, stop_price):
 
 def manage_trailing_stops(coins_list):
     positions = get_positions()
-    active_symbols = set()
+    active_symbols = {p.get("product_symbol") for p in positions}
     
+    # 🛑 AGGRESSIVE CLEANUP: Saare reduce-only / stop orders fetch karo aur check karo ki kya us symbol ki position abhi active hai ya nahi
+    all_open_orders = get_open_orders()
+    if all_open_orders:
+        for o in all_open_orders:
+            if o.get("reduce_only") or o.get("stop_order_type"):
+                sym = o.get("product_symbol")
+                # Agar symbol active positions mein nahi hai, toh iska matlab yeh orphan/purana stop order hai -> Turant delete karo!
+                if sym not in active_symbols:
+                    oid = o.get("id")
+                    if oid:
+                        api_req("DELETE", f"/v2/orders/{oid}")
+                        log(f"[STRICT CLEANUP] Deleted orphaned stop order for flat symbol {sym} (OrderID: {oid})")
+
     for p in positions:
         psym = p.get("product_symbol")
         if psym not in coins_list:
@@ -264,7 +277,6 @@ def manage_trailing_stops(coins_list):
         if size == 0:
             continue
             
-        active_symbols.add(psym)
         entry = float(p.get("entry_price") or p.get("average_price") or 0)
         if entry == 0:
             continue
@@ -297,18 +309,6 @@ def manage_trailing_stops(coins_list):
                     state["stops"][psym] = trail_stop
                     
         save_state(state)
-
-    # Auto cleanup for orphaned stop orders
-    all_open_orders = get_open_orders()
-    if all_open_orders:
-        for o in all_open_orders:
-            if o.get("reduce_only"):
-                sym = o.get("product_symbol")
-                if sym not in active_symbols:
-                    oid = o.get("id")
-                    if oid:
-                        api_req("DELETE", f"/v2/orders/{oid}")
-                        log(f"[AUTO CLEANUP] Removed orphaned stop order for flat symbol {sym}")
 
     for sym in list(state["stops"].keys()):
         if sym not in active_symbols:
