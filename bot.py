@@ -15,29 +15,27 @@ from flask import Flask, jsonify
 # DELTA EXCHANGE INDIA TESTNET / LIVE BOT CONFIG
 # ==================================================
 
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"  # Live ke liye https://api.india.delta.exchange par badal sakte hain
+BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
 
-# Fallback coins agar dynamic fetch mein issue ho
 DEFAULT_COINS = ["BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "SILVERUSD"]
 
-# Har coin ke liye default order size
 DEFAULT_ORDER_SIZE = 40
-MAX_POSITIONS = 10  # Ek sath maximum kitni positions khuli rahengi
+MAX_POSITIONS = 10
 ENABLE_TRADING = True
 
 TIMEFRAME = "5m"
 CHECK_INTERVAL = 15
-COOLDOWN_SECONDS = 180  # Cooldown taaki same coin par baar-baar overtrade na ho
+COOLDOWN_SECONDS = 180
 STATE_FILE = "state.json"
 
 EMA_FAST = 9
 EMA_SLOW = 21
 RSI_PERIOD = 14
 VOLUME_PERIOD = 20
-TRAIL_PCT = 0.005  # 0.5% Trailing stop-loss
+TRAIL_PCT = 0.008  # Safety buffer ke sath 0.8% trailing distance
 STOP_TRIGGER_METHOD = "last_traded_price"
 
 # ==================================================
@@ -115,7 +113,6 @@ def api_req(method, path, params=None, body=None):
 
 
 def get_active_symbols():
-    """Delta Exchange se saare active USD linear/perpetual contracts automatically fetch karta hai"""
     res, code = api_req("GET", "/v2/products")
     if code == 200 and isinstance(res, dict) and res.get("success"):
         products = res.get("result", [])
@@ -126,9 +123,7 @@ def get_active_symbols():
                 if sym and (sym.endswith("USD") or sym.endswith("USDT")):
                     symbols.append(sym)
         if symbols:
-            log(f"[SYMBOL FETCHER] Fetched {len(symbols)} active symbols from Delta Exchange.")
             return symbols
-    log("[SYMBOL FETCHER] Fallback to default COINS list.")
     return DEFAULT_COINS
 
 
@@ -138,7 +133,7 @@ def get_active_symbols():
 
 def get_candles(symbol):
     end = int(time.time())
-    start = end - (300 * 60)  # Last 300 candles
+    start = end - (300 * 60)
     params = {"resolution": TIMEFRAME, "symbol": symbol, "start": str(start), "end": str(end)}
     res, code = api_req("GET", "/v2/history/candles", params=params)
     if code == 200 and isinstance(res, dict) and res.get("success") and res.get("result"):
@@ -156,11 +151,9 @@ def check_signal(candles, symbol):
     df['close'] = pd.to_numeric(df['close'])
     df['volume'] = pd.to_numeric(df['volume'])
     
-    # EMA Calculation
     df['ema9'] = df['close'].ewm(span=EMA_FAST).mean()
     df['ema21'] = df['close'].ewm(span=EMA_SLOW).mean()
     
-    # RSI Calculation
     delta = df['close'].diff()
     gain = delta.where(delta > 0, 0).rolling(window=RSI_PERIOD).mean()
     loss = -delta.where(delta < 0, 0).rolling(window=RSI_PERIOD).mean()
@@ -242,7 +235,7 @@ def place_stop_order(symbol, entry_side, size, stop_price):
         "side": stop_side,
         "order_type": "market_order",
         "stop_order_type": "stop_loss_order",
-        "stop_price": str(round(stop_price, 2)),
+        "stop_price": str(round(stop_price, 4)),
         "stop_trigger_method": STOP_TRIGGER_METHOD,
         "reduce_only": True
     }
@@ -288,8 +281,6 @@ def manage_trailing_stops(coins_list):
             new_peak = max(old_peak, curr)
             state["peaks"][psym] = new_peak
             trail_stop = new_peak * (1 - TRAIL_PCT)
-            
-            # Update stop if improved
             if trail_stop > old_stop or old_stop == 0:
                 cancel_symbol_stops(psym)
                 res = place_stop_order(psym, "buy", abs(size), trail_stop)
@@ -299,8 +290,6 @@ def manage_trailing_stops(coins_list):
             new_peak = min(old_peak, curr) if old_peak != 0 else curr
             state["peaks"][psym] = new_peak
             trail_stop = new_peak * (1 + TRAIL_PCT)
-            
-            # Update stop if improved
             if trail_stop < old_stop or old_stop == 0:
                 cancel_symbol_stops(psym)
                 res = place_stop_order(psym, "sell", abs(size), trail_stop)
@@ -309,7 +298,7 @@ def manage_trailing_stops(coins_list):
                     
         save_state(state)
 
-    # 🛑 AUTOMATIC CLEANUP FOR ORPHANED STOP ORDERS (Flat symbols ke leftover stops hatane ke liye)
+    # Auto cleanup for orphaned stop orders
     all_open_orders = get_open_orders()
     if all_open_orders:
         for o in all_open_orders:
@@ -321,7 +310,6 @@ def manage_trailing_stops(coins_list):
                         api_req("DELETE", f"/v2/orders/{oid}")
                         log(f"[AUTO CLEANUP] Removed orphaned stop order for flat symbol {sym}")
 
-    # Clean up state if position is closed
     for sym in list(state["stops"].keys()):
         if sym not in active_symbols:
             state["stops"].pop(sym, None)
@@ -336,19 +324,14 @@ def manage_trailing_stops(coins_list):
 def main_loop():
     log("=== V3 MULTI-COIN AUTOMATED SCALPING BOT WITH STOP-LOSS STARTED ===")
     
-    # Start Flask server in background thread
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     
     while True:
         try:
-            # 1. Fetch active coins dynamically from exchange
             active_coins = get_active_symbols()
-            
-            # 2. Manage existing positions and trailing stop-losses (Includes Auto-Cleanup)
             manage_trailing_stops(active_coins)
             
-            # 3. Check current open positions count
             positions = get_positions()
             held_symbols = {p.get("product_symbol") for p in positions}
             
@@ -357,12 +340,10 @@ def main_loop():
                 time.sleep(30)
                 continue
                 
-            # 4. Scan coins for new entries
             for symbol in active_coins:
                 if symbol in held_symbols:
                     continue
                     
-                # Cooldown check
                 last_t = state["last_trade"].get(symbol, 0)
                 if time.time() - last_t < COOLDOWN_SECONDS:
                     continue
@@ -377,16 +358,14 @@ def main_loop():
                     if ENABLE_TRADING:
                         order = place_order(symbol, signal, DEFAULT_ORDER_SIZE)
                         if order:
-                            time.sleep(2) # Wait for exchange to register position
+                            time.sleep(2)
                             curr_px = float(candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4])
                             
-                            # Calculate initial stop-loss
                             if signal == "buy":
                                 initial_stop = curr_px * (1 - TRAIL_PCT)
                             else:
                                 initial_stop = curr_px * (1 + TRAIL_PCT)
                                 
-                            # Place exchange stop-loss order
                             place_stop_order(symbol, signal, DEFAULT_ORDER_SIZE, initial_stop)
                             
                             state["last_trade"][symbol] = time.time()
