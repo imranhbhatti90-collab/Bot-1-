@@ -203,13 +203,65 @@ def get_open_orders(symbol=None):
     return []
 
 
-def cancel_symbol_stops(symbol):
-    orders = get_open_orders(symbol)
-    for o in orders:
-        if o.get("product_symbol") == symbol and o.get("reduce_only"):
-            oid = o.get("id")
-            if oid:
-                api_req("DELETE", f"/v2/orders/{oid}")
+def manage_trailing_stops(coins_list):
+    positions = get_positions()
+    active_symbols = {p.get("product_symbol") for p in positions}
+    
+    # Strict cleanup for completely flat symbols
+    all_open_orders = get_open_orders()
+    if all_open_orders:
+        for o in all_open_orders:
+            if o.get("reduce_only") or o.get("stop_order_type"):
+                sym = o.get("product_symbol")
+                if sym not in active_symbols:
+                    oid = o.get("id")
+                    if oid:
+                        api_req("DELETE", f"/v2/orders/{oid}")
+                        log(f"[STRICT CLEANUP] Removed orphan stop for flat symbol {sym}")
+
+    for p in positions:
+        psym = p.get("product_symbol")
+        if psym not in coins_list:
+            continue
+        size = float(p.get("size", 0))
+        if size == 0:
+            continue
+            
+        entry = float(p.get("entry_price") or p.get("average_price") or 0)
+        if entry == 0:
+            continue
+            
+        candles = get_candles(psym)
+        if not candles:
+            continue
+        curr = float(candles[-1]['close'] if isinstance(candles[-1], dict) else candles[-1][4])
+        
+        old_peak = state["peaks"].get(psym, entry)
+        old_stop = state["stops"].get(psym, 0)
+        
+        if size > 0:  # LONG POSITION
+            new_peak = max(old_peak, curr)
+            state["peaks"][psym] = new_peak
+            trail_stop = new_peak * (1 - TRAIL_PCT)
+            
+            # Sirf tab update karo jab stop price improve ho aur purana stop hatana zaroori ho
+            if trail_stop > old_stop or old_stop == 0:
+                cancel_symbol_stops(psym)  # Purana stop hamesha pehle cancel hoga
+                res = place_stop_order(psym, "buy", abs(size), trail_stop)
+                if res:
+                    state["stops"][psym] = trail_stop
+        else:  # SHORT POSITION
+            new_peak = min(old_peak, curr) if old_peak != 0 else curr
+            state["peaks"][psym] = new_peak
+            trail_stop = new_peak * (1 + TRAIL_PCT)
+            
+            if trail_stop < old_stop or old_stop == 0:
+                cancel_symbol_stops(psym)  # Purana stop hamesha pehle cancel hoga
+                res = place_stop_order(psym, "sell", abs(size), trail_stop)
+                if res:
+                    state["stops"][psym] = trail_stop
+                    
+        save_state(state)
 
 
 def place_order(symbol, side, size):
