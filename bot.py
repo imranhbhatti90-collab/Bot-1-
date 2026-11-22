@@ -114,8 +114,22 @@ def api_req(method, path, params=None, body=None):
         "Content-Type": "application/json",
     }
     try:
-        r = requests.request(method, BASE_URL + path + qs, headers=headers, data=payload or None, timeout=15)
-        return r.json(), r.status_code
+        r = requests.request(
+            method,
+            BASE_URL + path + qs,
+            headers=headers,
+            data=payload or None,
+            timeout=15,
+        )
+        raw_text = r.text.strip()
+        if not raw_text:
+            parsed = {"success": 200 <= r.status_code < 300, "status_code": r.status_code}
+        else:
+            try:
+                parsed = r.json()
+            except ValueError:
+                parsed = {"success": 200 <= r.status_code < 300, "raw": raw_text}
+        return parsed, r.status_code
     except Exception as e:
         return {"error": str(e)}, 500
 
