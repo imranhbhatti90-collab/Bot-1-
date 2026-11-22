@@ -65,6 +65,36 @@ def home():
 def health():
     return jsonify(status="ok", automatic_trading=ENABLE_TRADING), 200
 
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    raw_text = request.get_data(as_text=True).strip()
+    json_data = request.get_json(silent=True)
+
+    if isinstance(json_data, dict):
+        signal = str(
+            json_data.get("signal")
+            or json_data.get("action")
+            or json_data.get("message")
+            or ""
+        ).strip().upper()
+        symbol = str(json_data.get("symbol") or "BTCUSDT").strip().upper()
+    else:
+        signal = raw_text.upper()
+        symbol = "BTCUSDT"
+
+    log(f"[WEBHOOK] Received -> symbol={symbol}, signal={signal}, raw={raw_text}")
+
+    if "BUY" in signal:
+        log(f"[WEBHOOK ACTION] BUY signal received for {symbol}")
+        # Yahan apna BUY order function call karein (agar bana ho)
+    elif "SELL" in signal:
+        log(f"[WEBHOOK ACTION] SELL signal received for {symbol}")
+        # Yahan apna SELL order function call karein
+    else:
+        log(f"[WEBHOOK ACTION] Ignored/unknown signal: {raw_text}")
+
+    return jsonify({"status": "ok", "signal": signal, "symbol": symbol}), 200
+
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
