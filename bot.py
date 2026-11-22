@@ -24,7 +24,7 @@ DEFAULT_COINS = ["BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "SILVERUSD"
 
 DEFAULT_ORDER_SIZE = 40
 MAX_POSITIONS = 4
-ENABLE_TRADING = False  # Pehle test/logs ke liye False; ready hone par True karein
+ENABLE_TRADING = true
 
 TIMEFRAME = "5m"
 COOLDOWN_SECONDS = 300
