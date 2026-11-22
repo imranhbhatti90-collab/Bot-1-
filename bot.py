@@ -240,7 +240,7 @@ def get_positions():
 
 
 def get_open_orders(symbol=None):
-    params = {}
+    params = {"states": "open,pending"}
     if symbol:
         params["product_symbol"] = symbol
     res, code = api_req("GET", "/v2/orders", params=params)
@@ -249,9 +249,100 @@ def get_open_orders(symbol=None):
         if isinstance(orders, list):
             return [
                 o for o in orders
-                if o.get("state") in ("open", "pending", "untriggered", None)
+                if o.get("state") in ("open", "pending")
             ]
     return []
+
+
+def cancel_symbol_stops(symbol):
+    orders = get_open_orders(symbol)
+    for o in orders:
+        if o.get("reduce_only") or o.get("stop_order_type"):
+            oid = o.get("id")
+            if oid:
+                res, code = api_req("DELETE", f"/v2/orders/{oid}")
+                if code == 404:
+                    log(f"[CANCEL STOP] {symbol} oid={oid} already gone (404)")
+                else:
+                    log(f"[CANCEL STOP] sym={symbol} oid={oid} status={code} res={res}")
+                time.sleep(0.2)
+
+
+def manage_trailing_stops(coins_list):
+    positions = get_positions()
+    active_symbols = {p.get("product_symbol") for p in positions}
+
+    all_open_orders = get_open_orders()
+    if all_open_orders:
+        for o in all_open_orders:
+            if o.get("reduce_only") or o.get("stop_order_type"):
+                sym = o.get("product_symbol")
+                oid = o.get("id")
+                if sym not in active_symbols and oid:
+                    res, code = api_req("DELETE", f"/v2/orders/{oid}")
+                    if code == 404:
+                        log(f"[STRICT CLEANUP] {sym} oid={oid} already gone (404)")
+                    else:
+                        log(f"[STRICT CLEANUP] sym={sym} oid={oid} status={code} res={res}")
+                    time.sleep(0.2)
+
+    for p in positions:
+        psym = p.get("product_symbol")
+        if psym not in coins_list:
+            continue
+        size = float(p.get("size", 0))
+        if size == 0:
+            continue
+
+        entry = float(p.get("entry_price") or p.get("average_price") or 0)
+        if entry == 0:
+            continue
+
+        candles = get_candles(psym)
+        df = compute_indicators(candles)
+        if df is None:
+            continue
+
+        curr = float(df.iloc[-1]["close"])
+        atr_val = float(df.iloc[-1]["atr"]) if not pd.isna(df.iloc[-1]["atr"]) else 0.0
+        if atr_val <= 0:
+            atr_val = float(state["atr"].get(psym, 0))
+        if atr_val <= 0:
+            continue
+
+        state["atr"][psym] = atr_val
+        trail_dist = atr_val * ATR_TRAIL_MULT
+
+        old_peak = state["peaks"].get(psym, entry)
+        old_stop = state["stops"].get(psym, 0)
+
+        if size > 0:  # LONG POSITION
+            new_peak = max(old_peak, curr)
+            state["peaks"][psym] = new_peak
+            trail_stop = new_peak - trail_dist
+            if trail_stop > old_stop or old_stop == 0:
+                cancel_symbol_stops(psym)
+                res = place_stop_order(psym, "buy", abs(size), trail_stop)
+                if res:
+                    state["stops"][psym] = trail_stop
+        else:  # SHORT POSITION
+            new_peak = min(old_peak, curr) if old_peak != 0 else curr
+            state["peaks"][psym] = new_peak
+            trail_stop = new_peak + trail_dist
+            if trail_stop < old_stop or old_stop == 0:
+                cancel_symbol_stops(psym)
+                res = place_stop_order(psym, "sell", abs(size), trail_stop)
+                if res:
+                    state["stops"][psym] = trail_stop
+
+        save_state(state)
+
+    for sym in list(state["stops"].keys()):
+        if sym not in active_symbols:
+            state["stops"].pop(sym, None)
+            state["peaks"].pop(sym, None)
+            state["atr"].pop(sym, None)
+            save_state(state)
 
 
 def cancel_symbol_stops(symbol):
