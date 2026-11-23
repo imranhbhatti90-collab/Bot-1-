@@ -9,22 +9,22 @@ from urllib.parse import urlencode, quote
 
 import requests
 import pandas as pd
-from flask import Flask, jsonify
+from flask import Flask, request, jsonify
 
 # ==================================================
 # DELTA EXCHANGE INDIA TESTNET / LIVE BOT CONFIG
 # ==================================================
 
-BASE_URL = "https://cdn-ind.testnet.deltaex.org"
+BASE_URL = os.getenv("DELTA_BASE_URL", "https://cdn-ind.testnet.deltaex.org").strip().rstrip("/")
 
-API_KEY = os.getenv("DELTA_API_KEY", "")
-API_SECRET = os.getenv("DELTA_API_SECRET", "")
+API_KEY = os.getenv("DELTA_API_KEY", "").strip()
+API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
 
 DEFAULT_COINS = ["BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "SILVERUSD"]
 
-DEFAULT_ORDER_SIZE = 40
-MAX_POSITIONS = 4
-ENABLE_TRADING = True
+DEFAULT_ORDER_SIZE = int(os.getenv("DELTA_ORDER_SIZE", "40"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "4"))
+ENABLE_TRADING = os.getenv("ENABLE_TRADING", "true").strip().lower() in ("1", "true", "yes", "on")
 
 TIMEFRAME = "5m"
 COOLDOWN_SECONDS = 300
@@ -42,18 +42,33 @@ ATR_PERIOD = 14
 ATR_SL_MULT = 2.0
 ATR_TRAIL_MULT = 2.0
 STOP_TRIGGER_METHOD = "last_traded_price"
+FALLBACK_SL_PCT = 0.01  # 1% fallback SL agar ATR na mile
 
 # ==================================================
-# FLASK SERVER (For Render Health Check)
+# FLASK SERVER (For Render Health Check & Webhook)
 # ==================================================
 
 app = Flask(__name__)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+state_lock = threading.Lock()
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+def normalize_delta_symbol(raw_symbol: str) -> str:
+    s = (raw_symbol or "BTCUSD").strip().upper()
+    if s in ("BTC", "BTCUSDT", "BTC-PERP"):
+        return "BTCUSD"
+    if s in ("ETH", "ETHUSDT", "ETH-PERP"):
+        return "ETHUSD"
+    if s in ("SOL", "SOLUSDT", "SOL-PERP"):
+        return "SOLUSD"
+    if s.endswith("USDT"):
+        return s[:-4] + "USD"
+    return s
 
 
 @app.route("/")
@@ -64,6 +79,7 @@ def home():
 @app.route("/health")
 def health():
     return jsonify(status="ok", automatic_trading=ENABLE_TRADING), 200
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -77,23 +93,31 @@ def webhook():
             or json_data.get("message")
             or ""
         ).strip().upper()
-        symbol = str(json_data.get("symbol") or "BTCUSDT").strip().upper()
+        raw_symbol = str(json_data.get("symbol") or json_data.get("ticker") or "BTCUSD").strip().upper()
+        size_override = json_data.get("size")
     else:
         signal = raw_text.upper()
-        symbol = "BTCUSDT"
+        raw_symbol = "BTCUSD"
+        size_override = None
 
-    log(f"[WEBHOOK] Received -> symbol={symbol}, signal={signal}, raw={raw_text}")
+    symbol = normalize_delta_symbol(raw_symbol)
+    try:
+        order_size = int(size_override) if size_override is not None else DEFAULT_ORDER_SIZE
+    except (ValueError, TypeError):
+        order_size = DEFAULT_ORDER_SIZE
+
+    log(f"[WEBHOOK] Received -> raw_sym={raw_symbol} -> delta_sym={symbol}, signal={signal}, size={order_size}, raw={raw_text}")
 
     if "BUY" in signal:
-        log(f"[WEBHOOK ACTION] BUY signal received for {symbol}")
-        # Yahan apna BUY order function call karein (agar bana ho)
-    elif "SELL" in signal:
-        log(f"[WEBHOOK ACTION] SELL signal received for {symbol}")
-        # Yahan apna SELL order function call karein
-    else:
-        log(f"[WEBHOOK ACTION] Ignored/unknown signal: {raw_text}")
+        res = execute_webhook_trade(symbol=symbol, side="buy", size=order_size)
+        return jsonify({"status": "ok", "action": "buy", "symbol": symbol, "result": res}), 200
 
-    return jsonify({"status": "ok", "signal": signal, "symbol": symbol}), 200
+    if "SELL" in signal:
+        res = execute_webhook_trade(symbol=symbol, side="sell", size=order_size)
+        return jsonify({"status": "ok", "action": "sell", "symbol": symbol, "result": res}), 200
+
+    log(f"[WEBHOOK ACTION] Ignored/unknown signal: {raw_text}")
+    return jsonify({"status": "ignored", "signal": signal, "symbol": symbol}), 200
 
 
 def run_flask():
@@ -131,6 +155,10 @@ state = load_state()
 # ==================================================
 
 def api_req(method, path, params=None, body=None):
+    if not API_KEY or not API_SECRET:
+        log("[API ERROR] DELTA_API_KEY ya DELTA_API_SECRET set nahi hai.")
+        return {"error": "Missing API credentials"}, 401
+
     ts = str(int(time.time()))
     qs = "?" + urlencode(params, quote_via=quote) if params else ""
     payload = json.dumps(body, separators=(",", ":")) if body is not None else ""
@@ -298,94 +326,6 @@ def cancel_symbol_stops(symbol):
                 time.sleep(0.2)
 
 
-def manage_trailing_stops(coins_list):
-    positions = get_positions()
-    active_symbols = {p.get("product_symbol") for p in positions}
-
-    all_open_orders = get_open_orders()
-    if all_open_orders:
-        for o in all_open_orders:
-            if o.get("reduce_only") or o.get("stop_order_type"):
-                sym = o.get("product_symbol")
-                oid = o.get("id")
-                if sym not in active_symbols and oid:
-                    res, code = api_req("DELETE", f"/v2/orders/{oid}")
-                    if code == 404:
-                        log(f"[STRICT CLEANUP] {sym} oid={oid} already gone (404)")
-                    else:
-                        log(f"[STRICT CLEANUP] sym={sym} oid={oid} status={code} res={res}")
-                    time.sleep(0.2)
-
-    for p in positions:
-        psym = p.get("product_symbol")
-        if psym not in coins_list:
-            continue
-        size = float(p.get("size", 0))
-        if size == 0:
-            continue
-
-        entry = float(p.get("entry_price") or p.get("average_price") or 0)
-        if entry == 0:
-            continue
-
-        candles = get_candles(psym)
-        df = compute_indicators(candles)
-        if df is None:
-            continue
-
-        curr = float(df.iloc[-1]["close"])
-        atr_val = float(df.iloc[-1]["atr"]) if not pd.isna(df.iloc[-1]["atr"]) else 0.0
-        if atr_val <= 0:
-            atr_val = float(state["atr"].get(psym, 0))
-        if atr_val <= 0:
-            continue
-
-        state["atr"][psym] = atr_val
-        trail_dist = atr_val * ATR_TRAIL_MULT
-
-        old_peak = state["peaks"].get(psym, entry)
-        old_stop = state["stops"].get(psym, 0)
-
-        if size > 0:  # LONG POSITION
-            new_peak = max(old_peak, curr)
-            state["peaks"][psym] = new_peak
-            trail_stop = new_peak - trail_dist
-            if trail_stop > old_stop or old_stop == 0:
-                cancel_symbol_stops(psym)
-                res = place_stop_order(psym, "buy", abs(size), trail_stop)
-                if res:
-                    state["stops"][psym] = trail_stop
-        else:  # SHORT POSITION
-            new_peak = min(old_peak, curr) if old_peak != 0 else curr
-            state["peaks"][psym] = new_peak
-            trail_stop = new_peak + trail_dist
-            if trail_stop < old_stop or old_stop == 0:
-                cancel_symbol_stops(psym)
-                res = place_stop_order(psym, "sell", abs(size), trail_stop)
-                if res:
-                    state["stops"][psym] = trail_stop
-
-        save_state(state)
-
-    for sym in list(state["stops"].keys()):
-        if sym not in active_symbols:
-            state["stops"].pop(sym, None)
-            state["peaks"].pop(sym, None)
-            state["atr"].pop(sym, None)
-            save_state(state)
-
-
-def cancel_symbol_stops(symbol):
-    orders = get_open_orders(symbol)
-    for o in orders:
-        if o.get("reduce_only") or o.get("stop_order_type"):
-            oid = o.get("id")
-            if oid:
-                res, code = api_req("DELETE", f"/v2/orders/{oid}")
-                log(f"[CANCEL STOP] sym={symbol} oid={oid} status={code} res={res}")
-                time.sleep(0.2)
-
-
 def place_order(symbol, side, size):
     body = {
         "product_symbol": symbol,
@@ -426,6 +366,51 @@ def place_stop_order(symbol, entry_side, size, stop_price):
         return None
 
 
+def execute_webhook_trade(symbol: str, side: str, size: int):
+    if not ENABLE_TRADING:
+        log(f"[WEBHOOK ACTION] ENABLE_TRADING is False -> skipped {side.upper()} {symbol}")
+        return {"skipped": "ENABLE_TRADING is False"}
+
+    if size <= 0:
+        log(f"[WEBHOOK ACTION] Invalid order size {size} for {symbol}")
+        return {"error": "Invalid order size"}
+
+    with state_lock:
+        candles = get_candles(symbol)
+        curr_px = 0.0
+        atr_val = 0.0
+
+        if candles:
+            last_c = candles[-1]
+            curr_px = float(last_c["close"] if isinstance(last_c, dict) else last_c[4])
+            df = compute_indicators(candles)
+            if df is not None and not pd.isna(df.iloc[-1]["atr"]):
+                atr_val = float(df.iloc[-1]["atr"])
+
+        order = place_order(symbol, side, size)
+        if not order:
+            return {"error": "Order placement failed"}
+
+        time.sleep(1.5)
+        if curr_px <= 0:
+            fill_px = order.get("average_fill_price") or order.get("limit_price") or 0
+            curr_px = float(fill_px or 0)
+
+        if curr_px > 0:
+            sl_dist = (atr_val * ATR_SL_MULT) if atr_val > 0 else (curr_px * FALLBACK_SL_PCT)
+            initial_stop = (curr_px - sl_dist) if side == "buy" else (curr_px + sl_dist)
+            place_stop_order(symbol, side, size, initial_stop)
+
+            state["last_trade"][symbol] = time.time()
+            state["peaks"][symbol] = curr_px
+            state["stops"][symbol] = initial_stop
+            if atr_val > 0:
+                state["atr"][symbol] = atr_val
+            save_state(state)
+
+        return order
+
+
 def manage_trailing_stops(coins_list):
     positions = get_positions()
     active_symbols = {p.get("product_symbol") for p in positions}
@@ -438,7 +423,10 @@ def manage_trailing_stops(coins_list):
                 oid = o.get("id")
                 if sym not in active_symbols and oid:
                     res, code = api_req("DELETE", f"/v2/orders/{oid}")
-                    log(f"[STRICT CLEANUP] sym={sym} oid={oid} status={code} res={res}")
+                    if code == 404:
+                        log(f"[STRICT CLEANUP] {sym} oid={oid} already gone (404)")
+                    else:
+                        log(f"[STRICT CLEANUP] sym={sym} oid={oid} status={code} res={res}")
                     time.sleep(0.2)
 
     for p in positions:
