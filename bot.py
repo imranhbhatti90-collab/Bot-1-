@@ -42,7 +42,7 @@ def generate_signature(secret, message):
     return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 def delta_request(method, endpoint, params=None, data=None):
-    timestamp = str(int(time..time.time()))
+    timestamp = str(int(time.time()))
     path = endpoint
     if params:
         query = "&".join([f"{k}={v}" for k, v in params.items()])
@@ -104,7 +104,6 @@ def place_order(product_id, side, size, order_type="market_order", limit_price=N
     return res
 
 def close_position(product_id, size, side):
-    # Opposite side se close karna
     close_side = "sell" if side == "buy" else "buy"
     return place_order(product_id, close_side, size)
 
@@ -126,7 +125,6 @@ def calculate_rsi(closes, period=14):
     return round(rsi, 2)
 
 def manage_open_positions():
-    """Open positions pe Stop-Loss aur Take-Profit check karta hai"""
     positions = get_open_positions()
     
     for pos in positions:
@@ -139,7 +137,6 @@ def manage_open_positions():
             if size == 0 or entry_price == 0:
                 continue
 
-            # Current price nikaalo
             symbol = pos.get("product_symbol") or pos.get("symbol")
             ticker = get_ticker(symbol)
             current_price = float(ticker.get("mark_price") or ticker.get("close", 0))
@@ -147,7 +144,6 @@ def manage_open_positions():
             if current_price == 0:
                 continue
 
-            # PnL percentage calculate
             if side == "buy":
                 pnl_percent = ((current_price - entry_price) / entry_price) * 100
             else:
@@ -155,12 +151,10 @@ def manage_open_positions():
 
             logger.info(f"Position → {symbol} | Side: {side} | PnL: {pnl_percent:.2f}%")
 
-            # Take Profit
             if pnl_percent >= TAKE_PROFIT_PERCENT:
                 logger.info(f"🎯 Take Profit Hit → Closing {symbol}")
                 close_position(product_id, size, side)
 
-            # Stop Loss
             elif pnl_percent <= -STOP_LOSS_PERCENT:
                 logger.info(f"🛑 Stop Loss Hit → Closing {symbol}")
                 close_position(product_id, size, side)
@@ -200,13 +194,11 @@ def run_bot():
 
     while True:
         try:
-            # Pehle open positions manage karo (SL/TP)
             manage_open_positions()
 
-            # Phir naye signals check karo
             for symbol in DEFAULT_COINS:
                 check_and_trade(symbol)
-                time.sleep(1)  # Rate limit se bachne ke liye
+                time.sleep(1)
 
         except Exception as e:
             logger.error(f"Main loop error: {e}")
