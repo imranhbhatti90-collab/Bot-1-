@@ -1,3 +1,4 @@
+
 import os
 import json
 import time
@@ -21,9 +22,11 @@ API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
 
 DEFAULT_COINS = ["BTCUSD", "ETHUSD", "SOLUSD", "XAUTUSD", "PAXGUSD", "SILVERUSD"]
+GOLD_COINS = {"XAUTUSD", "PAXGUSD"}
 
 DEFAULT_ORDER_SIZE = 40
 MAX_POSITIONS = 2
+MAX_GOLD_POSITIONS = 1
 ENABLE_TRADING = True
 
 TIMEFRAME = "15m"
@@ -145,13 +148,24 @@ def get_active_symbols():
 
 def get_candles(symbol):
     end = int(time.time())
-    # 200+ candles ke liye 15m par ~4.5 din ka data (6500 mins)
     start = end - (6500 * 60)
     params = {"resolution": TIMEFRAME, "symbol": symbol, "start": str(start), "end": str(end)}
     res, code = api_req("GET", "/v2/history/candles", params=params)
     if code == 200 and isinstance(res, dict) and res.get("success") and res.get("result"):
         return res["result"]
     return []
+
+
+def get_latest_candle_ts(candles):
+    if not candles:
+        return None
+    last_c = candles[-1]
+    if isinstance(last_c, dict):
+        ts = last_c.get("time") or last_c.get("timestamp") or last_c.get("start_time")
+        return int(ts) if ts is not None else None
+    if isinstance(last_c, (list, tuple)) and len(last_c) > 0:
+        return int(last_c[0])
+    return None
 
 
 def compute_indicators(candles):
@@ -198,7 +212,6 @@ def check_signal(candles, symbol):
     if df is None:
         return None, None, ""
 
-    # Latest closed/current reference (-1) aur pichli candle (-2)
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -228,7 +241,6 @@ def check_signal(candles, symbol):
     downtrend = (ema50 < ema200) and (close_px < ema200)
     vol_ok = vol >= (vol_avg * VOL_MULT)
 
-    # Pullback to EMA 21 check (low/prev_low EMA 21 ke kareeb touch/dip kare aur bounce close de)
     pullback_dist_buy = min(abs(low_px - ema21), abs(prev_low - ema21)) / ema21
     buy_pullback = (
         uptrend
@@ -447,6 +459,11 @@ def main_loop():
                 if symbol in held_symbols:
                     continue
 
+                if symbol in GOLD_COINS:
+                    active_gold = sum(1 for s in held_symbols if s in GOLD_COINS)
+                    if active_gold >= MAX_GOLD_POSITIONS:
+                        continue
+
                 last_t = state["last_trade"].get(symbol, 0)
                 if time.time() - last_t < COOLDOWN_SECONDS:
                     continue
@@ -455,9 +472,17 @@ def main_loop():
                 if not candles:
                     continue
 
+                candle_ts = get_latest_candle_ts(candles)
+                if candle_ts is not None and state["last_candle"].get(symbol) == candle_ts:
+                    continue
+
                 signal, atr_val, reason = check_signal(candles, symbol)
                 if signal and atr_val:
                     log(f"[SIGNAL DETECTED] {symbol} -> {signal.upper()} ({reason}) | ATR={atr_val:.4f}")
+                    if candle_ts is not None:
+                        state["last_candle"][symbol] = candle_ts
+                        save_state(state)
+
                     if ENABLE_TRADING:
                         order = place_order(symbol, signal, DEFAULT_ORDER_SIZE)
                         if order:
