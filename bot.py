@@ -9,12 +9,14 @@ import pandas as pd
 from flask import Flask, jsonify
 
 # ============================================================
-# DELTA EXCHANGE INDIA TESTNET - SCANNER / DIAGNOSTIC VERSION
-# ORDER PLACEMENT DISABLED - TEST DISCOVERY AND SIGNALS FIRST
+# DELTA EXCHANGE INDIA TESTNET - SIGNAL TRACKING SCANNER
+# ORDER PLACEMENT DISABLED
 # ============================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-ENABLE_TRADING = True 
+
+# SAFETY: scanner only, no trading or order placement
+ENABLE_TRADING = False
 
 TREND_TF = "15m"
 ENTRY_TF = "5m"
@@ -33,6 +35,10 @@ VOLUME_PERIOD = 20
 VOL_MULT = 1.10
 ATR_PERIOD = 14
 
+# Signal history settings
+MAX_SIGNAL_HISTORY = 200
+MAX_EVENTS = 100
+
 STATE_FILE = "state.json"
 
 logging.basicConfig(
@@ -45,7 +51,7 @@ app = Flask(__name__)
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "delta-india-testnet-scanner/1.0",
+    "User-Agent": "delta-india-testnet-scanner/2.0",
     "Accept": "application/json"
 })
 
@@ -59,10 +65,12 @@ def fresh_state():
         "products": {},
         "events": [],
         "signals": {},
+        "signal_history": [],
+        "active_signals": {},
         "last_scan": None,
         "discovery_error": None,
         "discovery_count": 0
-    }
+}
 
 
 def load_state():
@@ -74,6 +82,19 @@ def load_state():
 
         if isinstance(loaded, dict):
             base.update(loaded)
+
+        # Repair older state files
+        if not isinstance(base.get("signal_history"), list):
+            base["signal_history"] = []
+
+        if not isinstance(base.get("active_signals"), dict):
+            base["active_signals"] = {}
+
+        if not isinstance(base.get("signals"), dict):
+            base["signals"] = {}
+
+        if not isinstance(base.get("events"), list):
+            base["events"] = []
 
         return base
 
@@ -88,8 +109,18 @@ state_lock = threading.RLock()
 def save_state():
     with state_lock:
         try:
-            with open(STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, default=str)
+            with open(
+                STATE_FILE + ".tmp",
+                "w",
+                encoding="utf-8"
+            ) as f:
+                json.dump(
+                    state,
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str
+                )
 
             os.replace(STATE_FILE + ".tmp", STATE_FILE)
 
@@ -104,10 +135,269 @@ def event(message):
             "message": str(message)
         })
 
-        state["events"] = state["events"][-100:]
+        state["events"] = state["events"][-MAX_EVENTS:]
 
     log("%s", message)
     save_state()
+
+
+# ============================================================
+# SIGNAL HISTORY / CONSECUTIVE TRACKING
+# ============================================================
+
+def add_signal_history(item):
+    """
+    Store signal lifecycle events.
+    START, CHANGE, END and occasional continuation checkpoints.
+    """
+
+    with state_lock:
+        state["signal_history"].append(item)
+
+        state["signal_history"] = (
+            state["signal_history"][-MAX_SIGNAL_HISTORY:]
+        )
+
+
+def track_signal(record):
+    """
+    Tracks each symbol's current signal streak.
+
+    BUY/SELL:
+      - Starts a new streak
+      - Continues existing streak
+      - Counts consecutive scans
+      - Tracks first_seen and last_seen
+
+    NONE:
+      - Ends an active streak
+      - Saves an END event
+    """
+
+    symbol = record["symbol"]
+    signal = record["signal"]
+    now = int(time.time())
+
+    with state_lock:
+
+        active = state["active_signals"].get(symbol)
+
+        # ----------------------------------------------------
+        # SIGNAL NONE - END ACTIVE STREAK
+        # ----------------------------------------------------
+        if signal == "NONE":
+
+            if active:
+
+                duration = max(
+                    0,
+                    now - int(active.get("first_seen", now))
+                )
+
+                ended = {
+                    "event": "END",
+                    "symbol": symbol,
+                    "side": active.get("side"),
+                    "first_seen": active.get("first_seen"),
+                    "last_seen": active.get("last_seen"),
+                    "ended_at": now,
+                    "consecutive_scans": active.get(
+                        "consecutive_scans", 0
+                    ),
+                    "duration_seconds": duration,
+                    "last_price": record.get("price"),
+                    "reason": "Signal no longer valid"
+                }
+
+                add_signal_history(ended)
+
+                log(
+                    "[SIGNAL STREAK END] %s side=%s "
+                    "scans=%d duration=%ds",
+                    symbol,
+                    active.get("side"),
+                    active.get("consecutive_scans", 0),
+                    duration
+                )
+
+                state["active_signals"].pop(symbol, None)
+
+            return
+
+        # ----------------------------------------------------
+        # SAME SIGNAL - CONTINUE STREAK
+        # ----------------------------------------------------
+        if active and active.get("side") == signal:
+
+            active["consecutive_scans"] = (
+                int(active.get("consecutive_scans", 0)) + 1
+            )
+
+            active["last_seen"] = now
+            active["last_price"] = record.get("price")
+            active["last_rsi"] = record.get("rsi")
+            active["last_atr"] = record.get("atr")
+            active["last_volume"] = record.get("volume")
+            active["last_volume_avg"] = record.get("volume_avg")
+            active["last_trend"] = record.get("trend")
+
+            duration = max(
+                0,
+                now - int(active.get("first_seen", now))
+            )
+
+            active["duration_seconds"] = duration
+
+            # Save periodic checkpoints, not every scan
+            scans = active["consecutive_scans"]
+
+            if scans % 10 == 0:
+
+                checkpoint = {
+                    "event": "CHECKPOINT",
+                    "symbol": symbol,
+                    "side": signal,
+                    "first_seen": active.get("first_seen"),
+                    "last_seen": now,
+                    "consecutive_scans": scans,
+                    "duration_seconds": duration,
+                    "price": record.get("price"),
+                    "rsi": record.get("rsi"),
+                    "trend": record.get("trend")
+                }
+
+                add_signal_history(checkpoint)
+
+                log(
+                    "[SIGNAL CHECKPOINT] %s %s "
+                    "scans=%d duration=%ds",
+                    symbol,
+                    signal,
+                    scans,
+                    duration
+                )
+
+            else:
+
+                log(
+                    "[SIGNAL HOLD] %s %s "
+                    "consecutive_scans=%d duration=%ds",
+                    symbol,
+                    signal,
+                    scans,
+                    duration
+                )
+
+            return
+
+        # ----------------------------------------------------
+        # SIGNAL CHANGED OR NEW SIGNAL START
+        # ----------------------------------------------------
+
+        previous_side = None
+
+        if active:
+
+            previous_side = active.get("side")
+
+            ended = {
+                "event": "CHANGE",
+                "symbol": symbol,
+                "side": previous_side,
+                "new_side": signal,
+                "first_seen": active.get("first_seen"),
+                "last_seen": active.get("last_seen"),
+                "ended_at": now,
+                "consecutive_scans": active.get(
+                    "consecutive_scans", 0
+                ),
+                "duration_seconds": max(
+                    0,
+                    now - int(active.get("first_seen", now))
+                ),
+                "reason": "Signal changed"
+            }
+
+            add_signal_history(ended)
+
+        # New streak
+        new_active = {
+            "symbol": symbol,
+            "side": signal,
+            "first_seen": now,
+            "last_seen": now,
+            "consecutive_scans": 1,
+            "duration_seconds": 0,
+            "first_price": record.get("price"),
+            "last_price": record.get("price"),
+            "first_rsi": record.get("rsi"),
+            "last_rsi": record.get("rsi"),
+            "first_atr": record.get("atr"),
+            "last_atr": record.get("atr"),
+            "trend": record.get("trend"),
+            "last_trend": record.get("trend")
+        }
+
+        state["active_signals"][symbol] = new_active
+
+        start_event = {
+            "event": "START",
+            "symbol": symbol,
+            "side": signal,
+            "previous_side": previous_side,
+            "first_seen": now,
+            "last_seen": now,
+            "consecutive_scans": 1,
+            "duration_seconds": 0,
+            "price": record.get("price"),
+            "rsi": record.get("rsi"),
+            "atr": record.get("atr"),
+            "trend": record.get("trend"),
+            "volume": record.get("volume"),
+            "volume_avg": record.get("volume_avg")
+        }
+
+        add_signal_history(start_event)
+
+        log(
+            "[SIGNAL START] %s %s "
+            "price=%.8f RSI=%.2f trend=%s",
+            symbol,
+            signal,
+            record.get("price", 0),
+            record.get("rsi", 0),
+            record.get("trend", "UNKNOWN")
+        )
+
+
+def signal_summary():
+    with state_lock:
+
+        active = state.get("active_signals", {})
+
+        buys = [
+            item for item in active.values()
+            if item.get("side") == "BUY"
+        ]
+
+        sells = [
+            item for item in active.values()
+            if item.get("side") == "SELL"
+        ]
+
+        return {
+            "active_count": len(active),
+            "active_buys": len(buys),
+            "active_sells": len(sells),
+            "buy_symbols": sorted(
+                item.get("symbol")
+                for item in buys
+            ),
+            "sell_symbols": sorted(
+                item.get("symbol")
+                for item in sells
+            )
+        }
 
 
 # ============================================================
@@ -115,7 +405,9 @@ def event(message):
 # ============================================================
 
 def public_request(path, params=None):
+
     try:
+
         response = session.get(
             BASE_URL + path,
             params=params or {},
@@ -131,6 +423,7 @@ def public_request(path, params=None):
             }, response.status_code
 
     except Exception as exc:
+
         return {
             "error": str(exc)
         }, 500
@@ -188,6 +481,7 @@ def discover_products():
             )
 
             event("[DISCOVERY ERROR] Unexpected result format")
+
             return []
 
         all_products.extend(batch)
@@ -245,7 +539,6 @@ def discover_products():
 
         eligible.append(product)
 
-    # Remove duplicate symbols
     product_map = {
         p["symbol"]: p
         for p in eligible
@@ -362,9 +655,8 @@ def candle_frame(raw):
 
                     if possible in frame.columns:
 
-                        frame.rename(
-                            columns={possible: "time"},
-                            inplace=True
+                        frame = frame.rename(
+                            columns={possible: "time"}
                         )
 
                         break
@@ -418,30 +710,26 @@ def candle_frame(raw):
                 errors="coerce"
             )
 
-            frame.dropna(
-                subset=required + ["time"],
-                inplace=True
+            frame = frame.dropna(
+                subset=required + ["time"]
             )
 
-            frame.sort_values(
-                "time",
-                inplace=True
+            frame = frame.sort_values(
+                "time"
             )
 
-            frame.drop_duplicates(
+            frame = frame.drop_duplicates(
                 subset=["time"],
-                keep="last",
-                inplace=True
+                keep="last"
             )
 
         else:
 
-            frame.dropna(
-                subset=required,
-                inplace=True
+            frame = frame.dropna(
+                subset=required
             )
 
-        # Remove possibly incomplete latest candle
+        # Remove latest potentially incomplete candle
         if len(frame) > 1:
             frame = frame.iloc[:-1].copy()
 
@@ -647,7 +935,12 @@ def analyze_symbol(symbol):
         signal
     )
 
-    state["signals"][symbol] = record
+    # Update main signal snapshot
+    with state_lock:
+        state["signals"][symbol] = record
+
+    # Update signal streak/history
+    track_signal(record)
 
     save_state()
 
@@ -655,7 +948,7 @@ def analyze_symbol(symbol):
 
 
 # ============================================================
-# FLASK STATUS / DASHBOARD
+# FLASK STATUS / DASHBOARD API
 # ============================================================
 
 @app.route("/")
@@ -663,47 +956,81 @@ def home():
 
     return (
         "DELTA INDIA TESTNET SCANNER RUNNING "
-        "| /health | /dashboard-data"
+        "| /health | /dashboard-data | /signal-history"
     )
 
 
 @app.route("/health")
 def health():
 
-    return jsonify({
-        "status": "ok",
-        "testnet": True,
-        "trading_enabled": ENABLE_TRADING,
-        "scanner_only": True,
-        "eligible_symbols": len(
-            state.get("symbols", [])
-        ),
-        "discovery_count": state.get(
-            "discovery_count",
-            0
-        ),
-        "discovery_error": state.get(
-            "discovery_error"
-        ),
-        "last_scan": state.get("last_scan")
-    })
+    summary = signal_summary()
+
+    with state_lock:
+
+        return jsonify({
+            "status": "ok",
+            "testnet": True,
+            "trading_enabled": False,
+            "scanner_only": True,
+            "eligible_symbols": len(
+                state.get("symbols", [])
+            ),
+            "discovery_count": state.get(
+                "discovery_count",
+                0
+            ),
+            "discovery_error": state.get(
+                "discovery_error"
+            ),
+            "last_scan": state.get("last_scan"),
+            "active_signals": summary
+        })
 
 
 @app.route("/dashboard-data")
 def dashboard_data():
 
-    return jsonify({
-        "testnet": True,
-        "trading_enabled": ENABLE_TRADING,
-        "scanner_only": True,
-        "symbols": state.get("symbols", []),
-        "signals": state.get("signals", {}),
-        "events": state.get("events", [])[-50:],
-        "discovery_error": state.get(
-            "discovery_error"
-        ),
-        "last_scan": state.get("last_scan")
-    })
+    with state_lock:
+
+        return jsonify({
+            "testnet": True,
+            "trading_enabled": False,
+            "scanner_only": True,
+            "symbols": state.get("symbols", []),
+            "signals": state.get("signals", {}),
+            "active_signals": state.get(
+                "active_signals", {}
+            ),
+            "signal_summary": signal_summary(),
+            "signal_history": state.get(
+                "signal_history", []
+            )[-100:],
+            "events": state.get(
+                "events", []
+            )[-50:],
+            "discovery_error": state.get(
+                "discovery_error"
+            ),
+            "last_scan": state.get("last_scan")
+        })
+
+
+@app.route("/signal-history")
+def signal_history_endpoint():
+
+    with state_lock:
+
+        return jsonify({
+            "testnet": True,
+            "trading_enabled": False,
+            "history": state.get(
+                "signal_history", []
+            )[-MAX_SIGNAL_HISTORY:],
+            "active_signals": state.get(
+                "active_signals", {}
+            ),
+            "summary": signal_summary()
+        })
 
 
 def run_server():
@@ -724,13 +1051,13 @@ def main():
     log("=" * 70)
 
     log(
-        "DELTA INDIA TESTNET SCANNER STARTED "
+        "DELTA INDIA TESTNET SIGNAL TRACKING SCANNER STARTED "
         "(ORDER PLACEMENT DISABLED)"
     )
 
     log("BASE URL: %s", BASE_URL)
 
-    log("TRADING ENABLED: %s", ENABLE_TRADING)
+    log("TRADING ENABLED: FALSE - SAFETY MODE")
 
     log(
         "TREND TF=%s | ENTRY TF=%s | SCAN=%ss | DISCOVERY=%ss",
@@ -744,6 +1071,12 @@ def main():
         "FILTERS: EMA50/200 trend | EMA10/20 entry | "
         "RSI14 | Volume x%.2f | ATR14",
         VOL_MULT
+    )
+
+    log(
+        "SIGNAL TRACKING: history=%d | "
+        "consecutive scans | first_seen | last_seen",
+        MAX_SIGNAL_HISTORY
     )
 
     log("=" * 70)
@@ -795,9 +1128,16 @@ def main():
 
             save_state()
 
+            summary = signal_summary()
+
             log(
-                "[SCAN DONE] symbols=%d next scan in %ds",
+                "[SCAN DONE] symbols=%d "
+                "active_signals=%d BUY=%d SELL=%d "
+                "next scan in %ds",
                 len(symbols),
+                summary["active_count"],
+                summary["active_buys"],
+                summary["active_sells"],
                 SCAN_INTERVAL
             )
 
