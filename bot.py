@@ -14,7 +14,7 @@ from flask import Flask, jsonify
 # ============================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-ENABLE_TRADING = False
+ENABLE_TRADING = True 
 
 TREND_TF = "15m"
 ENTRY_TF = "5m"
