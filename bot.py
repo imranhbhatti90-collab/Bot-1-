@@ -6,7 +6,8 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from flask import Flask
 
 # ================== CONFIG ==================
@@ -14,16 +15,14 @@ BASE_URL = os.getenv("DELTA_BASE_URL", "https://cdn-ind.testnet.deltaex.org")
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
 
-# Strategy Settings
 RSI_PERIOD = 14
 OVERBOUGHT = 73
 OVERSOLD = 27
 ORDER_SIZE = int(os.getenv("DELTA_ORDER_SIZE", "5"))
 
-# Risk Management
-TAKE_PROFIT_PERCENT = 1.5    # 1.5% profit pe band
-STOP_LOSS_PERCENT = 1.0      # 1% loss pe band
-CHECK_INTERVAL = 30          # seconds
+TAKE_PROFIT_PERCENT = 1.5
+STOP_LOSS_PERCENT = 1.0
+CHECK_INTERVAL = 30
 
 DEFAULT_COINS = [
     "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD",
@@ -34,8 +33,10 @@ DEFAULT_COINS = [
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
-
 app = Flask(__name__)
+
+# product_id cache (shuru mein load hoga)
+PRODUCT_MAP = {}
 
 # ================== DELTA HELPERS ==================
 def generate_signature(secret, message):
@@ -43,15 +44,21 @@ def generate_signature(secret, message):
 
 def delta_request(method, endpoint, params=None, data=None):
     timestamp = str(int(time.time()))
-    path = endpoint
+    query_string = ""
     if params:
-        query = "&".join([f"{k}={v}" for k, v in params.items()])
-        path += "?" + query
+        # Delta ko sorted query string chahiye
+        query_string = "&".join([f"{k}={v}" for k, v in sorted(params.items())])
+    
+    path = endpoint
+    if query_string:
+        path += "?" + query_string
 
-    signature_data = method + timestamp + path
+    payload = ""
     if data:
-        signature_data += str(data)
+        # Ahem: proper JSON, separators se spaces hatao
+        payload = json.dumps(data, separators=(',', ':'))
 
+    signature_data = method + timestamp + path + query_string + payload
     headers = {
         "api-key": API_KEY,
         "timestamp": timestamp,
@@ -64,11 +71,23 @@ def delta_request(method, endpoint, params=None, data=None):
         if method == "GET":
             response = requests.get(url, headers=headers, params=params, timeout=10)
         else:
-            response = requests.post(url, headers=headers, json=data, timeout=10)
-        return response.json()
+            response = requests.post(url, headers=headers, data=payload, timeout=10)
+        res_json = response.json()
+        if not res_json.get("success", True) and res_json.get("error"):
+            logger.error(f"API Error: {res_json}")
+        return res_json
     except Exception as e:
         logger.error(f"Request error: {e}")
         return {}
+
+def load_product_map():
+    """Shuru mein tamam products load karein, symbol -> id mapping banayein"""
+    global PRODUCT_MAP
+    res = delta_request("GET", "/v2/products")
+    products = res.get("result", [])
+    for p in products:
+        PRODUCT_MAP[p["symbol"]] = p["id"]
+    logger.info(f"Loaded {len(PRODUCT_MAP)} products")
 
 def get_ticker(symbol):
     res = delta_request("GET", f"/v2/tickers/{symbol}")
@@ -86,16 +105,13 @@ def get_open_positions():
     res = delta_request("GET", "/v2/positions")
     return res.get("result", [])
 
-def place_order(product_id, side, size, order_type="market_order", limit_price=None):
+def place_order(product_id, side, size, order_type="market_order"):
     data = {
         "product_id": product_id,
         "size": size,
         "side": side,
         "order_type": order_type
     }
-    if limit_price:
-        data["limit_price"] = str(limit_price)
-
     res = delta_request("POST", "/v2/orders", data=data)
     if res.get("result"):
         logger.info(f"✅ Order Placed → {side.upper()} | Size: {size} | Product ID: {product_id}")
@@ -114,51 +130,39 @@ def calculate_rsi(closes, period=14):
     deltas = np.diff(closes)
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
-
     avg_gain = pd.Series(gains).rolling(window=period).mean().iloc[-1]
     avg_loss = pd.Series(losses).rolling(window=period).mean().iloc[-1]
-
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return round(rsi, 2)
+    return round(100 - (100 / (1 + rs)), 2)
 
 def manage_open_positions():
     positions = get_open_positions()
-    
     for pos in positions:
         try:
             product_id = pos.get("product_id")
             size = abs(float(pos.get("size", 0)))
             entry_price = float(pos.get("entry_price", 0))
             side = "buy" if float(pos.get("size", 0)) > 0 else "sell"
-            
             if size == 0 or entry_price == 0:
                 continue
 
             symbol = pos.get("product_symbol") or pos.get("symbol")
             ticker = get_ticker(symbol)
             current_price = float(ticker.get("mark_price") or ticker.get("close", 0))
-            
             if current_price == 0:
                 continue
 
-            if side == "buy":
-                pnl_percent = ((current_price - entry_price) / entry_price) * 100
-            else:
-                pnl_percent = ((entry_price - current_price) / entry_price) * 100
-
+            pnl_percent = ((current_price - entry_price) / entry_price * 100) if side == "buy" else ((entry_price - current_price) / entry_price * 100)
             logger.info(f"Position → {symbol} | Side: {side} | PnL: {pnl_percent:.2f}%")
 
             if pnl_percent >= TAKE_PROFIT_PERCENT:
-                logger.info(f"🎯 Take Profit Hit → Closing {symbol}")
+                logger.info(f"🎯 Take Profit → {symbol}")
                 close_position(product_id, size, side)
-
             elif pnl_percent <= -STOP_LOSS_PERCENT:
-                logger.info(f"🛑 Stop Loss Hit → Closing {symbol}")
+                logger.info(f"🛑 Stop Loss → {symbol}")
                 close_position(product_id, size, side)
-
         except Exception as e:
             logger.error(f"Error managing position: {e}")
 
@@ -172,9 +176,9 @@ def check_and_trade(symbol):
     if rsi is None:
         return
 
-    ticker = get_ticker(symbol)
-    product_id = ticker.get("product_id")
+    product_id = PRODUCT_MAP.get(symbol)
     if not product_id:
+        logger.warning(f"Product ID not found for {symbol}")
         return
 
     logger.info(f"{symbol} → RSI: {rsi}")
@@ -186,28 +190,21 @@ def check_and_trade(symbol):
 
 # ================== MAIN LOOP ==================
 def run_bot():
-    logger.info("=" * 50)
-    logger.info("🚀 RSI Multi-Pair Bot Started (with SL/TP)")
-    logger.info(f"Coins: {len(DEFAULT_COINS)} | Size: {ORDER_SIZE}")
-    logger.info(f"Take Profit: {TAKE_PROFIT_PERCENT}% | Stop Loss: {STOP_LOSS_PERCENT}%")
-    logger.info("=" * 50)
-
+    load_product_map()  # Ahem: pehle products load karein
+    logger.info("🚀 RSI Bot Started (SL/TP enabled)")
     while True:
         try:
             manage_open_positions()
-
             for symbol in DEFAULT_COINS:
                 check_and_trade(symbol)
                 time.sleep(1)
-
         except Exception as e:
             logger.error(f"Main loop error: {e}")
-
         time.sleep(CHECK_INTERVAL)
 
 @app.route("/")
 def home():
-    return "Delta RSI Bot with SL/TP is running!"
+    return "Delta RSI Bot is running!"
 
 if __name__ == "__main__":
     import threading
