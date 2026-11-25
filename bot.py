@@ -287,7 +287,6 @@ def signal_for(symbol):
         "candle_ts": int(e.time) if "time" in e else int(time.time())
     }
 
-```python
 # ============================================================
 # POSITIONS / OPEN ORDERS
 # ============================================================
