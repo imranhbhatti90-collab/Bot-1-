@@ -1,4 +1,3 @@
-
 import os
 import json
 import time
@@ -27,7 +26,7 @@ GOLD_COINS = {"XAUTUSD", "PAXGUSD"}
 DEFAULT_ORDER_SIZE = 40
 MAX_POSITIONS = 2
 MAX_GOLD_POSITIONS = 1
-ENABLE_TRADING = True
+ENABLE_TRADING = False  # Pehle signals/logs verify karne ke liye False rakhein
 
 TIMEFRAME = "15m"
 COOLDOWN_SECONDS = 300
@@ -278,6 +277,14 @@ def check_signal(candles, symbol):
 # ORDER EXECUTION & STOP-LOSS MANAGEMENT
 # ==================================================
 
+def format_stop_price(symbol, price):
+    if symbol in ("BTCUSD", "XAUTUSD", "PAXGUSD"):
+        return round(float(price), 1)
+    if symbol == "ETHUSD":
+        return round(float(price), 2)
+    return round(float(price), 4)
+
+
 def get_positions():
     res, code = api_req("GET", "/v2/positions/margined")
     if code == 200 and isinstance(res, dict) and res.get("success"):
@@ -330,25 +337,35 @@ def place_order(symbol, side, size):
     return None
 
 
-def place_stop_order(symbol, entry_side, size, stop_price):
+def place_stop_order(symbol, entry_side, size, stop_price, curr_px=None):
     stop_side = "sell" if entry_side == "buy" else "buy"
+    px = float(stop_price)
+
+    if curr_px and float(curr_px) > 0:
+        cpx = float(curr_px)
+        if entry_side == "buy" and px >= cpx:
+            px = cpx * 0.995
+        elif entry_side == "sell" and px <= cpx:
+            px = cpx * 1.005
+
+    clean_stop = format_stop_price(symbol, px)
     body = {
         "product_symbol": symbol,
         "size": int(size),
         "side": stop_side,
         "order_type": "market_order",
         "stop_order_type": "stop_loss_order",
-        "stop_price": str(round(stop_price, 4)),
+        "stop_price": str(clean_stop),
         "stop_trigger_method": STOP_TRIGGER_METHOD,
         "reduce_only": True,
     }
 
-    log(f"[STOP REQUEST] Placing stop for {symbol} @ {stop_price}")
+    log(f"[STOP REQUEST] Placing stop for {symbol} @ {clean_stop}")
     res, code = api_req("POST", "/v2/orders", body=body)
     log(f"[STOP RESPONSE] {symbol} HTTP={code} | Result: {res}")
 
     if code in (200, 201) and isinstance(res, dict) and res.get("success"):
-        log(f"[STOP SUCCESS] Stop-loss active for {symbol} at {stop_price}")
+        log(f"[STOP SUCCESS] Stop-loss active for {symbol} at {clean_stop}")
         return res.get("result")
     else:
         log(f"[STOP FAILED] {symbol} error: {res}")
@@ -409,18 +426,18 @@ def manage_trailing_stops(coins_list):
             trail_stop = new_peak - trail_dist
             if trail_stop > old_stop or old_stop == 0:
                 cancel_symbol_stops(psym)
-                res = place_stop_order(psym, "buy", abs(size), trail_stop)
+                res = place_stop_order(psym, "buy", abs(size), trail_stop, curr_px=curr)
                 if res:
-                    state["stops"][psym] = trail_stop
+                    state["stops"][psym] = format_stop_price(psym, trail_stop)
         else:  # SHORT POSITION
             new_peak = min(old_peak, curr) if old_peak != 0 else curr
             state["peaks"][psym] = new_peak
             trail_stop = new_peak + trail_dist
             if trail_stop < old_stop or old_stop == 0:
                 cancel_symbol_stops(psym)
-                res = place_stop_order(psym, "sell", abs(size), trail_stop)
+                res = place_stop_order(psym, "sell", abs(size), trail_stop, curr_px=curr)
                 if res:
-                    state["stops"][psym] = trail_stop
+                    state["stops"][psym] = format_stop_price(psym, trail_stop)
 
         save_state(state)
 
@@ -484,6 +501,17 @@ def main_loop():
                         save_state(state)
 
                     if ENABLE_TRADING:
+                        live_positions = get_positions()
+                        live_held = {p.get("product_symbol") for p in live_positions}
+                        if len(live_held) >= MAX_POSITIONS:
+                            log(f"[SKIP ENTRY] {symbol} -> live positions already {len(live_held)}/{MAX_POSITIONS}")
+                            continue
+                        if symbol in GOLD_COINS:
+                            live_gold = sum(1 for s in live_held if s in GOLD_COINS)
+                            if live_gold >= MAX_GOLD_POSITIONS:
+                                log(f"[SKIP ENTRY] {symbol} -> live gold positions already {live_gold}/{MAX_GOLD_POSITIONS}")
+                                continue
+
                         order = place_order(symbol, signal, DEFAULT_ORDER_SIZE)
                         if order:
                             time.sleep(2)
@@ -495,11 +523,11 @@ def main_loop():
                             else:
                                 initial_stop = curr_px + sl_dist
 
-                            place_stop_order(symbol, signal, DEFAULT_ORDER_SIZE, initial_stop)
+                            place_stop_order(symbol, signal, DEFAULT_ORDER_SIZE, initial_stop, curr_px=curr_px)
 
                             state["last_trade"][symbol] = time.time()
                             state["peaks"][symbol] = curr_px
-                            state["stops"][symbol] = initial_stop
+                            state["stops"][symbol] = format_stop_price(symbol, initial_stop)
                             state["atr"][symbol] = atr_val
                             save_state(state)
                     time.sleep(1)
