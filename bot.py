@@ -179,61 +179,177 @@ def api_get(path, params=None, timeout=15):
         f"API request failed: {path}: {last_error}"
     )
 
+# ============================================================
+# ROBUST PRODUCT DISCOVERY WITH FALLBACK
+# ============================================================
 
-# ============================================================
-# PRODUCT DISCOVERY
-# ============================================================
+FALLBACK_SYMBOLS = [
+    "1000SHIBUSD",
+    "ADAUSD",
+    "BTCUSD",
+    "DOGEUSD",
+    "DOGSUSD",
+    "ETHUSD",
+    "NVDAXUSD",
+    "PAXGUSD",
+    "QQQXUSD",
+    "SILVERUSD",
+    "SLVONUSD",
+    "SNDKBUSD",
+    "SOLUSD",
+    "SPYXUSD",
+    "USOONUSD",
+    "XAUTUSD",
+    "XRPUSD"
+]
+
 
 def discover_symbols(force=False):
     global symbols, last_discovery_time
 
     now = time.time()
 
-    if not force and now - last_discovery_time < DISCOVERY_INTERVAL:
+    if (
+        not force
+        and symbols
+        and now - last_discovery_time < DISCOVERY_INTERVAL
+    ):
         return symbols
 
+    discovered = set()
+    cursor = None
+    pages = 0
+
     try:
-        data = api_get(
-            "/v2/products",
-            params={"page_size": 500}
-        )
+        while pages < 10:
 
-        products = data.get("result", [])
+            params = {"page_size": 100}
 
-        eligible = []
+            if cursor:
+                params["after"] = cursor
 
-        for product in products:
+            data = api_get(
+                "/v2/products",
+                params=params
+            )
 
-            symbol = product.get("symbol")
-            product_type = product.get("product_type")
-            product_state = product.get("state")
+            products = data.get("result", [])
 
-            if not symbol:
-                continue
+            if not isinstance(products, list):
+                logger.error(
+                    "[DISCOVERY] Invalid product response format"
+                )
+                break
 
-            if product_type != "perpetual_futures":
-                continue
+            pages += 1
 
-            if product_state != "live":
-                continue
+            for product in products:
 
-            eligible.append(symbol)
+                if not isinstance(product, dict):
+                    continue
 
-        eligible = sorted(set(eligible))
+                sym = str(
+                    product.get("symbol", "")
+                ).strip().upper()
 
-        symbols = eligible
-        last_discovery_time = now
+                if not sym:
+                    continue
+
+                # Exclude option contracts
+                if sym.startswith("C-") or sym.startswith("P-"):
+                    continue
+
+                # USD-symbol scanner universe
+                if not sym.endswith("USD"):
+                    continue
+
+                # Flexible contract-type detection
+                contract_type = str(
+                    product.get("contract_type")
+                    or product.get("product_type")
+                    or product.get("type")
+                    or ""
+                ).strip().lower()
+
+                description = str(
+                    product.get("description", "")
+                ).lower()
+
+                # If contract type is provided, verify it
+                if contract_type:
+                    if "perpetual" not in contract_type:
+                        continue
+
+                # If contract type is missing, use description
+                elif description:
+                    if "perpetual" not in description:
+                        continue
+
+                # Flexible live-state validation
+                product_state = str(
+                    product.get("state")
+                    or product.get("status")
+                    or ""
+                ).strip().lower()
+
+                if product_state:
+                    if product_state not in (
+                        "live",
+                        "active",
+                        "trading"
+                    ):
+                        continue
+
+                discovered.add(sym)
+
+            meta = data.get("meta", {}) or {}
+            next_cursor = meta.get("after")
+
+            if not products or not next_cursor:
+                break
+
+            if next_cursor == cursor:
+                logger.warning(
+                    "[DISCOVERY] Cursor unchanged, stopping pagination"
+                )
+                break
+
+            cursor = next_cursor
+
+        discovered = sorted(discovered)
 
         logger.info(
-            "[DISCOVERY] catalog=%s eligible-live-perpetuals=%s",
-            len(products),
-            len(symbols)
+            "[DISCOVERY] pages=%s discovered=%s",
+            pages,
+            len(discovered)
         )
 
-        logger.info(
-            "[DISCOVERY SYMBOLS] %s",
-            ",".join(symbols)
-        )
+        # Successful API discovery
+        if discovered:
+
+            symbols = discovered
+            last_discovery_time = now
+
+            logger.info(
+                "[DISCOVERY SYMBOLS] %s",
+                ",".join(symbols)
+            )
+
+        # Fallback if API filtering finds zero
+        else:
+
+            logger.warning(
+                "[DISCOVERY FALLBACK] API returned no filtered symbols; "
+                "using known scanner universe"
+            )
+
+            symbols = FALLBACK_SYMBOLS.copy()
+            last_discovery_time = now
+
+            logger.warning(
+                "[DISCOVERY SYMBOLS] %s",
+                ",".join(symbols)
+            )
 
         with state_lock:
             state["symbols"] = symbols
@@ -242,16 +358,37 @@ def discover_symbols(force=False):
         return symbols
 
     except Exception as exc:
-        logger.error("[DISCOVERY ERROR] %s", exc)
+
+        logger.error(
+            "[DISCOVERY ERROR] %s",
+            exc
+        )
+
         add_error(f"Discovery error: {exc}")
 
+        # Keep previous universe if available
         if symbols:
             logger.warning(
-                "[DISCOVERY] Keeping previous symbol list"
+                "[DISCOVERY] Keeping previous %s symbols",
+                len(symbols)
             )
             return symbols
 
-        return []
+        # Last-resort fallback
+        symbols = FALLBACK_SYMBOLS.copy()
+        last_discovery_time = now
+
+        logger.warning(
+            "[DISCOVERY FALLBACK] Using %s known symbols",
+            len(symbols)
+        )
+
+        with state_lock:
+            state["symbols"] = symbols
+            state["total_symbols"] = len(symbols)
+
+        return symbols
+
 
 
 # ============================================================
