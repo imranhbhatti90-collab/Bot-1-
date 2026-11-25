@@ -1,544 +1,925 @@
-import os
-import json
-import time
-import hmac
-import hashlib
-import threading
-import logging
-from urllib.parse import urlencode, quote
-
+import os, json, time, hmac, hashlib, threading, logging, math
+from urllib.parse import urlencode
 import requests
 import pandas as pd
 from flask import Flask, jsonify
 
-# ==================================================
-# DELTA EXCHANGE INDIA TESTNET / LIVE BOT CONFIG
-# ==================================================
-
+# ============================================================
+# DELTA INDIA TESTNET ONLY
+# ============================================================
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-
 API_KEY = os.getenv("DELTA_API_KEY", "")
 API_SECRET = os.getenv("DELTA_API_SECRET", "")
 
-DEFAULT_COINS = ["BTCUSD", "ETHUSD", "SOLUSD", "PAXGUSD", "SILVERUSD"]
-GOLD_COINS = {"PAXGUSD"}
-
-DEFAULT_ORDER_SIZE = 40
-MAX_POSITIONS = 4
-MAX_GOLD_POSITIONS = 4
 ENABLE_TRADING = True
+MAX_POSITIONS = 10
+MARGIN_PER_TRADE = 20.0
+MAX_TOTAL_MARGIN = 200.0
+BALANCE_BUFFER = 5.0
 
-TIMEFRAME = "15m"
-COOLDOWN_SECONDS = 300
-STATE_FILE = "state.json"
+TREND_TF = "15m"
+ENTRY_TF = "5m"
+SCAN_INTERVAL = 30
+DISCOVERY_INTERVAL = 900
+COOLDOWN = 300
 
-EMA_FAST = 9
-EMA_SLOW = 21
 EMA_TREND_FAST = 50
 EMA_TREND_SLOW = 200
+EMA_ENTRY_FAST = 10
+EMA_ENTRY_SLOW = 20
 RSI_PERIOD = 14
 VOLUME_PERIOD = 20
-VOL_MULT = 1.2
-PULLBACK_MAX_PCT = 0.0035  # EMA 21 ke 0.35% ke andar pullback touch/zone
-
+VOL_MULT = 1.10
 ATR_PERIOD = 14
-ATR_SL_MULT = 2.0
-ATR_TRAIL_MULT = 2.0
-STOP_TRIGGER_METHOD = "last_traded_price"
+ATR_SL_MULT = 1.0
+ATR_TP_MULT = 1.0
+ATR_TRAIL_MULT = 1.0
+PARTIAL_PERCENT = 0.50
 
-# ==================================================
-# FLASK SERVER (For Render Health Check)
-# ==================================================
+STOP_TRIGGER = "last_traded_price"
+STATE_FILE = "state.json"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.info
 
 app = Flask(__name__)
+session = requests.Session()
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-
-
-def log(msg):
-    print(msg, flush=True)
-
-
-@app.route("/")
-def home():
-    return "V3 MULTI-COIN BOT WITH TREND PULLBACK + ATR - ACTIVE"
-
-
-@app.route("/health")
-def health():
-    return jsonify(status="ok", automatic_trading=ENABLE_TRADING), 200
-
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
-
-# ==================================================
-# STATE MANAGEMENT
-# ==================================================
+# ============================================================
+# STATE
+# ============================================================
+def fresh_state():
+    return {
+        "positions": {},
+        "last_trade": {},
+        "last_candle": {},
+        "products": {},
+        "events": []
+    }
 
 def load_state():
     try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
-            for k in ("peaks", "stops", "atr", "last_trade", "last_candle"):
-                data.setdefault(k, {})
-            return data
+        with open(STATE_FILE) as f:
+            d = json.load(f)
+        for k, v in fresh_state().items():
+            d.setdefault(k, v)
+        return d
     except Exception:
-        return {"peaks": {}, "stops": {}, "atr": {}, "last_trade": {}, "last_candle": {}}
-
-
-def save_state(s):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(s, f)
-    except Exception:
-        pass
-
+        return fresh_state()
 
 state = load_state()
+state_lock = threading.Lock()
 
+def save_state():
+    with state_lock:
+        try:
+            tmp = STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f, indent=2)
+            os.replace(tmp, STATE_FILE)
+        except Exception as e:
+            log("[STATE SAVE ERROR] %s", e)
 
-# ==================================================
-# API REQUEST & SYMBOL SELECTION
-# ==================================================
+def event(msg):
+    state["events"].append({"time": int(time.time()), "message": msg})
+    state["events"] = state["events"][-100:]
+    log(msg)
+    save_state()
 
-def api_req(method, path, params=None, body=None):
-    ts = str(int(time.time()))
-    qs = "?" + urlencode(params, quote_via=quote) if params else ""
+# ============================================================
+# API AUTH / REQUEST
+# ============================================================
+def api_request(method, path, params=None, body=None, auth=True):
+    params = params or {}
+    query = urlencode(params)
+    full_path = path + ("?" + query if query else "")
     payload = json.dumps(body, separators=(",", ":")) if body is not None else ""
-    msg = method.upper() + ts + path + qs + payload
-    sig = hmac.new(API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    headers = {"Content-Type": "application/json"}
 
-    headers = {
-        "api-key": API_KEY,
-        "timestamp": ts,
-        "signature": sig,
-        "Content-Type": "application/json",
-    }
+    if auth:
+        ts = str(int(time.time()))
+        message = method.upper() + ts + full_path + payload
+        signature = hmac.new(
+            API_SECRET.encode(), message.encode(), hashlib.sha256
+        ).hexdigest()
+        headers.update({
+            "api-key": API_KEY,
+            "timestamp": ts,
+            "signature": signature
+        })
+
     try:
-        r = requests.request(
-            method,
-            BASE_URL + path + qs,
+        r = session.request(
+            method, BASE_URL + full_path,
             headers=headers,
             data=payload or None,
-            timeout=15,
+            timeout=15
         )
-        raw_text = r.text.strip()
-        if not raw_text:
-            parsed = {"success": 200 <= r.status_code < 300, "status_code": r.status_code}
-        else:
-            try:
-                parsed = r.json()
-            except ValueError:
-                parsed = {"success": 200 <= r.status_code < 300, "raw": raw_text}
-        return parsed, r.status_code
+        try:
+            return r.json(), r.status_code
+        except Exception:
+            return {"raw": r.text}, r.status_code
     except Exception as e:
         return {"error": str(e)}, 500
 
+def public_request(path, params=None):
+    try:
+        r = session.get(BASE_URL + path, params=params, timeout=15)
+        return r.json(), r.status_code
+    except Exception as e:
+        return {"error": str(e)}, 500
 
-def get_active_symbols():
-    return DEFAULT_COINS
+# ============================================================
+# DISCOVERY - ACTIVE USD PERPETUALS
+# ============================================================
+def discover_products():
+    res, code = public_request("/v2/products", {"page_size": 200})
+    if code != 200 or not isinstance(res, dict) or not res.get("success"):
+        event(f"[DISCOVERY ERROR] {res}")
+        return []
 
+    raw = res.get("result", [])
+    eligible = []
 
-# ==================================================
-# CANDLES & INDICATORS (EMA + RSI + VOL + ATR)
-# ==================================================
+    for p in raw:
+        symbol = p.get("symbol") or p.get("product_symbol")
+        if not symbol:
+            continue
 
-def get_candles(symbol):
-    end = int(time.time())
-    start = end - (6500 * 60)
-    params = {"resolution": TIMEFRAME, "symbol": symbol, "start": str(start), "end": str(end)}
-    res, code = api_req("GET", "/v2/history/candles", params=params)
-    if code == 200 and isinstance(res, dict) and res.get("success") and res.get("result"):
-        return res["result"]
+        status = str(p.get("state", p.get("status", ""))).lower()
+        contract_type = str(p.get("contract_type", "")).lower()
+        settlement = str(p.get("settlement_asset", p.get("settling_asset", ""))).upper()
+
+        if status and status not in ("live", "active", "trading"):
+            continue
+        if contract_type and "perpetual" not in contract_type:
+            continue
+        if settlement and settlement not in ("USD", "USDT"):
+            continue
+
+        if not symbol.endswith("USD"):
+            continue
+
+        # Exclude options and expired/fixed expiry contracts
+        if p.get("expiry") or p.get("settlement_time"):
+            continue
+
+        eligible.append(p)
+
+    state["products"] = {
+        (p.get("symbol") or p.get("product_symbol")): p
+        for p in eligible
+    }
+    save_state()
+    event(f"[DISCOVERY] total={len(raw)} eligible={len(eligible)}")
+    return list(state["products"].keys())
+
+# ============================================================
+# CANDLES / INDICATORS
+# ============================================================
+def candles(symbol, timeframe, count=600):
+    now = int(time.time())
+    start = now - count * (15 if timeframe == "15m" else 5) * 60
+    params = {
+        "resolution": timeframe,
+        "symbol": symbol,
+        "start": start,
+        "end": now
+    }
+    res, code = public_request("/v2/history/candles", params)
+    if code == 200 and isinstance(res, dict) and res.get("success"):
+        return res.get("result", [])
+    log("[CANDLE ERROR] %s %s %s", symbol, timeframe, res)
     return []
 
-
-def get_latest_candle_ts(candles):
-    if not candles:
+def to_df(raw):
+    if not raw:
         return None
-    last_c = candles[-1]
-    if isinstance(last_c, dict):
-        ts = last_c.get("time") or last_c.get("timestamp") or last_c.get("start_time")
-        return int(ts) if ts is not None else None
-    if isinstance(last_c, (list, tuple)) and len(last_c) > 0:
-        return int(last_c[0])
+    try:
+        if isinstance(raw[0], dict):
+            df = pd.DataFrame(raw)
+        else:
+            df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+        df = df.sort_values("time" if "time" in df else df.index.name or "close")
+        if len(df) < 210:
+            return None
+        # Remove currently forming candle
+        df = df.iloc[:-1].copy()
+        df["ema10"] = df.close.ewm(span=10, adjust=False).mean()
+        df["ema20"] = df.close.ewm(span=20, adjust=False).mean()
+        df["ema50"] = df.close.ewm(span=50, adjust=False).mean()
+        df["ema200"] = df.close.ewm(span=200, adjust=False).mean()
+
+        delta = df.close.diff()
+        gain = delta.clip(lower=0).rolling(RSI_PERIOD).mean()
+        loss = (-delta.clip(upper=0)).rolling(RSI_PERIOD).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        df["rsi"] = 100 - 100 / (1 + rs)
+        df["vol_avg"] = df.volume.rolling(VOLUME_PERIOD).mean()
+
+        prev = df.close.shift(1)
+        tr = pd.concat([
+            df.high - df.low,
+            (df.high - prev).abs(),
+            (df.low - prev).abs()
+        ], axis=1).max(axis=1)
+        df["atr"] = tr.rolling(ATR_PERIOD).mean()
+        return df
+    except Exception as e:
+        log("[INDICATOR ERROR] %s", e)
+        return None
+
+# ============================================================
+# SIGNAL: 15m TREND + 5m EMA ALIGNMENT
+# ============================================================
+def signal_for(symbol):
+    tdf = to_df(candles(symbol, TREND_TF))
+    edf = to_df(candles(symbol, ENTRY_TF))
+    if tdf is None or edf is None:
+        return None
+
+    t = tdf.iloc[-1]
+    e = edf.iloc[-1]
+    prev = edf.iloc[-2]
+
+    if any(pd.isna(t[x]) for x in ("ema50", "ema200")):
+        return None
+    if any(pd.isna(e[x]) for x in ("ema10", "ema20", "rsi", "atr", "vol_avg")):
+        return None
+
+    bullish = t.ema50 > t.ema200 and t.close > t.ema200
+    bearish = t.ema50 < t.ema200 and t.close < t.ema200
+    volume_ok = e.volume >= e.vol_avg * VOL_MULT
+    cross_up = prev.ema10 <= prev.ema20 and e.ema10 > e.ema20
+    cross_down = prev.ema10 >= prev.ema20 and e.ema10 < e.ema20
+
+    # Alignment entries (cross not mandatory)
+    buy_aligned = e.ema10 > e.ema20
+    sell_aligned = e.ema10 < e.ema20
+
+    rsi_buy = 50 <= e.rsi <= 68
+    rsi_sell = 32 <= e.rsi <= 50
+
+    side = None
+    if bullish and buy_aligned and rsi_buy and volume_ok:
+        side = "buy"
+    elif bearish and sell_aligned and rsi_sell and volume_ok:
+        side = "sell"
+
+    log(
+        "[SIGNAL DIAG] %s trend=%s EMA10=%.8f EMA20=%.8f RSI=%.2f "
+        "VOL=%.2f AVG=%.2f ATR=%.8f CROSS_UP=%s CROSS_DOWN=%s SIGNAL=%s",
+        symbol, "BULL" if bullish else "BEAR" if bearish else "MIXED",
+        e.ema10, e.ema20, e.rsi, e.volume, e.vol_avg, e.atr,
+        cross_up, cross_down, side
+    )
+
+    return {
+        "side": side,
+        "atr": float(e.atr),
+        "price": float(e.close),
+        "rsi": float(e.rsi),
+        "volume": float(e.volume),
+        "vol_avg": float(e.vol_avg),
+        "candle_ts": int(e.time) if "time" in e else int(time.time())
+    }
+
+```python
+# ============================================================
+# POSITIONS / OPEN ORDERS
+# ============================================================
+def get_positions():
+    res, code = api_request("GET", "/v2/positions/margined")
+    if code == 200 and res.get("success"):
+        arr = res.get("result", [])
+        if isinstance(arr, dict):
+            arr = [arr]
+        return [p for p in arr if float(p.get("size", 0) or 0) != 0]
+    event(f"[POSITIONS ERROR] HTTP={code} {res}")
     return None
 
+def get_orders():
+    res, code = api_request("GET", "/v2/orders", {"states": "open,pending"})
+    if code == 200 and res.get("success"):
+        return res.get("result", [])
+    event(f"[ORDERS ERROR] HTTP={code} {res}")
+    return None
 
-def compute_indicators(candles):
-    if not candles or len(candles) < (EMA_TREND_SLOW + 5):
+def orders_for(symbol):
+    orders = get_orders()
+    if orders is None:
         return None
+    return [
+        o for o in orders
+        if o.get("product_symbol") == symbol
+        and o.get("state") in ("open", "pending")
+    ]
 
-    df = pd.DataFrame(candles)
-    if "close" not in df.columns:
-        df = pd.DataFrame(candles, columns=["time", "open", "high", "low", "close", "volume"])
+def cancel_order(order_id):
+    res, code = api_request("DELETE", f"/v2/orders/{order_id}")
+    return code in (200, 204) or (isinstance(res, dict) and res.get("success"))
 
-    for col in ("open", "high", "low", "close", "volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["high", "low", "close", "volume"]).reset_index(drop=True)
-
-    if len(df) < (EMA_TREND_SLOW + 5):
-        return None
-
-    df["ema9"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-    df["ema21"] = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=EMA_TREND_FAST, adjust=False).mean()
-    df["ema200"] = df["close"].ewm(span=EMA_TREND_SLOW, adjust=False).mean()
-
-    delta = df["close"].diff()
-    gain = delta.where(delta > 0, 0.0).rolling(window=RSI_PERIOD).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(window=RSI_PERIOD).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    df["vol_avg"] = df["volume"].rolling(window=VOLUME_PERIOD).mean()
-
-    prev_close = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_close).abs(),
-        (df["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(window=ATR_PERIOD).mean()
-
-    return df
-
-
-def check_signal(candles, symbol):
-    df = compute_indicators(candles)
-    if df is None:
-        return None, None, ""
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    open_px = float(last["open"])
-    close_px = float(last["close"])
-    low_px = float(last["low"])
-    high_px = float(last["high"])
-    prev_low = float(prev["low"])
-    prev_high = float(prev["high"])
-
-    ema9, ema21 = float(last["ema9"]), float(last["ema21"])
-    ema9_prev, ema21_prev = float(prev["ema9"]), float(prev["ema21"])
-    ema50 = float(last["ema50"])
-    ema200 = float(last["ema200"])
-    rsi = float(last["rsi"]) if not pd.isna(last["rsi"]) else 50.0
-    vol = float(last["volume"])
-    vol_avg = float(last["vol_avg"]) if not pd.isna(last["vol_avg"]) else vol
-    atr = float(last["atr"]) if not pd.isna(last["atr"]) else 0.0
-
-    if atr <= 0 or vol_avg <= 0 or ema21 <= 0:
-        return None, None, ""
-
-    buy_cross = ema9_prev <= ema21_prev and ema9 > ema21
-    sell_cross = ema9_prev >= ema21_prev and ema9 < ema21
-
-    uptrend = (ema50 > ema200) and (close_px > ema200)
-    downtrend = (ema50 < ema200) and (close_px < ema200)
-    vol_ok = vol >= (vol_avg * VOL_MULT)
-
-    pullback_dist_buy = min(abs(low_px - ema21), abs(prev_low - ema21)) / ema21
-    buy_pullback = (
-        uptrend
-        and (pullback_dist_buy <= PULLBACK_MAX_PCT)
-        and (close_px > open_px)
-        and (close_px > ema21)
-        and (ema9 >= ema21 * 0.999)
-    )
-
-    pullback_dist_sell = min(abs(high_px - ema21), abs(prev_high - ema21)) / ema21
-    sell_pullback = (
-        downtrend
-        and (pullback_dist_sell <= PULLBACK_MAX_PCT)
-        and (close_px < open_px)
-        and (close_px < ema21)
-        and (ema9 <= ema21 * 1.001)
-    )
-
-    if vol_ok and (50 <= rsi <= 70):
-        if buy_cross and uptrend:
-            return "buy", atr, "CROSS_9_21"
-        if buy_pullback:
-            return "buy", atr, "PULLBACK_EMA21"
-
-    if vol_ok and (30 <= rsi <= 50):
-        if sell_cross and downtrend:
-            return "sell", atr, "CROSS_9_21"
-        if sell_pullback:
-            return "sell", atr, "PULLBACK_EMA21"
-
-    return None, atr, ""
-
-
-# ==================================================
-# ORDER EXECUTION & STOP-LOSS MANAGEMENT
-# ==================================================
-
-def format_stop_price(symbol, price):
-    if symbol in ("BTCUSD", "XAUTUSD", "PAXGUSD"):
-        return round(float(price), 1)
-    if symbol == "ETHUSD":
-        return round(float(price), 2)
-    return round(float(price), 4)
-
-
-def get_positions():
-    res, code = api_req("GET", "/v2/positions/margined")
-    if code == 200 and isinstance(res, dict) and res.get("success"):
-        data = res.get("result", [])
-        return [p for p in (data if isinstance(data, list) else [data]) if float(p.get("size", 0)) != 0]
-    return []
-
-
-def get_open_orders(symbol=None):
-    params = {"states": "open,pending"}
-    if symbol:
-        params["product_symbol"] = symbol
-    res, code = api_req("GET", "/v2/orders", params=params)
-    if code == 200 and isinstance(res, dict) and res.get("success"):
-        orders = res.get("result", [])
-        if isinstance(orders, list):
-            return [
-                o for o in orders
-                if o.get("state") in ("open", "pending")
-            ]
-    return []
-
-
-def cancel_symbol_stops(symbol):
-    orders = get_open_orders(symbol)
+def cancel_protection(symbol):
+    orders = orders_for(symbol)
+    if orders is None:
+        return False
     for o in orders:
         if o.get("reduce_only") or o.get("stop_order_type"):
-            oid = o.get("id")
-            if oid:
-                res, code = api_req("DELETE", f"/v2/orders/{oid}")
-                if code == 404:
-                    log(f"[CANCEL STOP] {symbol} oid={oid} already gone (404)")
-                else:
-                    log(f"[CANCEL STOP] sym={symbol} oid={oid} status={code} res={res}")
-                time.sleep(0.2)
+            if not cancel_order(o["id"]):
+                event(f"[CANCEL FAILED] {symbol} order={o.get('id')}")
+                return False
+    return True
 
+def position_map(positions):
+    return {p.get("product_symbol"): p for p in positions}
 
-def place_order(symbol, side, size):
+# ============================================================
+# PRODUCT / CONTRACT SIZING
+# ============================================================
+def product_for(symbol):
+    return state["products"].get(symbol, {})
+
+def get_leverage(product):
+    for key in ("max_leverage", "leverage", "default_leverage"):
+        try:
+            v = float(product.get(key, 0))
+            if v > 0:
+                return min(v, 100.0)
+        except Exception:
+            pass
+    # Conservative fallback used for estimates only.
+    return 20.0
+
+def contract_value(product):
+    try:
+        val = float(product.get("contract_value", 1) or 1)
+        return val if val > 0 else 1.0
+    except Exception:
+        return 1.0
+
+def size_for(symbol, price):
+    product = product_for(symbol)
+    lev = get_leverage(product)
+    cval = contract_value(product)
+
+    # Approximate target notional = margin × leverage
+    target_notional = MARGIN_PER_TRADE * lev
+    size = int(target_notional / max(price * cval, 1e-12))
+
+    # Contract quantity integer; minimum 1
+    size = max(1, size)
+    notional = size * price * cval
+    est_margin = notional / lev
+
+    log("[SIZE] %s size=%s price=%s cval=%s lev-est=%s margin-est=%.2f",
+        symbol, size, price, cval, lev, est_margin)
+    return size, est_margin, lev
+
+# ============================================================
+# ORDER HELPERS
+# ============================================================
+def place_market(symbol, side, size, reduce_only=False):
     body = {
         "product_symbol": symbol,
         "size": int(size),
         "side": side,
         "order_type": "market_order",
+        "reduce_only": bool(reduce_only)
     }
-    res, code = api_req("POST", "/v2/orders", body=body)
-    if code in (200, 201) and isinstance(res, dict) and res.get("success"):
-        log(f"[ORDER PLACED] {symbol} {side} size {size}")
+    res, code = api_request("POST", "/v2/orders", body=body)
+    if code in (200, 201) and res.get("success"):
+        event(f"[ORDER OK] {symbol} {side} size={size} reduce_only={reduce_only}")
         return res.get("result")
-    log(f"[ORDER FAILED] {symbol} {side} -> {res}")
+    event(f"[ORDER FAILED] {symbol} {side} size={size} HTTP={code} {res}")
     return None
 
+def place_stop(symbol, side, size, stop_price):
+    close_side = "sell" if side == "buy" else "buy"
+    product = product_for(symbol)
+    tick = float(product.get("tick_size", 0.0001) or 0.0001)
+    stop_price = round(round(stop_price / tick) * tick, 8)
 
-def place_stop_order(symbol, entry_side, size, stop_price, curr_px=None):
-    stop_side = "sell" if entry_side == "buy" else "buy"
-    px = float(stop_price)
-
-    if curr_px and float(curr_px) > 0:
-        cpx = float(curr_px)
-        if entry_side == "buy" and px >= cpx:
-            px = cpx * 0.995
-        elif entry_side == "sell" and px <= cpx:
-            px = cpx * 1.005
-
-    clean_stop = format_stop_price(symbol, px)
     body = {
         "product_symbol": symbol,
         "size": int(size),
-        "side": stop_side,
+        "side": close_side,
         "order_type": "market_order",
         "stop_order_type": "stop_loss_order",
-        "stop_price": str(clean_stop),
-        "stop_trigger_method": STOP_TRIGGER_METHOD,
-        "reduce_only": True,
+        "stop_price": str(stop_price),
+        "stop_trigger_method": STOP_TRIGGER,
+        "reduce_only": True
     }
-
-    log(f"[STOP REQUEST] Placing stop for {symbol} @ {clean_stop}")
-    res, code = api_req("POST", "/v2/orders", body=body)
-    log(f"[STOP RESPONSE] {symbol} HTTP={code} | Result: {res}")
-
-    if code in (200, 201) and isinstance(res, dict) and res.get("success"):
-        log(f"[STOP SUCCESS] Stop-loss active for {symbol} at {clean_stop}")
+    res, code = api_request("POST", "/v2/orders", body=body)
+    if code in (200, 201) and res.get("success"):
+        event(f"[SL OK] {symbol} stop={stop_price} size={size}")
         return res.get("result")
-    else:
-        log(f"[STOP FAILED] {symbol} error: {res}")
-        return None
+    event(f"[SL FAILED] {symbol} stop={stop_price} HTTP={code} {res}")
+    return None
 
+def place_tp(symbol, side, size, target_price):
+    close_side = "sell" if side == "buy" else "buy"
+    product = product_for(symbol)
+    tick = float(product.get("tick_size", 0.0001) or 0.0001)
+    target_price = round(round(target_price / tick) * tick, 8)
 
-def manage_trailing_stops(coins_list):
-    positions = get_positions()
-    active_symbols = {p.get("product_symbol") for p in positions}
+    body = {
+        "product_symbol": symbol,
+        "size": int(size),
+        "side": close_side,
+        "order_type": "market_order",
+        "stop_order_type": "take_profit_order",
+        "stop_price": str(target_price),
+        "stop_trigger_method": STOP_TRIGGER,
+        "reduce_only": True
+    }
+    res, code = api_request("POST", "/v2/orders", body=body)
+    if code in (200, 201) and res.get("success"):
+        event(f"[TP OK] {symbol} target={target_price} partial_size={size}")
+        return res.get("result")
+    event(f"[TP FAILED] {symbol} target={target_price} HTTP={code} {res}")
+    return None
 
-    all_open_orders = get_open_orders()
-    if all_open_orders:
-        for o in all_open_orders:
-            if o.get("reduce_only") or o.get("stop_order_type"):
-                sym = o.get("product_symbol")
-                oid = o.get("id")
-                if sym not in active_symbols and oid:
-                    res, code = api_req("DELETE", f"/v2/orders/{oid}")
-                    if code == 404:
-                        log(f"[STRICT CLEANUP] {sym} oid={oid} already gone (404)")
-                    else:
-                        log(f"[STRICT CLEANUP] sym={sym} oid={oid} status={code} res={res}")
-                    time.sleep(0.2)
-
-    for p in positions:
-        psym = p.get("product_symbol")
-        if psym not in coins_list:
+# ============================================================
+# ORDER / POSITION CHECK HELPERS
+# ============================================================
+def wait_position(symbol, attempts=6):
+    for _ in range(attempts):
+        time.sleep(2)
+        pos = get_positions()
+        if pos is None:
             continue
-        size = float(p.get("size", 0))
+        for p in pos:
+            if p.get("product_symbol") == symbol and float(p.get("size", 0)) != 0:
+                return p
+    return None
+
+def position_side(size):
+    return "buy" if size > 0 else "sell"
+
+def close_side(side):
+    return "sell" if side == "buy" else "buy"
+
+def close_position(symbol, size):
+    return place_market(symbol, close_side(position_side(size)), abs(int(size)), True)
+
+# ============================================================
+# POSITION PROTECTION SETUP
+# ============================================================
+def setup_protection(symbol, position, atr):
+    size = int(float(position.get("size", 0)))
+    if size == 0:
+        return False
+
+    side = position_side(size)
+    entry = float(position.get("entry_price", 0) or 0)
+    if entry <= 0 or atr <= 0:
+        event(f"[PROTECTION ERROR] {symbol} invalid entry/ATR")
+        return False
+
+    sl_dist = atr * ATR_SL_MULT
+    tp_dist = atr * ATR_TP_MULT
+
+    if side == "buy":
+        sl = entry - sl_dist
+        tp = entry + tp_dist
+    else:
+        sl = entry + sl_dist
+        tp = entry - tp_dist
+
+    partial_size = abs(size) // 2
+    # One contract cannot be split; no partial TP is placed for size < 2
+    if partial_size < 1:
+        partial_size = 0
+
+    # Persist management info first
+    state["positions"][symbol] = {
+        "side": side,
+        "entry": entry,
+        "atr": atr,
+        "initial_sl": sl,
+        "target": tp,
+        "partial_size": partial_size,
+        "partial_done": partial_size == 0,
+        "trail_stop": sl,
+        "last_protect_update": 0,
+        "created": time.time()
+    }
+    save_state()
+
+    # Place SL before TP; if SL fails, do not place TP and mark unsafe
+    sl_order = place_stop(symbol, side, abs(size), sl)
+    if not sl_order:
+        state["positions"][symbol]["unsafe"] = True
+        save_state()
+        event(f"[UNPROTECTED POSITION] {symbol} SL failed; entries will pause")
+        return False
+
+    if partial_size > 0:
+        tp_order = place_tp(symbol, side, partial_size, tp)
+        if not tp_order:
+            state["positions"][symbol]["unsafe"] = True
+            save_state()
+            event(f"[TP FAILED / SAFETY] {symbol}; entries paused pending review")
+            return False
+
+    state["positions"][symbol]["unsafe"] = False
+    state["positions"][symbol]["sl_order_id"] = sl_order.get("id") if isinstance(sl_order, dict) else None
+    save_state()
+    event(f"[PROTECTION READY] {symbol} SL={sl} TP={tp} partial={partial_size}")
+    return True
+
+# ============================================================
+# POSITION MANAGEMENT
+# ============================================================
+def get_symbol_candles(symbol):
+    raw = candles(symbol, ENTRY_TF)
+    df = to_df(raw)
+    if df is None:
+        return None
+    return df
+
+def update_protective_stop(symbol, side, size, new_stop, meta):
+    orders = orders_for(symbol)
+    if orders is None:
+        return False
+
+    old_stops = [
+        o for o in orders
+        if o.get("stop_order_type") == "stop_loss_order"
+    ]
+
+    # Place replacement first, then cancel old stop to reduce unprotected time
+    new_order = place_stop(symbol, side, size, new_stop)
+    if not new_order:
+        return False
+
+    for o in old_stops:
+        if o.get("id") != (new_order.get("id") if isinstance(new_order, dict) else None):
+            cancel_order(o.get("id"))
+
+    meta["sl_order_id"] = new_order.get("id") if isinstance(new_order, dict) else None
+    meta["trail_stop"] = new_stop
+    meta["last_protect_update"] = time.time()
+    save_state()
+    return True
+
+def manage_positions():
+    positions = get_positions()
+    if positions is None:
+        event("[MANAGEMENT FAIL] Cannot fetch positions; new entries blocked")
+        return False
+
+    pmap = position_map(positions)
+
+    for symbol, position in pmap.items():
+        size = int(float(position.get("size", 0)))
         if size == 0:
             continue
 
-        entry = float(p.get("entry_price") or p.get("average_price") or 0)
-        if entry == 0:
+        side = position_side(size)
+        entry = float(position.get("entry_price", 0) or 0)
+        if entry <= 0:
             continue
 
-        candles = get_candles(psym)
-        df = compute_indicators(candles)
+        meta = state["positions"].get(symbol)
+
+        # Existing position not created by bot: do not overwrite its protection.
+        if not meta:
+            event(f"[EXTERNAL/UNKNOWN POSITION] {symbol}; entries blocked until reviewed")
+            return False
+
+        df = get_symbol_candles(symbol)
         if df is None:
+            event(f"[MANAGEMENT SKIP] {symbol} candles unavailable")
+            return False
+
+        last = df.iloc[-1]
+        price = float(last.close)
+        atr = float(last.atr)
+        if atr <= 0:
+            atr = float(meta.get("atr", 0))
+        if atr <= 0:
             continue
 
-        curr = float(df.iloc[-1]["close"])
-        atr_val = float(df.iloc[-1]["atr"]) if not pd.isna(df.iloc[-1]["atr"]) else 0.0
-        if atr_val <= 0:
-            atr_val = float(state["atr"].get(psym, 0))
-        if atr_val <= 0:
-            continue
+        # Position size reduction means partial TP likely filled.
+        original_size = int(meta.get("original_size", abs(size)))
+        if abs(size) < original_size and not meta.get("partial_done", False):
+            meta["partial_done"] = True
+            meta["partial_filled_at"] = time.time()
+            event(f"[PARTIAL CONFIRMED] {symbol} remaining={abs(size)}")
+            save_state()
 
-        state["atr"][psym] = atr_val
-        trail_dist = atr_val * ATR_TRAIL_MULT
+            # Cancel TP remainder if any; now only remaining position managed.
+            orders = orders_for(symbol)
+            if orders:
+                for o in orders:
+                    if o.get("stop_order_type") == "take_profit_order":
+                        cancel_order(o.get("id"))
 
-        old_peak = state["peaks"].get(psym, entry)
-        old_stop = state["stops"].get(psym, 0)
+            # Move stop to breakeven after confirmed partial fill
+            breakeven = entry
+            old_stop = float(meta.get("trail_stop", meta.get("initial_sl", 0)))
+            if side == "buy":
+                candidate = max(old_stop, breakeven)
+            else:
+                candidate = min(old_stop, breakeven) if old_stop else breakeven
 
-        if size > 0:  # LONG POSITION
-            new_peak = max(old_peak, curr)
-            state["peaks"][psym] = new_peak
-            trail_stop = new_peak - trail_dist
-            if trail_stop > old_stop or old_stop == 0:
-                cancel_symbol_stops(psym)
-                res = place_stop_order(psym, "buy", abs(size), trail_stop, curr_px=curr)
-                if res:
-                    state["stops"][psym] = format_stop_price(psym, trail_stop)
-        else:  # SHORT POSITION
-            new_peak = min(old_peak, curr) if old_peak != 0 else curr
-            state["peaks"][psym] = new_peak
-            trail_stop = new_peak + trail_dist
-            if trail_stop < old_stop or old_stop == 0:
-                cancel_symbol_stops(psym)
-                res = place_stop_order(psym, "sell", abs(size), trail_stop, curr_px=curr)
-                if res:
-                    state["stops"][psym] = format_stop_price(psym, trail_stop)
+            if update_protective_stop(symbol, side, abs(size), candidate, meta):
+                event(f"[BREAKEVEN SET] {symbol} stop={candidate}")
 
-        save_state(state)
+        # Track best favorable price
+        peak = float(meta.get("peak_price", entry))
+        if side == "buy":
+            peak = max(peak, price)
+            proposed = peak - atr * ATR_TRAIL_MULT
+            old_stop = float(meta.get("trail_stop", meta.get("initial_sl", 0)))
+            # Never lower stop on a long
+            proposed = max(proposed, old_stop)
+            improve = proposed > old_stop + (atr * 0.02)
+        else:
+            peak = min(peak, price) if peak else price
+            proposed = peak + atr * ATR_TRAIL_MULT
+            old_stop = float(meta.get("trail_stop", meta.get("initial_sl", 0)))
+            # Never raise stop on a short
+            proposed = min(proposed, old_stop) if old_stop else proposed
+            improve = proposed < old_stop - (atr * 0.02) if old_stop else True
 
-    for sym in list(state["stops"].keys()):
-        if sym not in active_symbols:
-            state["stops"].pop(sym, None)
-            state["peaks"].pop(sym, None)
-            state["atr"].pop(sym, None)
-            save_state(state)
+        meta["peak_price"] = peak
+        meta["atr"] = atr
+        meta["last_price"] = price
 
+        # After partial TP, trail remaining from favorable peak.
+        # Before partial, initial SL remains active.
+        if meta.get("partial_done") and improve:
+            if update_protective_stop(symbol, side, abs(size), proposed, meta):
+                event(f"[TRAIL UPDATED] {symbol} side={side} price={price} stop={proposed}")
 
-# ==================================================
-# MAIN BOT LOOP
-# ==================================================
+        event(
+            f"[MANAGE] {symbol} side={side} entry={entry:.8f} "
+            f"price={price:.8f} ATR={atr:.8f} TP={meta.get('target')} "
+            f"SL={meta.get('trail_stop')} partial={meta.get('partial_done')}"
+        )
 
-def main_loop():
-    log("=== V3 MULTI-COIN BOT (EMA 50/200 + PULLBACK + ATR) STARTED ===")
+    # Clean metadata only after exchange confirms position is gone
+    for symbol in list(state["positions"].keys()):
+        if symbol not in pmap:
+            event(f"[POSITION CLOSED] {symbol}; clearing metadata")
+            state["positions"].pop(symbol, None)
 
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+    save_state()
+    return True
+
+# ============================================================
+# ENTRY FILTERS / RISK GUARDS
+# ============================================================
+def estimate_used_margin(positions):
+    total = 0.0
+    for p in positions:
+        try:
+            symbol = p.get("product_symbol")
+            size = abs(float(p.get("size", 0)))
+            entry = float(p.get("entry_price", 0))
+            product = product_for(symbol)
+            lev = get_leverage(product)
+            cval = contract_value(product)
+            total += size * entry * cval / lev
+        except Exception:
+            # Unknown sizing => fail-safe, treat as full margin
+            total += MARGIN_PER_TRADE
+    return total
+
+def entry_allowed(symbol, positions):
+    held = {p.get("product_symbol") for p in positions}
+    if symbol in held:
+        return False, "ALREADY_OPEN"
+    if len(held) >= MAX_POSITIONS:
+        return False, "MAX_POSITIONS"
+    used = estimate_used_margin(positions)
+    if used + MARGIN_PER_TRADE > MAX_TOTAL_MARGIN:
+        return False, "MAX_MARGIN_CAP"
+    if symbol in state["last_trade"]:
+        if time.time() - state["last_trade"][symbol] < COOLDOWN:
+            return False, "COOLDOWN"
+    return True, "OK"
+
+def submit_entry(symbol, signal, atr, price):
+    size, margin_est, leverage_est = size_for(symbol, price)
+
+    if size <= 0:
+        event(f"[ENTRY SKIP] {symbol} calculated size zero")
+        return False
+
+    positions = get_positions()
+    if positions is None:
+        event("[ENTRY BLOCK] Position query failed")
+        return False
+
+    allowed, reason = entry_allowed(symbol, positions)
+    if not allowed:
+        event(f"[ENTRY BLOCK] {symbol} reason={reason}")
+        return False
+
+    if estimate_used_margin(positions) + margin_est > MAX_TOTAL_MARGIN:
+        event(f"[ENTRY BLOCK] {symbol} estimated account margin cap")
+        return False
+
+    order = place_market(symbol, signal, size, reduce_only=False)
+    if not order:
+        return False
+
+    # Wait for exchange-confirmed position
+    position = wait_position(symbol)
+    if not position:
+        event(f"[ENTRY WARNING] {symbol} order sent but position not confirmed; NO further entries")
+        return False
+
+    actual_size = abs(int(float(position.get("size", 0))))
+    if actual_size <= 0:
+        return False
+
+    actual_entry = float(position.get("entry_price", price) or price)
+    event(f"[ENTRY CONFIRMED] {symbol} side={signal} size={actual_size} entry={actual_entry}")
+
+    # Save original size for partial-fill tracking
+    state["positions"][symbol] = {
+        "side": signal,
+        "entry": actual_entry,
+        "atr": atr,
+        "original_size": actual_size,
+        "partial_size": actual_size // 2,
+        "partial_done": actual_size < 2,
+        "peak_price": actual_entry,
+        "created": time.time(),
+        "unsafe": True
+    }
+    save_state()
+
+    # Protection is based on confirmed actual size/entry
+    if not setup_protection(symbol, position, atr):
+        event(f"[ENTRY SAFETY] {symbol} protection setup failed")
+        return False
+
+    state["positions"][symbol]["original_size"] = actual_size
+    state["last_trade"][symbol] = time.time()
+    save_state()
+    return True
+
+# ============================================================
+# FLASK STATUS / DASHBOARD DATA
+# ============================================================
+@app.route("/")
+def home():
+    return "DELTA TESTNET 5M SCALPING BOT - RUNNING"
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "ok",
+        "testnet": True,
+        "trading_enabled": ENABLE_TRADING,
+        "symbols": len(state.get("products", {})),
+        "positions_managed": len(state.get("positions", {}))
+    })
+
+@app.route("/dashboard-data")
+def dashboard_data():
+    positions = get_positions()
+    orders = get_orders()
+    return jsonify({
+        "testnet": True,
+        "trading": ENABLE_TRADING,
+        "symbols": list(state["products"].keys()),
+        "positions": positions,
+        "orders": orders,
+        "managed": state["positions"],
+        "events": state["events"][-30:]
+    })
+
+def run_server():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), use_reloader=False)
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+def main():
+    if not API_KEY or not API_SECRET:
+        log("[FATAL] API credentials missing")
+        return
+
+    log("=" * 65)
+    log("DELTA INDIA TESTNET 5M SCALPING BOT STARTING")
+    log("TESTNET URL: %s", BASE_URL)
+    log("TRADING ENABLED: %s", ENABLE_TRADING)
+    log("MAX POSITIONS: %s", MAX_POSITIONS)
+    log("MARGIN PER TRADE: %.2f", MARGIN_PER_TRADE)
+    log("MAX ACCOUNT MARGIN: %.2f", MAX_TOTAL_MARGIN)
+    log("ENTRY TF: %s | TREND TF: %s", ENTRY_TF, TREND_TF)
+    log("SL ATR=%.2f | TP ATR=%.2f | TRAIL ATR=%.2f",
+        ATR_SL_MULT, ATR_TP_MULT, ATR_TRAIL_MULT)
+    log("=" * 65)
+
+    threading.Thread(target=run_server, daemon=True).start()
+
+    symbols = []
+    last_discovery = 0
 
     while True:
         try:
-            active_coins = get_active_symbols()
-            manage_trailing_stops(active_coins)
+            if time.time() - last_discovery >= DISCOVERY_INTERVAL or not symbols:
+                discovered = discover_products()
+                if discovered:
+                    symbols = discovered
+                last_discovery = time.time()
+
+            # Manage all positions before considering new entries
+            safe = manage_positions()
 
             positions = get_positions()
-            held_symbols = {p.get("product_symbol") for p in positions}
-
-            if len(held_symbols) >= MAX_POSITIONS:
-                log(f"[MAX POSITIONS REACHED] {len(held_symbols)}/{MAX_POSITIONS}. Waiting...")
-                time.sleep(30)
+            if positions is None:
+                event("[SCAN HALTED] Cannot verify positions")
+                time.sleep(SCAN_INTERVAL)
                 continue
 
-            for symbol in active_coins:
-                if symbol in held_symbols:
+            held = {p.get("product_symbol") for p in positions}
+            # Safety: if an exchange position is unknown to bot metadata,
+            # don't create additional positions until manually reviewed.
+            unknown = held - set(state["positions"].keys())
+            if unknown:
+                event(f"[UNKNOWN OPEN POSITIONS] {sorted(unknown)}")
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            # If any position has failed protection, block new entries
+            unsafe = any(m.get("unsafe") for m in state["positions"].values())
+            if not safe or unsafe:
+                event("[NEW ENTRIES BLOCKED] Position management/protection not safe")
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            if len(held) >= MAX_POSITIONS:
+                log("[MAX POSITIONS] %s/%s", len(held), MAX_POSITIONS)
+                time.sleep(SCAN_INTERVAL)
+                continue
+
+            for symbol in symbols:
+                if symbol in held:
                     continue
 
-                if symbol in GOLD_COINS:
-                    active_gold = sum(1 for s in held_symbols if s in GOLD_COINS)
-                    if active_gold >= MAX_GOLD_POSITIONS:
-                        continue
+                positions = get_positions()
+                if positions is None:
+                    break
 
-                last_t = state["last_trade"].get(symbol, 0)
-                if time.time() - last_t < COOLDOWN_SECONDS:
+                held_now = {p.get("product_symbol") for p in positions}
+                if len(held_now) >= MAX_POSITIONS:
+                    break
+
+                allowed, reason = entry_allowed(symbol, positions)
+                if not allowed:
+                    log("[SKIP] %s %s", symbol, reason)
                     continue
 
-                candles = get_candles(symbol)
-                if not candles:
+                result = signal_for(symbol)
+                if not result:
                     continue
 
-                candle_ts = get_latest_candle_ts(candles)
-                if candle_ts is not None and state["last_candle"].get(symbol) == candle_ts:
+                side = result["side"]
+                atr = result["atr"]
+                price = result["price"]
+                candle_ts = result["candle_ts"]
+
+                if not side or atr <= 0 or price <= 0:
                     continue
 
-                signal, atr_val, reason = check_signal(candles, symbol)
-                if signal and atr_val:
-                    log(f"[SIGNAL DETECTED] {symbol} -> {signal.upper()} ({reason}) | ATR={atr_val:.4f}")
-                    if candle_ts is not None:
-                        state["last_candle"][symbol] = candle_ts
-                        save_state(state)
+                last_candle = state["last_candle"].get(symbol)
+                if last_candle == candle_ts:
+                    continue
 
-                    if ENABLE_TRADING:
-                        live_positions = get_positions()
-                        live_held = {p.get("product_symbol") for p in live_positions}
-                        if len(live_held) >= MAX_POSITIONS:
-                            log(f"[SKIP ENTRY] {symbol} -> live positions already {len(live_held)}/{MAX_POSITIONS}")
-                            continue
-                        if symbol in GOLD_COINS:
-                            live_gold = sum(1 for s in live_held if s in GOLD_COINS)
-                            if live_gold >= MAX_GOLD_POSITIONS:
-                                log(f"[SKIP ENTRY] {symbol} -> live gold positions already {live_gold}/{MAX_GOLD_POSITIONS}")
-                                continue
+                # Mark candle consumed before order attempt, prevent duplicate entry
+                state["last_candle"][symbol] = candle_ts
+                save_state()
 
-                        order = place_order(symbol, signal, DEFAULT_ORDER_SIZE)
-                        if order:
-                            time.sleep(2)
-                            curr_px = float(candles[-1]["close"] if isinstance(candles[-1], dict) else candles[-1][4])
-                            sl_dist = atr_val * ATR_SL_MULT
+                log("[SIGNAL] %s %s price=%.8f ATR=%.8f RSI=%.2f",
+                    symbol, side.upper(), price, atr, result["rsi"])
 
-                            if signal == "buy":
-                                initial_stop = curr_px - sl_dist
-                            else:
-                                initial_stop = curr_px + sl_dist
-
-                            place_stop_order(symbol, signal, DEFAULT_ORDER_SIZE, initial_stop, curr_px=curr_px)
-
-                            state["last_trade"][symbol] = time.time()
-                            state["peaks"][symbol] = curr_px
-                            state["stops"][symbol] = format_stop_price(symbol, initial_stop)
-                            state["atr"][symbol] = atr_val
-                            save_state(state)
+                if ENABLE_TRADING:
+                    ok = submit_entry(symbol, side, atr, price)
+                    if ok:
+                        held.add(symbol)
+                    # Do not re-enter same symbol on same scan cycle
                     time.sleep(1)
 
-            log("--- Scan completed. Sleeping for 30s ---")
-            time.sleep(30)
+            log("[SCAN DONE] sleeping %ss", SCAN_INTERVAL)
+            time.sleep(SCAN_INTERVAL)
 
+        except KeyboardInterrupt:
+            log("Bot stopped by user")
+            break
         except Exception as e:
-            log(f"[MAIN LOOP ERROR] {e}")
+            log("[MAIN ERROR] %s", e)
             time.sleep(10)
 
-
 if __name__ == "__main__":
-    main_loop()
+    main()
