@@ -16,7 +16,7 @@ from flask import Flask, jsonify, Response
 # ============================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-TRADING_ENABLED = True 
+TRADING_ENABLED = False  # informational hard lock; scanner never places orders
 
 TREND_RESOLUTION = "15m"
 ENTRY_RESOLUTION = "5m"
@@ -33,11 +33,13 @@ ATR_PERIOD = 14
 VOLUME_MA_PERIOD = 20
 VOLUME_MULTIPLIER = 1.00
 MAX_ATR_PERCENT = 5.0  # Reject suspiciously abnormal ATR readings
-MAX_SINGLE_CANDLE_MOVE_PERCENT = 8.0  # hard safety against malformed/jump candles
-MAX_CLOSE_TO_CLOSE_MOVE_PERCENT = 8.0
-MAX_CANDLE_GAP_MULTIPLE = 2.0
-MAX_STALE_CANDLE_MULTIPLE = 2.0
-RAW_CANDLE_DIAGNOSTIC_COUNT = 5
+
+# HARD DATA-QUALITY GUARDS (signal scanner only)
+MAX_CANDLE_RANGE_PERCENT = 6.0  # high-low as % of close
+MAX_CANDLE_BODY_PERCENT = 5.0   # open-close as % of prior close
+MAX_CLOSE_JUMP_PERCENT = 5.0    # close-to-close jump
+ZERO_VOLUME_QUARANTINE_COUNT = 4  # zero-volume candles in latest 5 closed bars
+QUALITY_RECENT_CANDLES = 5
 
 BUY_RSI_MIN = 50
 BUY_RSI_MAX = 70
@@ -94,12 +96,12 @@ state = {
 active_signals = {}
 signal_history = []
 last_diagnostics = {}
+data_quarantine = {}  # per symbol/timeframe, reset only when that TF is clean
 scan_count = 0
 last_scan_time = None
 last_scan_duration = None
 last_discovery_time = 0
 symbols = []
-raw_diagnostic_last_logged = {}
 
 # ------------------------------------------------------------
 # HELPERS
@@ -258,74 +260,53 @@ def discover_symbols(force=False):
 # CANDLES / DATA QUALITY
 # ------------------------------------------------------------
 
-def candle_quality(frame, resolution, now=None):
-    """Inspect recent closed candles; return flags and concise metrics."""
-    now = int(now or time.time())
-    interval = {"5m": 300, "15m": 900}[resolution]
+def quality_flags(symbol, resolution, frame):
+    """Return hard-block flags for recent closed candles and update quarantine."""
     flags = []
-    if frame.empty:
-        return {"ok": False, "flags": ["NO_CANDLES"], "metrics": {}}
+    if frame is None or frame.empty:
+        flags.append("NO_CLOSED_CANDLES")
+    else:
+        recent = frame.tail(QUALITY_RECENT_CANDLES).copy()
+        if len(recent) >= QUALITY_RECENT_CANDLES:
+            zero_count = int((recent["volume"] <= 0).sum())
+            if zero_count >= ZERO_VOLUME_QUARANTINE_COUNT:
+                flags.append(f"ZERO_VOLUME_RECENT({zero_count}/{QUALITY_RECENT_CANDLES})")
 
-    recent = frame.tail(RAW_CANDLE_DIAGNOSTIC_COUNT).copy()
-    latest = recent.iloc[-1]
-    age = now - int(latest["time"])
-    if age > interval * MAX_STALE_CANDLE_MULTIPLE:
-        flags.append(f"STALE_LAST_CANDLE({age}s)")
+        for _, row in recent.iterrows():
+            close = float(row["close"])
+            if close <= 0:
+                flags.append("NONPOSITIVE_PRICE")
+                continue
+            range_pct = (float(row["high"]) - float(row["low"])) / close * 100
+            body_pct = abs(float(row["close"]) - float(row["open"])) / close * 100
+            if range_pct > MAX_CANDLE_RANGE_PERCENT:
+                flags.append(f"CANDLE_RANGE({range_pct:.2f}%>{MAX_CANDLE_RANGE_PERCENT:.2f}%)")
+            if body_pct > MAX_CANDLE_BODY_PERCENT:
+                flags.append(f"CANDLE_BODY({body_pct:.2f}%>{MAX_CANDLE_BODY_PERCENT:.2f}%)")
 
-    if len(recent) >= 2:
-        times = recent["time"].astype(int).tolist()
-        for left, right in zip(times, times[1:]):
-            gap = right - left
-            if gap > interval * MAX_CANDLE_GAP_MULTIPLE:
-                flags.append(f"CANDLE_GAP({gap}s)")
-                break
+        if len(frame) >= 2:
+            recent_pairs = frame.tail(QUALITY_RECENT_CANDLES + 1)
+            closes = recent_pairs["close"].astype(float).tolist()
+            for prev_close, close in zip(closes[:-1], closes[1:]):
+                if prev_close <= 0:
+                    flags.append("INVALID_PREVIOUS_CLOSE")
+                    continue
+                jump_pct = abs(close - prev_close) / prev_close * 100
+                if jump_pct > MAX_CLOSE_JUMP_PERCENT:
+                    flags.append(f"CLOSE_JUMP({jump_pct:.2f}%>{MAX_CLOSE_JUMP_PERCENT:.2f}%)")
 
-        # Detect suspicious open-to-close and close-to-close movements.
-        for _, candle in recent.iterrows():
-            move = abs(float(candle["close"]) / float(candle["open"])-1) * 100
-            if move > MAX_SINGLE_CANDLE_MOVE_PERCENT:
-                flags.append(f"CANDLE_BODY_JUMP({move:.2f}%)")
-                break
-        closes = recent["close"].astype(float).tolist()
-        for a, b in zip(closes, closes[1:]):
-            if a > 0:
-                move = abs(b / a - 1) * 100
-                if move > MAX_CLOSE_TO_CLOSE_MOVE_PERCENT:
-                    flags.append(f"CLOSE_JUMP({move:.2f}%)")
-                    break
-
-    zero_recent = int((recent["volume"] <= 0).sum())
-    if zero_recent:
-        flags.append(f"ZERO_VOLUME_RECENT({zero_recent}/{len(recent)})")
-
-    metrics = {
-        "latest_candle_age_seconds": age,
-        "recent_zero_volume_count": zero_recent,
-        "recent_candle_count": len(recent),
-        "last_candle_time": int(latest["time"]),
-        "last_close": float(latest["close"]),
-        "last_volume": float(latest["volume"]),
-    }
-    return {"ok": not any(flag.startswith(("STALE_LAST_CANDLE", "CANDLE_GAP", "CANDLE_BODY_JUMP", "CLOSE_JUMP")) for flag in flags),
-            "flags": flags, "metrics": metrics}
-
-
-def log_raw_candles(symbol, resolution, frame, quality):
-    """Log the last five raw candles only when quality concerns are detected."""
-    if not quality.get("flags"):
-        return
+    # Deduplicate flags while retaining their order.
+    flags = list(dict.fromkeys(flags))
     key = f"{symbol}:{resolution}"
-    now = time.time()
-    if now - raw_diagnostic_last_logged.get(key, 0) < 300:
-        return  # avoid flooding Render logs; repeat raw snapshot every 5 minutes
-    raw_diagnostic_last_logged[key] = now
-    rows = frame.tail(RAW_CANDLE_DIAGNOSTIC_COUNT)
-    logger.warning("[DATA QUALITY] %s %s flags=%s recent=%s", symbol, resolution,
-                  quality.get("flags"), len(rows))
-    for _, r in rows.iterrows():
-        logger.warning("[RAW CANDLE] %s %s time=%s O=%s H=%s L=%s C=%s V=%s",
-                      symbol, resolution, int(r["time"]), r["open"], r["high"],
-                      r["low"], r["close"], r["volume"])
+    if flags:
+        data_quarantine[key] = {"symbol": symbol, "resolution": resolution,
+                                "status": "QUARANTINED", "flags": flags,
+                                "updated_at": utc_now()}
+        logger.error("[DATA QUARANTINE] %s %s flags=%s", symbol, resolution, flags)
+    else:
+        data_quarantine.pop(key, None)
+        logger.info("[DATA QUALITY OK] %s %s recent closed candles clean", symbol, resolution)
+    return flags
 
 
 def fetch_candles(symbol, resolution, count):
@@ -348,29 +329,50 @@ def fetch_candles(symbol, resolution, count):
     missing = [c for c in required if c not in frame.columns]
     if missing:
         raise ValueError(f"Missing candle columns: {missing}")
+
     for column in required:
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.dropna(subset=required)
+
+    # Normalize millisecond timestamps to seconds if needed.
     if not frame.empty and frame["time"].median() > 10_000_000_000:
         frame["time"] = frame["time"] / 1000.0
     frame = frame.sort_values("time").drop_duplicates("time", keep="last")
 
-    frame = frame[(frame["open"] > 0) & (frame["high"] > 0) &
-                  (frame["low"] > 0) & (frame["close"] > 0) &
-                  (frame["volume"] >= 0) & (frame["high"] >= frame["low"]) &
-                  (frame["high"] >= frame["open"]) & (frame["high"] >= frame["close"]) &
-                  (frame["low"] <= frame["open"]) & (frame["low"] <= frame["close"])]
-
+    # Only closed bars are used for signals/quality evaluation.
     current_bar_open = now - (now % candle_seconds)
     frame = frame[frame["time"] < current_bar_open].reset_index(drop=True)
     if frame.empty:
-        raise ValueError("No valid closed candles after filtering")
+        raise ValueError("No closed candles after timestamp filtering")
 
-    quality = candle_quality(frame, resolution, now)
-    frame.attrs["quality"] = quality
-    log_raw_candles(symbol, resolution, frame, quality)
-    logger.debug("[CANDLES] %s %s rows=%s first=%s last=%s", symbol, resolution,
-                 len(frame), int(frame["time"].iloc[0]), int(frame["time"].iloc[-1]))
+    # Preserve evidence of malformed candles rather than silently discarding them.
+    integrity = (
+        (frame["open"] > 0) & (frame["high"] > 0) & (frame["low"] > 0) &
+        (frame["close"] > 0) & (frame["volume"] >= 0) &
+        (frame["high"] >= frame["low"]) &
+        (frame["high"] >= frame["open"]) & (frame["high"] >= frame["close"]) &
+        (frame["low"] <= frame["open"]) & (frame["low"] <= frame["close"])
+    )
+    bad_count = int((~integrity).sum())
+    if bad_count:
+        key = f"{symbol}:{resolution}"
+        flags = [f"INVALID_OHLC_ROWS({bad_count})"]
+        data_quarantine[key] = {"symbol": symbol, "resolution": resolution,
+                                "status": "QUARANTINED", "flags": flags,
+                                "updated_at": utc_now()}
+        logger.error("[DATA QUARANTINE] %s %s flags=%s", symbol, resolution, flags)
+        raise ValueError(f"DATA_QUARANTINE:{resolution}:{'|'.join(flags)}")
+    frame = frame[integrity].reset_index(drop=True)
+    if frame.empty:
+        raise ValueError("DATA_QUARANTINE: no integrity-valid candles")
+
+    flags = quality_flags(symbol, resolution, frame)
+    if flags:
+        raise ValueError(f"DATA_QUARANTINE:{resolution}:{'|'.join(flags)}")
+
+    logger.debug("[CANDLES] %s %s rows=%s first=%s last=%s",
+                 symbol, resolution, len(frame),
+                 int(frame["time"].iloc[0]), int(frame["time"].iloc[-1]))
     return frame
 
 
@@ -432,10 +434,6 @@ def analyze_trend(frame):
             "reason": f"Insufficient trend candles ({len(frame)}/{MIN_TREND_CANDLES})"
         }
 
-    quality = frame.attrs.get("quality", {"ok": True, "flags": [], "metrics": {}})
-    if not quality.get("ok", True):
-        return {"trend": "DATA_INVALID", "reason": "TREND_CANDLE_QUALITY:" + "|".join(quality.get("flags", [])),
-                "quality": quality}
     enriched = calculate_indicators(frame)
     row = enriched.iloc[-1]
 
@@ -459,7 +457,6 @@ def analyze_trend(frame):
         "ema50": ema50,
         "ema200": ema200,
         "trend_candle_time": int(row["time"]),
-        "quality": quality,
         "reason": ""
     }
 
@@ -477,7 +474,6 @@ def analyze_entry(symbol, trend_data, frame):
             "sell_blocked": ["INSUFFICIENT_ENTRY_CANDLES"]
         }
 
-    quality = frame.attrs.get("quality", {"ok": True, "flags": [], "metrics": {}})
     enriched = calculate_indicators(frame)
     row = enriched.iloc[-1]
 
@@ -491,17 +487,6 @@ def analyze_entry(symbol, trend_data, frame):
 
     trend = trend_data.get("trend", "NOT_READY")
     buy_reasons, sell_reasons = [], []
-
-    data_quality_block = not quality.get("ok", True)
-    if data_quality_block:
-        quality_reason = "CANDLE_DATA_INVALID:" + "|".join(quality.get("flags", []))
-        buy_reasons.append(quality_reason)
-        sell_reasons.append(quality_reason)
-    if trend == "DATA_INVALID":
-        trend_quality = trend_data.get("quality", {})
-        reason = "TREND_DATA_INVALID:" + "|".join(trend_quality.get("flags", []))
-        buy_reasons.append(reason)
-        sell_reasons.append(reason)
 
     if close is None or close <= 0:
         buy_reasons.append("INVALID_PRICE")
@@ -574,8 +559,6 @@ def analyze_entry(symbol, trend_data, frame):
         "volume_ok": volume_ok,
         "atr": atr,
         "atr_percent": atr_percent,
-        "entry_data_quality": quality,
-        "trend_data_quality": trend_data.get("quality", {}),
         "signal": signal,
         "buy_blocked": buy_reasons,
         "sell_blocked": sell_reasons,
@@ -692,10 +675,10 @@ def scan_symbol(symbol):
         trend_frame = fetch_candles(symbol, TREND_RESOLUTION, TREND_CANDLE_COUNT)
         trend_data = analyze_trend(trend_frame)
 
-        if trend_data["trend"] in ("NOT_READY", "DATA_INVALID"):
+        if trend_data["trend"] == "NOT_READY":
             diagnostic = {
                 "symbol": symbol, "time": utc_now(),
-                "signal": "NONE", "trend": trend_data["trend"],
+                "signal": "NONE", "trend": "NOT_READY",
                 "reason": trend_data.get("reason"),
                 "buy_blocked": [trend_data.get("reason")],
                 "sell_blocked": [trend_data.get("reason")]
@@ -721,12 +704,6 @@ def scan_symbol(symbol):
             diagnostic.get("signal")
         )
 
-        entry_quality = diagnostic.get("entry_data_quality", {})
-        if entry_quality.get("flags"):
-            logger.warning("[QUALITY SUMMARY] %s entry_flags=%s trend_flags=%s",
-                          symbol, entry_quality.get("flags"),
-                          diagnostic.get("trend_data_quality", {}).get("flags", []))
-
         if diagnostic["signal"] == "NONE":
             logger.info("[BLOCKED BUY] %s: %s", symbol,
                        " | ".join(diagnostic.get("buy_blocked", [])))
@@ -742,19 +719,24 @@ def scan_symbol(symbol):
 
     except Exception as exc:
         error_text = f"{symbol}: {type(exc).__name__}: {exc}"
-        logger.error("[SYMBOL ERROR] %s", error_text)
+        is_quarantine = "DATA_QUARANTINE" in str(exc)
+        logger.error("[%s] %s", "DATA BLOCKED" if is_quarantine else "SYMBOL ERROR", error_text)
         logger.debug(traceback.format_exc())
         add_error(error_text)
 
         diagnostic = {
             "symbol": symbol, "time": utc_now(),
-            "signal": "NONE", "trend": "ERROR",
+            "signal": "NONE", "trend": "DATA_INVALID" if is_quarantine else "ERROR",
+            "data_status": "QUARANTINED" if is_quarantine else "ERROR",
             "reason": error_text,
             "buy_blocked": [error_text],
             "sell_blocked": [error_text]
         }
         last_diagnostics[symbol] = diagnostic
-        # API error intentionally does not end a previously active signal.
+        if is_quarantine:
+            # Invalid market data invalidates any currently tracked signal.
+            record_signal(diagnostic)
+        # Ordinary API errors intentionally do not end a previously active signal.
         return diagnostic
 
 
@@ -935,6 +917,8 @@ def dashboard_data():
             "active_signals": active_signals.copy(),
             "signal_history": signal_history[-SIGNAL_HISTORY_LIMIT:],
             "last_diagnostics": last_diagnostics.copy(),
+            "data_quarantine": data_quarantine.copy(),
+            "quarantined_symbols": sorted({v.get("symbol") for v in data_quarantine.values()}),
             "errors": state.get("errors", [])[-20:],
             "settings": {
                 "trend_resolution": TREND_RESOLUTION,
@@ -946,6 +930,10 @@ def dashboard_data():
                 "rsi_period": RSI_PERIOD,
                 "atr_period": ATR_PERIOD,
                 "max_atr_percent": MAX_ATR_PERCENT,
+                "max_candle_range_percent": MAX_CANDLE_RANGE_PERCENT,
+                "max_candle_body_percent": MAX_CANDLE_BODY_PERCENT,
+                "max_close_jump_percent": MAX_CLOSE_JUMP_PERCENT,
+                "zero_volume_quarantine_count": ZERO_VOLUME_QUARANTINE_COUNT,
                 "volume_ma_period": VOLUME_MA_PERIOD,
                 "volume_multiplier": VOLUME_MULTIPLIER,
                 "buy_rsi_range": [BUY_RSI_MIN, BUY_RSI_MAX],
@@ -973,6 +961,7 @@ def diagnostics_endpoint():
         return jsonify({
             "symbols": symbols.copy(),
             "diagnostics": last_diagnostics.copy(),
+            "data_quarantine": data_quarantine.copy(),
             "errors": state.get("errors", [])[-20:],
             "time": utc_now()
         })
