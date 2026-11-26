@@ -16,7 +16,7 @@ from flask import Flask, jsonify, Response
 # ============================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-TRADING_ENABLED = False  # informational hard lock; scanner never places orders
+TRADING_ENABLED = True 
 
 TREND_RESOLUTION = "15m"
 ENTRY_RESOLUTION = "5m"
