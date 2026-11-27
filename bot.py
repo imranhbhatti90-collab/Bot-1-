@@ -9,7 +9,7 @@ from flask import Flask, jsonify, Response
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
 AUTO_TRADING_REQUESTED = os.getenv("AUTO_TRADING", "false").lower() == "true"
 # Safety lock: order execution is intentionally disabled in this build.
-AUTO_TRADING = False
+AUTO_TRADING = True
 EXECUTION_LOCK_REASON = "ORDER EXECUTION DISABLED: API signing, product sizing, and protective-order workflow require separate validation."
 MARGIN_USD = 20.0
 MAX_POSITIONS = 10
