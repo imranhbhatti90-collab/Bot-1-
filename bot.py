@@ -42,11 +42,11 @@ MAX_CLOSE_JUMP_PCT = 5.0
 ZERO_VOLUME_QUARANTINE_COUNT = 4
 ZERO_VOLUME_WINDOW = 5
 
-# UPDATED SETTINGS
+# ATR SETTINGS
 ATR_SL_MULTIPLIER = 1.5
 ATR_TP_MULTIPLIER = 2.0
 
-# Cooldown after a position closes (TP or SL)
+# Cooldown after position closes
 COOLDOWN_SECONDS = 15 * 60
 
 STOP_TRIGGER_METHOD = "last_traded_price"
@@ -88,6 +88,7 @@ products_by_symbol = {}
 last_discovery = 0
 last_executed_candle = {}
 
+
 # ----------------------- STATE -------------------------------
 def load_state():
     global state, last_executed_candle
@@ -113,6 +114,7 @@ def load_state():
     state.setdefault("orders", [])
     state.setdefault("errors", [])
 
+
 def save_state():
     with lock:
         state["last_executed_candle"] = last_executed_candle
@@ -122,6 +124,7 @@ def save_state():
             json.dump(state, f, indent=2, default=str)
 
         os.replace(tmp, STATE_FILE)
+
 
 def record_error(where, exc):
     msg = f"{where}: {type(exc).__name__}: {exc}"
@@ -135,6 +138,7 @@ def record_error(where, exc):
         state["errors"] = state["errors"][-30:]
 
     save_state()
+
 
 # ----------------------- API ---------------------------------
 def api_request(method, path, params=None, body=None, auth=False):
@@ -198,10 +202,12 @@ def api_request(method, path, params=None, body=None, auth=False):
 
     return payload
 
+
 def result_of(payload):
     if isinstance(payload, dict):
         return payload.get("result", payload)
     return payload
+
 
 def get_products():
     payload = api_request("GET", "/v2/products")
@@ -211,6 +217,7 @@ def get_products():
         result = result.get("products", [])
 
     return result if isinstance(result, list) else []
+
 
 def discover_symbols(force=False):
     global last_discovery, products_by_symbol
@@ -243,8 +250,8 @@ def discover_symbols(force=False):
         last_discovery = time.time()
 
         log.info(
-            "[DISCOVERY] eligible=%s / requested=%s",
-            len(active), len(FALLBACK_SYMBOLS)
+            "[DISCOVERY] eligible=%s / requested=%s symbols=%s",
+            len(active), len(FALLBACK_SYMBOLS), active
         )
 
         save_state()
@@ -254,6 +261,7 @@ def discover_symbols(force=False):
 
         if not products_by_symbol:
             state["symbols"] = FALLBACK_SYMBOLS[:]
+
 
 # ----------------------- CANDLES ------------------------------
 def fetch_candles(symbol, resolution):
@@ -317,6 +325,7 @@ def fetch_candles(symbol, resolution):
 
     return df.tail(CANDLE_LIMIT).reset_index(drop=True)
 
+
 # ----------------------- INDICATORS ---------------------------
 def add_indicators(df):
     d = df.copy()
@@ -355,6 +364,7 @@ def add_indicators(df):
 
     return d
 
+
 def validate_data(df, symbol, resolution):
     minimum = (
         MIN_TREND_CANDLES
@@ -383,6 +393,7 @@ def validate_data(df, symbol, resolution):
         raise ValueError("INVALID_CLOSE")
 
     atr_pct = float(last.get("atr", 0)) / close * 100
+
     candle_range_pct = (
         float(last["high"]) - float(last["low"])
     ) / close * 100
@@ -420,6 +431,7 @@ def validate_data(df, symbol, resolution):
         "time": int(last["time"]),
         "atr_pct": round(atr_pct, 4)
     }
+
 
 # ----------------------- ANALYSIS ------------------------------
 def analyze_symbol(symbol):
@@ -485,6 +497,7 @@ def analyze_symbol(symbol):
         "volume_ma20": float(e["volume_ma20"])
     }
 
+
 # ----------------------- ACCOUNT / EXECUTION ------------------
 def get_positions():
     payload = api_request(
@@ -500,6 +513,7 @@ def get_positions():
 
     return result if isinstance(result, list) else []
 
+
 def open_positions():
     return [
         p for p in get_positions()
@@ -507,8 +521,10 @@ def open_positions():
         and int(float(p.get("size", 0) or 0)) != 0
     ]
 
+
 def position_symbol(p):
     return p.get("product_symbol") or p.get("symbol")
+
 
 def get_leverage(product_id):
     payload = api_request(
@@ -524,6 +540,7 @@ def get_leverage(product_id):
 
     raise RuntimeError(f"Could not read current leverage: {payload}")
 
+
 def round_to_tick(value, tick, direction):
     tick = float(tick or 0)
 
@@ -536,6 +553,7 @@ def round_to_tick(value, tick, direction):
         return round(math.ceil(units) * tick, 8)
 
     return round(math.floor(units) * tick, 8)
+
 
 def calculate_order_size(product, price, leverage):
     contract_value = float(product.get("contract_value") or 0)
@@ -559,6 +577,7 @@ def calculate_order_size(product, price, leverage):
 
     return size
 
+
 # ----------------------- COOLDOWN ----------------------------
 def check_cooldown(symbol):
     until = float(
@@ -578,6 +597,7 @@ def check_cooldown(symbol):
         state["cooldown_until"].pop(symbol, None)
 
     return False
+
 
 def monitor_closed_positions():
     """
@@ -618,6 +638,8 @@ def monitor_closed_positions():
     state["tracked_open_symbols"] = sorted(current_symbols)
     save_state()
 
+
+# ----------------------- ENTRY / ATR LOGGING ------------------
 def submit_entry(signal_data):
     symbol = signal_data["symbol"]
 
@@ -641,6 +663,10 @@ def submit_entry(signal_data):
         state["execution_status"][symbol] = (
             f"BLOCKED_MAX_POSITIONS({len(positions)}/{MAX_POSITIONS})"
         )
+        log.warning(
+            "[ENTRY BLOCKED] %s max positions reached (%s/%s)",
+            symbol, len(positions), MAX_POSITIONS
+        )
         return
 
     # Do not open a second position on same symbol
@@ -649,6 +675,7 @@ def submit_entry(signal_data):
             state["execution_status"][symbol] = (
                 "BLOCKED_POSITION_ALREADY_OPEN"
             )
+            log.info("[ENTRY BLOCKED] %s position already open", symbol)
             return
 
     candle_key = str(signal_data["candle_time"])
@@ -657,6 +684,7 @@ def submit_entry(signal_data):
         state["execution_status"][symbol] = (
             "BLOCKED_DUPLICATE_CANDLE"
         )
+        log.info("[ENTRY BLOCKED] %s duplicate candle", symbol)
         return
 
     product_id = product.get("id")
@@ -678,23 +706,44 @@ def submit_entry(signal_data):
 
     tick = float(product.get("tick_size") or 0.01)
 
-    # UPDATED SL ATR x 1.5, TP ATR x 2.0
+    # Calculate distances
+    sl_distance = ATR_SL_MULTIPLIER * atr
+    tp_distance = ATR_TP_MULTIPLIER * atr
+
+    # ATR calculation log
+    log.info(
+        "\n========== ATR TRADE CALCULATION ==========\n"
+        "COIN: %s\n"
+        "SIGNAL: %s\n"
+        "REFERENCE ENTRY: %.8f\n"
+        "ATR(14): %.8f\n"
+        "SL MULTIPLIER: %.2f\n"
+        "SL DISTANCE: %.8f\n"
+        "TP MULTIPLIER: %.2f\n"
+        "TP DISTANCE: %.8f\n"
+        "==========================================",
+        symbol, signal_data["signal"], price,
+        atr, ATR_SL_MULTIPLIER, sl_distance,
+        ATR_TP_MULTIPLIER, tp_distance
+    )
+
+    # Calculate bracket prices
     if side == "buy":
         sl = round_to_tick(
-            price - ATR_SL_MULTIPLIER * atr,
+            price - sl_distance,
             tick, "down"
         )
         tp = round_to_tick(
-            price + ATR_TP_MULTIPLIER * atr,
+            price + tp_distance,
             tick, "up"
         )
     else:
         sl = round_to_tick(
-            price + ATR_SL_MULTIPLIER * atr,
+            price + sl_distance,
             tick, "up"
         )
         tp = round_to_tick(
-            price - ATR_TP_MULTIPLIER * atr,
+            price - tp_distance,
             tick, "down"
         )
 
@@ -715,12 +764,30 @@ def submit_entry(signal_data):
         "client_order_id": client_order_id
     }
 
+    # Full order request log
     log.info(
-        "[ORDER REQUEST] %s %s size=%s margin_target=$%.2f "
-        "leverage=%sx price~%s SL=%s (ATR x %.1f) "
-        "TP=%s (ATR x %.1f)",
+        "\n========== ORDER REQUEST ==========\n"
+        "COIN: %s\n"
+        "SIDE: %s\n"
+        "SIZE: %s\n"
+        "MARGIN TARGET: $%.2f\n"
+        "LEVERAGE: %sx\n"
+        "REFERENCE ENTRY: %.8f\n"
+        "ATR(14): %.8f\n"
+        "SL PRICE: %.8f\n"
+        "SL DISTANCE: %.8f\n"
+        "SL ATR MULTIPLIER: %.2f\n"
+        "TP PRICE: %.8f\n"
+        "TP DISTANCE: %.8f\n"
+        "TP ATR MULTIPLIER: %.2f\n"
+        "TRIGGER METHOD: %s\n"
+        "CLIENT ORDER ID: %s\n"
+        "================================",
         symbol, side.upper(), size, MARGIN_USD, leverage,
-        price, sl, ATR_SL_MULTIPLIER, tp, ATR_TP_MULTIPLIER
+        price, atr,
+        sl, sl_distance, ATR_SL_MULTIPLIER,
+        tp, tp_distance, ATR_TP_MULTIPLIER,
+        STOP_TRIGGER_METHOD, client_order_id
     )
 
     response = api_request(
@@ -752,7 +819,7 @@ def submit_entry(signal_data):
     state["trade_count"] = int(state.get("trade_count", 0)) + 1
     state["execution_status"][symbol] = "ORDER_ACCEPTED"
 
-    state.setdefault("orders", []).append({
+    order_record = {
         "time": datetime.now(timezone.utc).isoformat(),
         "symbol": symbol,
         "side": side,
@@ -760,6 +827,9 @@ def submit_entry(signal_data):
         "margin_target_usd": MARGIN_USD,
         "leverage_read": leverage,
         "reference_price": price,
+        "atr": atr,
+        "sl_distance": sl_distance,
+        "tp_distance": tp_distance,
         "stop_loss": sl,
         "take_profit": tp,
         "sl_atr_multiplier": ATR_SL_MULTIPLIER,
@@ -767,16 +837,41 @@ def submit_entry(signal_data):
         "order_id": order_id,
         "client_order_id": client_order_id,
         "response": response
-    })
+    }
 
+    state.setdefault("orders", []).append(order_record)
     state["orders"] = state["orders"][-100:]
 
     save_state()
+
+    # Accepted order detailed log
+    log.info(
+        "\n========== BRACKET ORDER ACCEPTED ==========\n"
+        "COIN: %s\n"
+        "SIDE: %s\n"
+        "ORDER ID: %s\n"
+        "CLIENT ORDER ID: %s\n"
+        "QUANTITY: %s\n"
+        "REFERENCE ENTRY: %.8f\n"
+        "ATR(14): %.8f\n"
+        "SL PRICE: %.8f | ATR x %.2f\n"
+        "TP PRICE: %.8f | ATR x %.2f\n"
+        "TARGET MARGIN: $%.2f\n"
+        "LEVERAGE: %sx\n"
+        "STATUS: EXCHANGE ACCEPTED\n"
+        "==========================================",
+        symbol, side.upper(), order_id,
+        client_order_id, size, price, atr,
+        sl, ATR_SL_MULTIPLIER,
+        tp, ATR_TP_MULTIPLIER,
+        MARGIN_USD, leverage
+    )
 
     log.info(
         "[ORDER ACCEPTED] %s %s id=%s",
         symbol, side.upper(), order_id
     )
+
 
 # ----------------------- SCANNER ------------------------------
 def scan_symbol(symbol):
@@ -787,9 +882,13 @@ def scan_symbol(symbol):
 
         log.info(
             "[SIGNAL] %s trend=%s signal=%s price=%.8f "
-            "RSI=%.2f ATR=%.8f",
+            "RSI=%.2f ATR=%.8f EMA10=%.8f EMA20=%.8f "
+            "EMA50=%.8f EMA200=%.8f volume=%.4f volumeMA20=%.4f",
             symbol, data["trend"], data["signal"],
-            data["price"], data["rsi"], data["atr"]
+            data["price"], data["rsi"], data["atr"],
+            data["ema10"], data["ema20"],
+            data["ema50"], data["ema200"],
+            data["volume"], data["volume_ma20"]
         )
 
         if data["signal"] in ("BUY", "SELL"):
@@ -807,6 +906,7 @@ def scan_symbol(symbol):
     except Exception as e:
         state.setdefault("execution_status", {})[symbol] = f"BLOCKED: {e}"
         log.warning("[SCAN BLOCKED] %s: %s", symbol, e)
+
 
 def scanner_loop():
     load_state()
@@ -826,6 +926,11 @@ def scanner_loop():
         ATR_SL_MULTIPLIER,
         ATR_TP_MULTIPLIER,
         COOLDOWN_SECONDS // 60
+    )
+
+    log.info(
+        "[LOGGING ENABLED] ATR calculation, distances, "
+        "bracket prices and accepted order details will be printed."
     )
 
     while True:
@@ -853,6 +958,7 @@ def scanner_loop():
         elapsed = time.time() - cycle_start
 
         time.sleep(max(1, SCAN_INTERVAL - elapsed))
+
 
 # ----------------------- WEB DASHBOARD ------------------------
 @app.route("/")
@@ -900,6 +1006,7 @@ def home():
     """
     return Response(html, mimetype="text/html")
 
+
 @app.route("/health")
 def health():
     return jsonify({
@@ -909,6 +1016,7 @@ def health():
         "api_credentials_present": bool(API_KEY and API_SECRET),
         "last_scan": state.get("last_scan")
     })
+
 
 @app.route("/dashboard-data")
 def dashboard_data():
@@ -935,6 +1043,7 @@ def dashboard_data():
         "state": state
     })
 
+
 @app.route("/positions")
 def positions_route():
     try:
@@ -947,6 +1056,7 @@ def positions_route():
             "success": False,
             "error": str(e)
         }), 500
+
 
 @app.route("/diagnostics")
 def diagnostics():
@@ -967,6 +1077,7 @@ def diagnostics():
         "last_scan": state.get("last_scan"),
         "execution_status": state.get("execution_status", {})
     })
+
 
 # ----------------------- STARTUP ------------------------------
 if __name__ == "__main__":
