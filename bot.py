@@ -334,7 +334,7 @@ def add_indicators(df):
     d["ema10"] = close.ewm(span=10, adjust=False).mean()
     d["ema20"] = close.ewm(span=20, adjust=False).mean()
     d["ema50"] = close.ewm(span=50, adjust=False).mean()
-    d["ema200"] = close.ewm(span=200, adjust=False).mean()
+    d["ema100"] = close.ewm(span=100, adjust=False).mean()
 
     delta = close.diff()
 
@@ -450,16 +450,16 @@ def analyze_symbol(symbol):
     trend_name = "MIXED"
 
     if (
-        t["ema50"] > t["ema200"]
+        t["ema50"] > t["ema100"]
         and t["close"] > t["ema50"]
-        and t["close"] > t["ema200"]
+        and t["close"] > t["ema100"]
     ):
         trend_name = "BULLISH"
 
     elif (
-        t["ema50"] < t["ema200"]
+        t["ema50"] < t["ema100"]
         and t["close"] < t["ema50"]
-        and t["close"] < t["ema200"]
+        and t["close"] < t["ema100"]
     ):
         trend_name = "BEARISH"
 
@@ -491,7 +491,7 @@ def analyze_symbol(symbol):
         "ema10": float(e["ema10"]),
         "ema20": float(e["ema20"]),
         "ema50": float(t["ema50"]),
-        "ema200": float(t["ema200"]),
+        "ema100": float(t["ema100"]),
         "candle_time": int(e["time"]),
         "volume": float(e["volume"]),
         "volume_ma20": float(e["volume_ma20"])
@@ -883,11 +883,11 @@ def scan_symbol(symbol):
         log.info(
             "[SIGNAL] %s trend=%s signal=%s price=%.8f "
             "RSI=%.2f ATR=%.8f EMA10=%.8f EMA20=%.8f "
-            "EMA50=%.8f EMA200=%.8f volume=%.4f volumeMA20=%.4f",
+            "EMA50=%.8f EMA100=%.8f volume=%.4f volumeMA20=%.4f",
             symbol, data["trend"], data["signal"],
             data["price"], data["rsi"], data["atr"],
             data["ema10"], data["ema20"],
-            data["ema50"], data["ema200"],
+            data["ema50"], data["ema100"],
             data["volume"], data["volume_ma20"]
         )
 
