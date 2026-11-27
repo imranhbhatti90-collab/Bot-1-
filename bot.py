@@ -1,22 +1,29 @@
 import os
 import json
 import time
+import hmac
+import hashlib
 import threading
 import logging
 import traceback
+import math
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 import requests
 import pandas as pd
 from flask import Flask, jsonify, Response
 
 # ============================================================
-# DELTA EXCHANGE INDIA TESTNET - SIGNAL SCANNER ONLY
-# HARD SAFETY: NO ORDER PLACEMENT CODE IN THIS FILE
+# DELTA INDIA TESTNET - AUTO TRADER
+# HARD LOCK: TESTNET URL ONLY
 # ============================================================
 
 BASE_URL = "https://cdn-ind.testnet.deltaex.org"
-TRADING_ENABLED = True 
+
+AUTO_TRADING = os.getenv("AUTO_TRADING", "true").lower() == "true"
+MARGIN_USD = 20.0
+MAX_POSITIONS = 10
 
 TREND_RESOLUTION = "15m"
 ENTRY_RESOLUTION = "5m"
@@ -32,13 +39,12 @@ RSI_PERIOD = 14
 ATR_PERIOD = 14
 VOLUME_MA_PERIOD = 20
 VOLUME_MULTIPLIER = 1.00
-MAX_ATR_PERCENT = 5.0  # Reject suspiciously abnormal ATR readings
 
-# HARD DATA-QUALITY GUARDS (signal scanner only)
-MAX_CANDLE_RANGE_PERCENT = 6.0  # high-low as % of close
-MAX_CANDLE_BODY_PERCENT = 5.0   # open-close as % of prior close
-MAX_CLOSE_JUMP_PERCENT = 5.0    # close-to-close jump
-ZERO_VOLUME_QUARANTINE_COUNT = 4  # zero-volume candles in latest 5 closed bars
+MAX_ATR_PERCENT = 5.0
+MAX_CANDLE_RANGE_PERCENT = 6.0
+MAX_CANDLE_BODY_PERCENT = 5.0
+MAX_CLOSE_JUMP_PERCENT = 5.0
+ZERO_VOLUME_QUARANTINE_COUNT = 4
 QUALITY_RECENT_CANDLES = 5
 
 BUY_RSI_MIN = 50
@@ -51,9 +57,14 @@ ENTRY_CANDLE_COUNT = 1000
 MIN_TREND_CANDLES = 220
 MIN_ENTRY_CANDLES = 50
 
+SL_ATR_MULTIPLIER = 1.2
+TP_ATR_MULTIPLIER = 2.0
+
 SIGNAL_HISTORY_LIMIT = 200
-CHECKPOINT_EVERY = 10
 STATE_FILE = "state.json"
+
+API_KEY = os.getenv("DELTA_API_KEY", "").strip()
+API_SECRET = os.getenv("DELTA_API_SECRET", "").strip()
 
 FALLBACK_SYMBOLS = [
     "1000SHIBUSD", "ADAUSD", "BTCUSD", "DOGEUSD", "DOGSUSD",
@@ -66,193 +77,201 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
-logger = logging.getLogger("delta_scanner")
+logger = logging.getLogger("delta_auto_testnet")
 
 session = requests.Session()
 session.headers.update({
     "Accept": "application/json",
-    "User-Agent": "Delta-India-Testnet-Signal-Scanner/3.0"
+    "User-Agent": "Delta-India-Testnet-AutoBot/4.0"
 })
 
 app = Flask(__name__)
-state_lock = threading.RLock()
+lock = threading.RLock()
 
-state = {
-    "bot_status": "STARTING",
-    "trading_enabled": False,
-    "exchange": "DELTA INDIA TESTNET",
-    "symbols": [],
-    "total_symbols": 0,
-    "scan_count": 0,
-    "last_scan": None,
-    "last_scan_duration": None,
-    "active_signals": {},
-    "signal_history": [],
-    "last_diagnostics": {},
-    "errors": [],
-    "started_at": None
-}
-
+symbols = FALLBACK_SYMBOLS.copy()
+products = {}
 active_signals = {}
 signal_history = []
 last_diagnostics = {}
-data_quarantine = {}  # per symbol/timeframe, reset only when that TF is clean
+data_quarantine = {}
+errors = []
 scan_count = 0
 last_scan_time = None
 last_scan_duration = None
 last_discovery_time = 0
-symbols = []
+last_entry_candle = {}
+trade_history = []
+execution_status = {}
 
 # ------------------------------------------------------------
-# HELPERS
+# BASIC HELPERS
 # ------------------------------------------------------------
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def safe_float(value, default=None):
+def safe_float(v, default=None):
     try:
-        value = float(value)
-        if pd.isna(value) or not pd.notna(value):
+        x = float(v)
+        if not math.isfinite(x):
             return default
-        return value
-    except (TypeError, ValueError):
+        return x
+    except Exception:
         return default
 
 
-def add_error(message):
-    with state_lock:
-        state["errors"].append({"time": utc_now(), "message": str(message)})
-        state["errors"] = state["errors"][-50:]
-
-
-def api_get(path, params=None, timeout=15):
-    url = BASE_URL + path
-    last_error = None
-
-    for attempt in range(3):
-        try:
-            response = session.get(url, params=params, timeout=timeout)
-            response.raise_for_status()
-            payload = response.json()
-
-            if isinstance(payload, dict) and payload.get("success") is False:
-                raise RuntimeError(f"API success=False: {payload}")
-
-            return payload
-
-        except Exception as exc:
-            last_error = exc
-            logger.warning("[API RETRY] %s attempt=%s error=%s",
-                          path, attempt + 1, exc)
-            if attempt < 2:
-                time.sleep(1 + attempt)
-
-    raise RuntimeError(f"API failed: {path}: {last_error}")
+def add_error(msg):
+    errors.append({"time": utc_now(), "message": str(msg)})
+    del errors[:-50]
 
 
 def result_list(payload):
     if not isinstance(payload, dict):
         return []
-    result = payload.get("result", [])
-    return result if isinstance(result, list) else []
+    r = payload.get("result", [])
+    return r if isinstance(r, list) else []
+
+
+def result_obj(payload):
+    if isinstance(payload, dict):
+        return payload.get("result")
+    return None
 
 
 # ------------------------------------------------------------
-# SYMBOL DISCOVERY
+# API AUTHENTICATION
+# ------------------------------------------------------------
+
+def auth_headers(method, path, params=None, body=None):
+    if not API_KEY or not API_SECRET:
+        raise RuntimeError("Missing DELTA_API_KEY or DELTA_API_SECRET")
+
+    timestamp = str(int(time.time()))
+    query = urlencode(params or {})
+    request_path = path + (("?" + query) if query else "")
+    body_text = json.dumps(body, separators=(",", ":")) if body else ""
+
+    prehash = method.upper() + timestamp + request_path + body_text
+    signature = hmac.new(
+        API_SECRET.encode(),
+        prehash.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    return {
+        "api-key": API_KEY,
+        "signature": signature,
+        "timestamp": timestamp,
+        "User-Agent": "Delta-India-Testnet-AutoBot/4.0",
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
+
+
+def api_request(method, path, params=None, body=None, auth=False):
+    # Explicit environment lock.
+    if BASE_URL != "https://cdn-ind.testnet.deltaex.org":
+        raise RuntimeError("TESTNET URL LOCK FAILED")
+
+    headers = {}
+    if auth:
+        headers = auth_headers(method, path, params, body)
+
+    url = BASE_URL + path
+
+    response = session.request(
+        method=method.upper(),
+        url=url,
+        params=params,
+        json=body,
+        headers=headers,
+        timeout=20
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    if isinstance(payload, dict) and payload.get("success") is False:
+        raise RuntimeError(f"Delta API error: {payload.get('error')}")
+
+    return payload
+
+
+def api_get(path, params=None, auth=False):
+    return api_request("GET", path, params=params, auth=auth)
+
+
+def api_post(path, body, auth=True):
+    return api_request("POST", path, body=body, auth=auth)
+
+
+# ------------------------------------------------------------
+# PRODUCT DISCOVERY
 # ------------------------------------------------------------
 
 def discover_symbols(force=False):
-    global symbols, last_discovery_time
+    global symbols, products, last_discovery_time
 
     now = time.time()
-    if not force and symbols and now - last_discovery_time < DISCOVERY_INTERVAL:
+    if not force and products and now - last_discovery_time < DISCOVERY_INTERVAL:
         return symbols
 
-    found = set()
+    found = {}
     cursor = None
-    pages = 0
 
     try:
-        while pages < 10:
+        for _ in range(10):
             params = {"page_size": 100}
             if cursor:
                 params["after"] = cursor
 
             payload = api_get("/v2/products", params=params)
-            products = result_list(payload)
-            pages += 1
+            rows = result_list(payload)
 
-            for product in products:
-                if not isinstance(product, dict):
+            for p in rows:
+                if not isinstance(p, dict):
                     continue
 
-                sym = str(product.get("symbol", "")).strip().upper()
-                if not sym or not sym.endswith("USD"):
-                    continue
-                if sym.startswith(("C-", "P-")):
+                sym = str(p.get("symbol", "")).upper().strip()
+                if not sym.endswith("USD") or sym.startswith(("C-", "P-")):
                     continue
 
                 contract_type = str(
-                    product.get("contract_type")
-                    or product.get("product_type")
-                    or product.get("type")
-                    or ""
-                ).strip().lower()
-                description = str(product.get("description", "")).lower()
-
-                # If product metadata identifies type, require perpetual.
+                    p.get("contract_type", p.get("product_type", ""))
+                ).lower()
+                description = str(p.get("description", "")).lower()
                 type_text = contract_type or description
+
                 if type_text and "perpetual" not in type_text:
                     continue
 
-                status = str(
-                    product.get("state") or product.get("status") or ""
-                ).strip().lower()
+                status = str(p.get("state", p.get("status", ""))).lower()
                 if status and status not in ("live", "active", "trading"):
                     continue
 
-                found.add(sym)
+                found[sym] = p
 
-            meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+            meta = payload.get("meta", {})
             next_cursor = meta.get("after")
-            if not products or not next_cursor or next_cursor == cursor:
+            if not rows or not next_cursor or next_cursor == cursor:
                 break
             cursor = next_cursor
 
-        discovered = sorted(found)
-        logger.info("[DISCOVERY] pages=%s discovered=%s", pages, len(discovered))
-
-        if discovered:
-            symbols = discovered
-            logger.info("[DISCOVERY SYMBOLS] %s", ",".join(symbols))
+        if found:
+            products = found
+            symbols = sorted(found.keys())
         else:
-            symbols = FALLBACK_SYMBOLS.copy()
-            logger.warning("[DISCOVERY FALLBACK] Using known symbols: %s",
-                          ",".join(symbols))
+            logger.warning("[DISCOVERY] Using fallback symbols")
 
         last_discovery_time = now
-        with state_lock:
-            state["symbols"] = symbols.copy()
-            state["total_symbols"] = len(symbols)
+        logger.info("[DISCOVERY] symbols=%s", len(symbols))
         return symbols
 
     except Exception as exc:
-        logger.error("[DISCOVERY ERROR] %s", exc)
-        add_error(f"Discovery error: {exc}")
-
-        if symbols:
-            logger.warning("[DISCOVERY] Retaining previous symbol list (%s)",
-                          len(symbols))
-            return symbols
-
-        symbols = FALLBACK_SYMBOLS.copy()
-        last_discovery_time = now
-        with state_lock:
-            state["symbols"] = symbols.copy()
-            state["total_symbols"] = len(symbols)
-        logger.warning("[DISCOVERY FALLBACK] Using %s symbols", len(symbols))
+        logger.exception("[DISCOVERY ERROR] %s", exc)
+        add_error(str(exc))
+        if not symbols:
+            symbols = FALLBACK_SYMBOLS.copy()
         return symbols
 
 
@@ -260,143 +279,134 @@ def discover_symbols(force=False):
 # CANDLES / DATA QUALITY
 # ------------------------------------------------------------
 
-def quality_flags(symbol, resolution, frame):
-    """Return hard-block flags for recent closed candles and update quarantine."""
-    flags = []
-    if frame is None or frame.empty:
-        flags.append("NO_CLOSED_CANDLES")
-    else:
-        recent = frame.tail(QUALITY_RECENT_CANDLES).copy()
-        if len(recent) >= QUALITY_RECENT_CANDLES:
-            zero_count = int((recent["volume"] <= 0).sum())
-            if zero_count >= ZERO_VOLUME_QUARANTINE_COUNT:
-                flags.append(f"ZERO_VOLUME_RECENT({zero_count}/{QUALITY_RECENT_CANDLES})")
-
-        for _, row in recent.iterrows():
-            close = float(row["close"])
-            if close <= 0:
-                flags.append("NONPOSITIVE_PRICE")
-                continue
-            range_pct = (float(row["high"]) - float(row["low"])) / close * 100
-            body_pct = abs(float(row["close"]) - float(row["open"])) / close * 100
-            if range_pct > MAX_CANDLE_RANGE_PERCENT:
-                flags.append(f"CANDLE_RANGE({range_pct:.2f}%>{MAX_CANDLE_RANGE_PERCENT:.2f}%)")
-            if body_pct > MAX_CANDLE_BODY_PERCENT:
-                flags.append(f"CANDLE_BODY({body_pct:.2f}%>{MAX_CANDLE_BODY_PERCENT:.2f}%)")
-
-        if len(frame) >= 2:
-            recent_pairs = frame.tail(QUALITY_RECENT_CANDLES + 1)
-            closes = recent_pairs["close"].astype(float).tolist()
-            for prev_close, close in zip(closes[:-1], closes[1:]):
-                if prev_close <= 0:
-                    flags.append("INVALID_PREVIOUS_CLOSE")
-                    continue
-                jump_pct = abs(close - prev_close) / prev_close * 100
-                if jump_pct > MAX_CLOSE_JUMP_PERCENT:
-                    flags.append(f"CLOSE_JUMP({jump_pct:.2f}%>{MAX_CLOSE_JUMP_PERCENT:.2f}%)")
-
-    # Deduplicate flags while retaining their order.
-    flags = list(dict.fromkeys(flags))
-    key = f"{symbol}:{resolution}"
-    if flags:
-        data_quarantine[key] = {"symbol": symbol, "resolution": resolution,
-                                "status": "QUARANTINED", "flags": flags,
-                                "updated_at": utc_now()}
-        logger.error("[DATA QUARANTINE] %s %s flags=%s", symbol, resolution, flags)
-    else:
-        data_quarantine.pop(key, None)
-        logger.info("[DATA QUALITY OK] %s %s recent closed candles clean", symbol, resolution)
-    return flags
-
-
 def fetch_candles(symbol, resolution, count):
     now = int(time.time())
-    candle_seconds = {"5m": 300, "15m": 900}.get(resolution)
-    if not candle_seconds:
-        raise ValueError(f"Unsupported candle resolution: {resolution}")
+    seconds = {"5m": 300, "15m": 900}[resolution]
+    start = now - count * seconds
 
-    start = now - count * candle_seconds
     payload = api_get(
         "/v2/history/candles",
-        params={"resolution": resolution, "symbol": symbol, "start": start, "end": now}
+        params={
+            "resolution": resolution,
+            "symbol": symbol,
+            "start": start,
+            "end": now
+        }
     )
+
     rows = result_list(payload)
     if not rows:
-        raise ValueError("API returned no candle rows")
+        raise ValueError("NO_CANDLES")
 
     frame = pd.DataFrame(rows)
     required = ["time", "open", "high", "low", "close", "volume"]
-    missing = [c for c in required if c not in frame.columns]
-    if missing:
-        raise ValueError(f"Missing candle columns: {missing}")
 
-    for column in required:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    if any(c not in frame.columns for c in required):
+        raise ValueError("MISSING_CANDLE_FIELDS")
+
+    for c in required:
+        frame[c] = pd.to_numeric(frame[c], errors="coerce")
+
     frame = frame.dropna(subset=required)
 
-    # Normalize millisecond timestamps to seconds if needed.
-    if not frame.empty and frame["time"].median() > 10_000_000_000:
-        frame["time"] = frame["time"] / 1000.0
-    frame = frame.sort_values("time").drop_duplicates("time", keep="last")
+    if frame["time"].median() > 10_000_000_000:
+        frame["time"] /= 1000.0
 
-    # Only closed bars are used for signals/quality evaluation.
-    current_bar_open = now - (now % candle_seconds)
-    frame = frame[frame["time"] < current_bar_open].reset_index(drop=True)
+    frame = frame.sort_values("time").drop_duplicates("time")
+    current_open = now - now % seconds
+    frame = frame[frame["time"] < current_open].reset_index(drop=True)
+
     if frame.empty:
-        raise ValueError("No closed candles after timestamp filtering")
+        raise ValueError("NO_CLOSED_CANDLES")
 
-    # Preserve evidence of malformed candles rather than silently discarding them.
     integrity = (
-        (frame["open"] > 0) & (frame["high"] > 0) & (frame["low"] > 0) &
-        (frame["close"] > 0) & (frame["volume"] >= 0) &
+        (frame["open"] > 0) &
+        (frame["high"] > 0) &
+        (frame["low"] > 0) &
+        (frame["close"] > 0) &
+        (frame["volume"] >= 0) &
         (frame["high"] >= frame["low"]) &
-        (frame["high"] >= frame["open"]) & (frame["high"] >= frame["close"]) &
-        (frame["low"] <= frame["open"]) & (frame["low"] <= frame["close"])
+        (frame["high"] >= frame["open"]) &
+        (frame["high"] >= frame["close"]) &
+        (frame["low"] <= frame["open"]) &
+        (frame["low"] <= frame["close"])
     )
-    bad_count = int((~integrity).sum())
-    if bad_count:
-        key = f"{symbol}:{resolution}"
-        flags = [f"INVALID_OHLC_ROWS({bad_count})"]
-        data_quarantine[key] = {"symbol": symbol, "resolution": resolution,
-                                "status": "QUARANTINED", "flags": flags,
-                                "updated_at": utc_now()}
-        logger.error("[DATA QUARANTINE] %s %s flags=%s", symbol, resolution, flags)
-        raise ValueError(f"DATA_QUARANTINE:{resolution}:{'|'.join(flags)}")
-    frame = frame[integrity].reset_index(drop=True)
-    if frame.empty:
-        raise ValueError("DATA_QUARANTINE: no integrity-valid candles")
 
-    flags = quality_flags(symbol, resolution, frame)
+    if not integrity.all():
+        raise ValueError("DATA_QUARANTINE:INVALID_OHLC")
+
+    recent = frame.tail(QUALITY_RECENT_CANDLES)
+    flags = []
+
+    if len(recent) == QUALITY_RECENT_CANDLES:
+        zeros = int((recent["volume"] <= 0).sum())
+        if zeros >= ZERO_VOLUME_QUARANTINE_COUNT:
+            flags.append(f"ZERO_VOLUME({zeros}/{QUALITY_RECENT_CANDLES})")
+
+    for _, row in recent.iterrows():
+        close = row["close"]
+        if close <= 0:
+            flags.append("INVALID_CLOSE")
+            continue
+
+        range_pct = (row["high"] - row["low"]) / close * 100
+        body_pct = abs(row["close"] - row["open"]) / close * 100
+
+        if range_pct > MAX_CANDLE_RANGE_PERCENT:
+            flags.append(f"CANDLE_RANGE({range_pct:.2f}%)")
+        if body_pct > MAX_CANDLE_BODY_PERCENT:
+            flags.append(f"CANDLE_BODY({body_pct:.2f}%)")
+
+    if len(frame) >= 2:
+        closes = frame.tail(QUALITY_RECENT_CANDLES + 1)["close"].tolist()
+        for a, b in zip(closes[:-1], closes[1:]):
+            if a <= 0:
+                flags.append("INVALID_PREVIOUS_CLOSE")
+            elif abs(b - a) / a * 100 > MAX_CLOSE_JUMP_PERCENT:
+                flags.append("CLOSE_JUMP")
+
+    key = f"{symbol}:{resolution}"
+
     if flags:
-        raise ValueError(f"DATA_QUARANTINE:{resolution}:{'|'.join(flags)}")
+        data_quarantine[key] = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "flags": list(set(flags)),
+            "status": "QUARANTINED",
+            "updated_at": utc_now()
+        }
+        raise ValueError("DATA_QUARANTINE:" + "|".join(flags))
 
-    logger.debug("[CANDLES] %s %s rows=%s first=%s last=%s",
-                 symbol, resolution, len(frame),
-                 int(frame["time"].iloc[0]), int(frame["time"].iloc[-1]))
+    data_quarantine.pop(key, None)
     return frame
 
 
 # ------------------------------------------------------------
-# INDICATORS (EMA, RSI-WILDER, ATR-WILDER, VOLUME MA)
+# INDICATORS
 # ------------------------------------------------------------
 
 def calculate_indicators(frame):
     frame = frame.copy()
 
-    for span in (10, 20, 50, 200):
+    for span in [10, 20, 50, 200]:
         frame[f"ema{span}"] = frame["close"].ewm(
             span=span, adjust=False, min_periods=span
         ).mean()
 
     delta = frame["close"].diff()
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    avg_gain = gains.ewm(
-        alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False
+    avg_gain = gain.ewm(
+        alpha=1 / RSI_PERIOD,
+        min_periods=RSI_PERIOD,
+        adjust=False
     ).mean()
-    avg_loss = losses.ewm(
-        alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD, adjust=False
+
+    avg_loss = loss.ewm(
+        alpha=1 / RSI_PERIOD,
+        min_periods=RSI_PERIOD,
+        adjust=False
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, float("nan"))
@@ -405,34 +415,34 @@ def calculate_indicators(frame):
     frame.loc[(avg_gain == 0) & (avg_loss > 0), "rsi"] = 0
     frame.loc[(avg_gain == 0) & (avg_loss == 0), "rsi"] = 50
 
-    previous_close = frame["close"].shift(1)
+    prev_close = frame["close"].shift(1)
     tr = pd.concat([
         frame["high"] - frame["low"],
-        (frame["high"] - previous_close).abs(),
-        (frame["low"] - previous_close).abs()
+        (frame["high"] - prev_close).abs(),
+        (frame["low"] - prev_close).abs()
     ], axis=1).max(axis=1)
-    frame["tr"] = tr
+
     frame["atr"] = tr.ewm(
-        alpha=1 / ATR_PERIOD, min_periods=ATR_PERIOD, adjust=False
+        alpha=1 / ATR_PERIOD,
+        min_periods=ATR_PERIOD,
+        adjust=False
     ).mean()
 
     frame["volume_avg"] = frame["volume"].shift(1).rolling(
-        VOLUME_MA_PERIOD, min_periods=VOLUME_MA_PERIOD
+        VOLUME_MA_PERIOD,
+        min_periods=VOLUME_MA_PERIOD
     ).mean()
 
     return frame
 
 
 # ------------------------------------------------------------
-# TREND ANALYSIS
+# SIGNAL ANALYSIS
 # ------------------------------------------------------------
 
 def analyze_trend(frame):
     if len(frame) < MIN_TREND_CANDLES:
-        return {
-            "trend": "NOT_READY",
-            "reason": f"Insufficient trend candles ({len(frame)}/{MIN_TREND_CANDLES})"
-        }
+        return {"trend": "NOT_READY"}
 
     enriched = calculate_indicators(frame)
     row = enriched.iloc[-1]
@@ -442,7 +452,7 @@ def analyze_trend(frame):
     ema200 = safe_float(row["ema200"])
 
     if None in (close, ema50, ema200):
-        return {"trend": "NOT_READY", "reason": "Trend EMA values invalid"}
+        return {"trend": "NOT_READY"}
 
     if ema50 > ema200 and close > ema50 and close > ema200:
         trend = "BULLISH"
@@ -456,89 +466,59 @@ def analyze_trend(frame):
         "close": close,
         "ema50": ema50,
         "ema200": ema200,
-        "trend_candle_time": int(row["time"]),
-        "reason": ""
+        "time": int(row["time"])
     }
 
 
-# ------------------------------------------------------------
-# ENTRY ANALYSIS
-# ------------------------------------------------------------
-
 def analyze_entry(symbol, trend_data, frame):
     if len(frame) < MIN_ENTRY_CANDLES:
-        return {
-            "symbol": symbol, "signal": "NONE",
-            "reason": f"INSUFFICIENT_ENTRY_CANDLES({len(frame)})",
-            "buy_blocked": ["INSUFFICIENT_ENTRY_CANDLES"],
-            "sell_blocked": ["INSUFFICIENT_ENTRY_CANDLES"]
-        }
+        return {"symbol": symbol, "signal": "NONE", "reason": "ENTRY_CANDLES_SHORT"}
 
-    enriched = calculate_indicators(frame)
-    row = enriched.iloc[-1]
+    frame = calculate_indicators(frame)
+    row = frame.iloc[-1]
 
     close = safe_float(row["close"])
     ema10 = safe_float(row["ema10"])
     ema20 = safe_float(row["ema20"])
     rsi = safe_float(row["rsi"])
     atr = safe_float(row["atr"])
-    current_volume = safe_float(row["volume"], 0.0)
+    volume = safe_float(row["volume"], 0)
     volume_avg = safe_float(row["volume_avg"])
 
-    trend = trend_data.get("trend", "NOT_READY")
-    buy_reasons, sell_reasons = [], []
+    trend = trend_data.get("trend")
+    reasons = []
 
-    if close is None or close <= 0:
-        buy_reasons.append("INVALID_PRICE")
-        sell_reasons.append("INVALID_PRICE")
-    if ema10 is None or ema20 is None:
-        buy_reasons.append("ENTRY_EMA_NOT_READY")
-        sell_reasons.append("ENTRY_EMA_NOT_READY")
-    if rsi is None:
-        buy_reasons.append("RSI_NOT_READY")
-        sell_reasons.append("RSI_NOT_READY")
-    atr_percent = (atr / close * 100.0) if atr is not None and close and close > 0 else None
-    if atr is None or atr <= 0:
-        buy_reasons.append("ATR_NOT_READY")
-        sell_reasons.append("ATR_NOT_READY")
-    elif atr_percent is not None and atr_percent > MAX_ATR_PERCENT:
-        buy_reasons.append(f"ATR_OUTLIER({atr_percent:.2f}%>{MAX_ATR_PERCENT:.2f}%)")
-        sell_reasons.append(f"ATR_OUTLIER({atr_percent:.2f}%>{MAX_ATR_PERCENT:.2f}%)")
-    if volume_avg is None or volume_avg <= 0:
-        buy_reasons.append("VOLUME_AVERAGE_INVALID")
-        sell_reasons.append("VOLUME_AVERAGE_INVALID")
-    if current_volume <= 0:
-        buy_reasons.append("CURRENT_VOLUME_ZERO")
-        sell_reasons.append("CURRENT_VOLUME_ZERO")
+    if not close or close <= 0:
+        reasons.append("INVALID_PRICE")
+    if not ema10 or not ema20:
+        reasons.append("EMA_NOT_READY")
+    if not rsi:
+        reasons.append("RSI_NOT_READY")
+    if not atr or atr <= 0:
+        reasons.append("ATR_NOT_READY")
+
+    atr_pct = atr / close * 100 if close and atr else None
+    if atr_pct and atr_pct > MAX_ATR_PERCENT:
+        reasons.append("ATR_OUTLIER")
 
     volume_ok = (
-        current_volume > 0 and volume_avg is not None and volume_avg > 0
-        and current_volume >= volume_avg * VOLUME_MULTIPLIER
+        volume > 0 and volume_avg and volume_avg > 0
+        and volume >= volume_avg * VOLUME_MULTIPLIER
     )
 
-    if trend != "BULLISH":
-        buy_reasons.append(f"TREND_NOT_BULLISH({trend})")
-    if ema10 is None or ema20 is None or not ema10 > ema20:
-        buy_reasons.append("EMA10_NOT_ABOVE_EMA20")
-    if rsi is None or not (BUY_RSI_MIN <= rsi <= BUY_RSI_MAX):
-        buy_reasons.append(f"RSI_OUTSIDE_BUY_RANGE({rsi})")
-    if not volume_ok:
-        buy_reasons.append("VOLUME_FILTER_FAIL")
+    buy = (
+        not reasons and trend == "BULLISH" and
+        ema10 > ema20 and BUY_RSI_MIN <= rsi <= BUY_RSI_MAX and
+        volume_ok
+    )
 
-    if trend != "BEARISH":
-        sell_reasons.append(f"TREND_NOT_BEARISH({trend})")
-    if ema10 is None or ema20 is None or not ema10 < ema20:
-        sell_reasons.append("EMA10_NOT_BELOW_EMA20")
-    if rsi is None or not (SELL_RSI_MIN <= rsi <= SELL_RSI_MAX):
-        sell_reasons.append(f"RSI_OUTSIDE_SELL_RANGE({rsi})")
-    if not volume_ok:
-        sell_reasons.append("VOLUME_FILTER_FAIL")
+    sell = (
+        not reasons and trend == "BEARISH" and
+        ema10 < ema20 and SELL_RSI_MIN <= rsi <= SELL_RSI_MAX and
+        volume_ok
+    )
 
-    signal = "NONE"
-    if not buy_reasons:
-        signal = "BUY"
-    elif not sell_reasons:
-        signal = "SELL"
+    signal = "BUY" if buy else "SELL" if sell else "NONE"
 
     diagnostic = {
         "symbol": symbol,
@@ -550,440 +530,801 @@ def analyze_entry(symbol, trend_data, frame):
         "ema50": trend_data.get("ema50"),
         "ema200": trend_data.get("ema200"),
         "rsi": rsi,
-        "volume": current_volume,
-        "volume_avg": volume_avg,
-        "volume_ratio": (
-            current_volume / volume_avg
-            if volume_avg is not None and volume_avg > 0 else None
-        ),
-        "volume_ok": volume_ok,
         "atr": atr,
-        "atr_percent": atr_percent,
+        "atr_percent": atr_pct,
+        "volume": volume,
+        "volume_avg": volume_avg,
+        "volume_ratio": volume / volume_avg if volume_avg else None,
+        "volume_ok": bool(volume_ok),
         "signal": signal,
-        "buy_blocked": buy_reasons,
-        "sell_blocked": sell_reasons,
         "candle_time": int(row["time"]),
-        "trend_candle_time": trend_data.get("trend_candle_time"),
-        "reason": "ALL_BUY_FILTERS_PASSED" if signal == "BUY"
-                  else "ALL_SELL_FILTERS_PASSED" if signal == "SELL"
-                  else "FILTERS_BLOCKED"
+        "trend_candle_time": trend_data.get("time"),
+        "reason": "FILTERS_PASSED" if signal != "NONE" else "FILTERS_BLOCKED"
     }
+
     return diagnostic
 
 
 # ------------------------------------------------------------
-# SIGNAL HISTORY / TRACKING
+# AUTH ACCOUNT INFORMATION
+# ------------------------------------------------------------
+
+def get_positions():
+    payload = api_get("/v2/positions/margined", auth=True)
+    return result_list(payload)
+
+
+def get_open_orders():
+    payload = api_get("/v2/orders", auth=True)
+    return result_list(payload)
+
+
+def open_position_for_symbol(symbol, positions=None):
+    if positions is None:
+        positions = get_positions()
+
+    for p in positions:
+        if str(p.get("product_symbol", p.get("symbol", ""))).upper() == symbol:
+            size = safe_float(p.get("size"), 0)
+            if size and size != 0:
+                return p
+    return None
+
+
+def active_orders_for_symbol(symbol, orders=None):
+    if orders is None:
+        orders = get_open_orders()
+
+    result = []
+    for o in orders:
+        if str(o.get("product_symbol", o.get("symbol", ""))).upper() != symbol:
+            continue
+        status = str(o.get("state", "")).lower()
+        if status in ("open", "pending"):
+            result.append(o)
+    return result
+
+
+def count_open_positions(positions=None):
+    if positions is None:
+        positions = get_positions()
+
+    count = 0
+    for p in positions:
+        if safe_float(p.get("size"), 0) != 0:
+            count += 1
+    return count
+
+
+# ------------------------------------------------------------
+# POSITION SIZING
+# ------------------------------------------------------------
+
+def get_product(symbol):
+    if symbol not in products:
+        discover_symbols(force=True)
+    return products.get(symbol)
+
+
+def get_leverage(product_id):
+    payload = api_get(
+        f"/v2/products/{product_id}/orders/leverage",
+        auth=True
+    )
+    data = result_obj(payload)
+    if not isinstance(data, dict):
+        raise RuntimeError("LEVERAGE API returned unexpected data")
+
+    lev = safe_float(data.get("leverage"))
+    if not lev or lev <= 0:
+        raise RuntimeError("Exchange leverage unavailable")
+    return lev
+
+
+def calculate_contract_size(product, leverage, price):
+    contract_value = safe_float(product.get("contract_value"))
+    minimum_size = safe_float(product.get("minimum_order_size"), 1)
+    maximum_size = safe_float(product.get("maximum_order_size"))
+
+    if not contract_value or contract_value <= 0:
+        raise RuntimeError("Product contract_value missing/invalid")
+
+    if not price or price <= 0:
+        raise RuntimeError("Invalid price for sizing")
+
+    # Approximation for USD-quoted contract metadata.
+    # Refuse if product metadata does not support calculation.
+    target_notional = MARGIN_USD * leverage
+    raw_size = target_notional / contract_value
+    size = int(math.floor(raw_size))
+
+    if size < minimum_size:
+        raise RuntimeError(
+            f"Calculated size {size} below exchange minimum {minimum_size}"
+        )
+
+    if maximum_size and size > maximum_size:
+        size = int(maximum_size)
+
+    if size <= 0:
+        raise RuntimeError("Calculated order size invalid")
+
+    estimated_notional = size * contract_value
+    estimated_margin = estimated_notional / leverage
+
+    if estimated_margin > MARGIN_USD * 1.10:
+        raise RuntimeError("Sizing would exceed margin allowance")
+
+    return size, estimated_margin, estimated_notional
+
+
+# ------------------------------------------------------------
+# ORDER PLACEMENT
+# ------------------------------------------------------------
+
+def place_market_entry(symbol, side, size, product):
+    body = {
+        "product_id": int(product["id"]),
+        "product_symbol": symbol,
+        "size": int(size),
+        "side": side,
+        "order_type": "market_order"
+    }
+
+    logger.warning("[ENTRY ORDER] %s %s size=%s", symbol, side, size)
+    return api_post("/v2/orders", body, auth=True)
+
+
+def place_protective_order(symbol, product, side, size, stop_price, order_type):
+    body = {
+        "product_id": int(product["id"]),
+        "product_symbol": symbol,
+        "size": int(size),
+        "side": side,
+        "order_type": "market_order",
+        "stop_order_type": order_type,
+        "stop_price": str(stop_price),
+        "stop_trigger_method": "last_traded_price",
+        "reduce_only": True
+    }
+
+    logger.warning(
+        "[PROTECTIVE ORDER] %s %s size=%s trigger=%s type=%s",
+        symbol, side, size, stop_price, order_type
+    )
+    return api_post("/v2/orders", body, auth=True)
+
+
+def cancel_order(order_id):
+    # DELETE order endpoint.
+    return api_request(
+        "DELETE",
+        f"/v2/orders/{order_id}",
+        auth=True
+    )
+
+
+def cancel_symbol_orders(symbol):
+    orders = active_orders_for_symbol(symbol)
+    for o in orders:
+        oid = o.get("id")
+        if oid:
+            try:
+                cancel_order(oid)
+                logger.info("[CANCEL RESIDUAL] %s order=%s", symbol, oid)
+            except Exception as exc:
+                logger.error("[CANCEL ERROR] %s %s", symbol, exc)
+
+
+# ------------------------------------------------------------
+# EXECUTION SAFETY
+# ------------------------------------------------------------
+
+def execute_signal(diagnostic):
+    symbol = diagnostic.get("symbol")
+    signal = diagnostic.get("signal")
+    price = safe_float(diagnostic.get("close"))
+    atr = safe_float(diagnostic.get("atr"))
+    candle_time = diagnostic.get("candle_time")
+
+    if not AUTO_TRADING:
+        execution_status[symbol] = "AUTO_TRADING_DISABLED"
+        return
+
+    if signal not in ("BUY", "SELL"):
+        return
+
+    if not price or not atr or atr <= 0:
+        execution_status[symbol] = "INVALID_PRICE_OR_ATR"
+        return
+
+    # Prevent repeat entries on same 5m candle.
+    if last_entry_candle.get(symbol) == candle_time:
+        execution_status[symbol] = "SAME_CANDLE_ENTRY_BLOCK"
+        return
+
+    try:
+        positions = get_positions()
+        orders = get_open_orders()
+
+        if open_position_for_symbol(symbol, positions):
+            execution_status[symbol] = "POSITION_ALREADY_OPEN"
+            return
+
+        if active_orders_for_symbol(symbol, orders):
+            execution_status[symbol] = "ACTIVE_ORDER_EXISTS"
+            return
+
+        if count_open_positions(positions) >= MAX_POSITIONS:
+            execution_status[symbol] = "MAX_POSITION_LIMIT"
+            return
+
+        product = get_product(symbol)
+        if not product:
+            execution_status[symbol] = "PRODUCT_NOT_FOUND"
+            return
+
+        product_id = product.get("id")
+        if not product_id:
+            execution_status[symbol] = "PRODUCT_ID_MISSING"
+            return
+
+        leverage = get_leverage(product_id)
+        size, estimated_margin, notional = calculate_contract_size(
+            product, leverage, price
+        )
+
+        entry_side = "buy" if signal == "BUY" else "sell"
+        exit_side = "sell" if signal == "BUY" else "buy"
+
+        # ATR stop and target levels.
+        if signal == "BUY":
+            stop_price = price - atr * SL_ATR_MULTIPLIER
+            target_price = price + atr * TP_ATR_MULTIPLIER
+        else:
+            stop_price = price + atr * SL_ATR_MULTIPLIER
+            target_price = price - atr * TP_ATR_MULTIPLIER
+
+        if stop_price <= 0 or target_price <= 0:
+            execution_status[symbol] = "INVALID_STOP_TARGET"
+            return
+
+        # ENTRY
+        entry_response = place_market_entry(
+            symbol, entry_side, size, product
+        )
+
+        # Wait for exchange position to appear.
+        position = None
+        for _ in range(8):
+            time.sleep(1)
+            position = open_position_for_symbol(symbol)
+            if position:
+                break
+
+        if not position:
+            execution_status[symbol] = (
+                "ENTRY_SENT_POSITION_NOT_CONFIRMED"
+            )
+            logger.error(
+                "[ENTRY UNCERTAIN] %s: check exchange manually before restart",
+                symbol
+            )
+            return
+
+        actual_size = abs(int(safe_float(position.get("size"), size)))
+        entry_price = safe_float(position.get("entry_price"), price)
+
+        # Protective SL first.
+        try:
+            sl_response = place_protective_order(
+                symbol, product, exit_side, actual_size,
+                stop_price, "stop_loss_order"
+            )
+        except Exception as sl_error:
+            logger.critical(
+                "[SL FAILED] %s; HALTING NEW ENTRIES. Error=%s",
+                symbol, sl_error
+            )
+            execution_status[symbol] = "SL_FAILED_EMERGENCY"
+
+            # Attempt emergency reduce-only market close.
+            try:
+                emergency_body = {
+                    "product_id": int(product_id),
+                    "product_symbol": symbol,
+                    "size": actual_size,
+                    "side": exit_side,
+                    "order_type": "market_order",
+                    "reduce_only": True
+                }
+                api_post("/v2/orders", emergency_body, auth=True)
+                execution_status[symbol] = "SL_FAILED_EMERGENCY_CLOSE_SENT"
+            except Exception as close_error:
+                logger.critical(
+                    "[EMERGENCY CLOSE FAILED] %s %s",
+                    symbol, close_error
+                )
+                execution_status[symbol] = "CRITICAL_MANUAL_ACTION_REQUIRED"
+            return
+
+        # Verify protective stop appears in active orders.
+        verified_sl = False
+        for _ in range(5):
+            time.sleep(1)
+            active = active_orders_for_symbol(symbol)
+            for o in active:
+                stop_type = str(o.get("stop_order_type", "")).lower()
+                reduce_only = o.get("reduce_only")
+                if "stop_loss" in stop_type and reduce_only:
+                    verified_sl = True
+                    break
+            if verified_sl:
+                break
+
+        if not verified_sl:
+            logger.critical("[SL NOT VERIFIED] %s", symbol)
+            execution_status[symbol] = "SL_NOT_VERIFIED"
+            return
+
+        # Place reduce-only take-profit.
+        tp_response = None
+        try:
+            tp_response = place_protective_order(
+                symbol, product, exit_side, actual_size,
+                target_price, "take_profit_order"
+            )
+        except Exception as tp_error:
+            logger.error("[TP ERROR] %s %s", symbol, tp_error)
+            execution_status[symbol] = "SL_VERIFIED_TP_FAILED"
+
+        trade = {
+            "time": utc_now(),
+            "symbol": symbol,
+            "signal": signal,
+            "entry_price": entry_price,
+            "reference_price": price,
+            "size": actual_size,
+            "margin_estimate": estimated_margin,
+            "notional_estimate": notional,
+            "leverage_read_from_exchange": leverage,
+            "atr": atr,
+            "stop_loss": stop_price,
+            "take_profit": target_price,
+            "entry_order": entry_response,
+            "sl_order": sl_response,
+            "tp_order": tp_response,
+            "status": "ENTRY_AND_SL_VERIFIED"
+        }
+
+        trade_history.append(trade)
+        del trade_history[:-100]
+
+        last_entry_candle[symbol] = candle_time
+        execution_status[symbol] = "TRADE_OPEN_SL_VERIFIED"
+
+        logger.warning(
+            "[TRADE OPEN] %s %s entry=%s size=%s SL=%s TP=%s "
+            "leverage=%sx margin_est=%s",
+            symbol, signal, entry_price, actual_size,
+            stop_price, target_price, leverage, estimated_margin
+        )
+
+    except Exception as exc:
+        execution_status[symbol] = "EXECUTION_ERROR"
+        logger.error("[EXECUTION ERROR] %s %s", symbol, exc)
+        logger.debug(traceback.format_exc())
+        add_error(f"Execution {symbol}: {exc}")
+
+
+# ------------------------------------------------------------
+# SIGNAL TRACKING
 # ------------------------------------------------------------
 
 def record_signal(diagnostic):
     symbol = diagnostic.get("symbol")
     signal = diagnostic.get("signal", "NONE")
-    now = utc_now()
     previous = active_signals.get(symbol)
+    now = utc_now()
 
     if signal == "NONE":
         if previous:
             signal_history.append({
-                "event": "END", "symbol": symbol,
+                "event": "END",
+                "symbol": symbol,
                 "signal": previous["signal"],
-                "first_seen": previous["first_seen"],
-                "last_seen": previous["last_seen"],
-                "duration_scans": previous["scans"],
                 "ended_at": now,
-                "last_price": diagnostic.get("close"),
-                "reason": diagnostic.get("reason")
+                "last_price": diagnostic.get("close")
             })
-            logger.info("[SIGNAL END] %s %s scans=%s",
-                        symbol, previous["signal"], previous["scans"])
             active_signals.pop(symbol, None)
-        trim_history()
         return
 
-    if not previous:
+    if not previous or previous.get("signal") != signal:
         active_signals[symbol] = {
-            "symbol": symbol, "signal": signal,
-            "first_seen": now, "last_seen": now,
-            "scans": 1, "last_price": diagnostic.get("close"),
-            "last_rsi": diagnostic.get("rsi"),
-            "last_atr": diagnostic.get("atr"),
-            "trend": diagnostic.get("trend")
+            "symbol": symbol,
+            "signal": signal,
+            "first_seen": now,
+            "last_seen": now,
+            "scans": 1,
+            "last_price": diagnostic.get("close"),
+            "rsi": diagnostic.get("rsi"),
+            "atr": diagnostic.get("atr")
         }
         signal_history.append({
-            "event": "START", "symbol": symbol, "signal": signal,
-            "time": now, "price": diagnostic.get("close"),
-            "rsi": diagnostic.get("rsi"), "atr": diagnostic.get("atr"),
-            "trend": diagnostic.get("trend")
-        })
-        logger.warning("[SIGNAL START] %s %s price=%s RSI=%s ATR=%s",
-                      symbol, signal, diagnostic.get("close"),
-                      diagnostic.get("rsi"), diagnostic.get("atr"))
-        trim_history()
-        return
-
-    if previous["signal"] != signal:
-        signal_history.append({
-            "event": "CHANGE", "symbol": symbol,
-            "old_signal": previous["signal"], "new_signal": signal,
-            "time": now, "price": diagnostic.get("close")
-        })
-        logger.warning("[SIGNAL CHANGE] %s %s -> %s",
-                      symbol, previous["signal"], signal)
-        active_signals[symbol] = {
-            "symbol": symbol, "signal": signal,
-            "first_seen": now, "last_seen": now,
-            "scans": 1, "last_price": diagnostic.get("close"),
-            "last_rsi": diagnostic.get("rsi"),
-            "last_atr": diagnostic.get("atr"),
-            "trend": diagnostic.get("trend")
-        }
-        trim_history()
-        return
-
-    previous.update({
-        "last_seen": now,
-        "scans": previous.get("scans", 0) + 1,
-        "last_price": diagnostic.get("close"),
-        "last_rsi": diagnostic.get("rsi"),
-        "last_atr": diagnostic.get("atr"),
-        "trend": diagnostic.get("trend")
-    })
-
-    if previous["scans"] % CHECKPOINT_EVERY == 0:
-        signal_history.append({
-            "event": "CHECKPOINT", "symbol": symbol, "signal": signal,
-            "time": now, "scans": previous["scans"],
-            "first_seen": previous["first_seen"],
+            "event": "START",
+            "symbol": symbol,
+            "signal": signal,
+            "time": now,
             "price": diagnostic.get("close"),
-            "rsi": diagnostic.get("rsi"), "atr": diagnostic.get("atr")
+            "rsi": diagnostic.get("rsi"),
+            "atr": diagnostic.get("atr")
         })
-        logger.info("[SIGNAL CHECKPOINT] %s %s scans=%s",
-                    symbol, signal, previous["scans"])
-    trim_history()
+    else:
+        previous["last_seen"] = now
+        previous["scans"] = previous.get("scans", 0) + 1
+        previous["last_price"] = diagnostic.get("close")
 
-
-def trim_history():
-    if len(signal_history) > SIGNAL_HISTORY_LIMIT:
-        del signal_history[:-SIGNAL_HISTORY_LIMIT]
+    del signal_history[:-SIGNAL_HISTORY_LIMIT]
 
 
 # ------------------------------------------------------------
-# PER-SYMBOL SCAN
+# PER SYMBOL SCANNER
 # ------------------------------------------------------------
 
 def scan_symbol(symbol):
     try:
-        trend_frame = fetch_candles(symbol, TREND_RESOLUTION, TREND_CANDLE_COUNT)
+        trend_frame = fetch_candles(
+            symbol, TREND_RESOLUTION, TREND_CANDLE_COUNT
+        )
         trend_data = analyze_trend(trend_frame)
 
-        if trend_data["trend"] == "NOT_READY":
-            diagnostic = {
-                "symbol": symbol, "time": utc_now(),
-                "signal": "NONE", "trend": "NOT_READY",
-                "reason": trend_data.get("reason"),
-                "buy_blocked": [trend_data.get("reason")],
-                "sell_blocked": [trend_data.get("reason")]
+        if trend_data.get("trend") == "NOT_READY":
+            return {
+                "symbol": symbol,
+                "signal": "NONE",
+                "trend": "NOT_READY",
+                "reason": "TREND_CANDLES_INSUFFICIENT"
             }
-            logger.warning("[TREND SKIP] %s %s",
-                          symbol, trend_data.get("reason"))
-            record_signal(diagnostic)
-            last_diagnostics[symbol] = diagnostic
-            return diagnostic
 
-        entry_frame = fetch_candles(symbol, ENTRY_RESOLUTION, ENTRY_CANDLE_COUNT)
+        entry_frame = fetch_candles(
+            symbol, ENTRY_RESOLUTION, ENTRY_CANDLE_COUNT
+        )
         diagnostic = analyze_entry(symbol, trend_data, entry_frame)
         last_diagnostics[symbol] = diagnostic
 
         logger.info(
-            "[SIGNAL DIAG] %s TREND=%s CLOSE=%s EMA10=%s EMA20=%s "
-            "RSI=%s VOL=%s AVG=%s VOL_RATIO=%s VOL_OK=%s ATR=%s SIGNAL=%s",
-            symbol, diagnostic.get("trend"), diagnostic.get("close"),
-            diagnostic.get("ema10"), diagnostic.get("ema20"),
-            diagnostic.get("rsi"), diagnostic.get("volume"),
-            diagnostic.get("volume_avg"), diagnostic.get("volume_ratio"),
-            diagnostic.get("volume_ok"), diagnostic.get("atr"),
-            diagnostic.get("signal")
+            "[SIGNAL] %s trend=%s signal=%s close=%s RSI=%s ATR=%s",
+            symbol, diagnostic.get("trend"), diagnostic.get("signal"),
+            diagnostic.get("close"), diagnostic.get("rsi"),
+            diagnostic.get("atr")
         )
 
-        if diagnostic["signal"] == "NONE":
-            logger.info("[BLOCKED BUY] %s: %s", symbol,
-                       " | ".join(diagnostic.get("buy_blocked", [])))
-            logger.info("[BLOCKED SELL] %s: %s", symbol,
-                       " | ".join(diagnostic.get("sell_blocked", [])))
-        else:
-            logger.warning("[VALID SIGNAL] %s %s price=%s RSI=%s",
-                           symbol, diagnostic["signal"],
-                           diagnostic.get("close"), diagnostic.get("rsi"))
-
         record_signal(diagnostic)
+
+        if diagnostic.get("signal") in ("BUY", "SELL"):
+            execute_signal(diagnostic)
+
         return diagnostic
 
     except Exception as exc:
         error_text = f"{symbol}: {type(exc).__name__}: {exc}"
-        is_quarantine = "DATA_QUARANTINE" in str(exc)
-        logger.error("[%s] %s", "DATA BLOCKED" if is_quarantine else "SYMBOL ERROR", error_text)
-        logger.debug(traceback.format_exc())
+        logger.error("[SCAN BLOCKED] %s", error_text)
         add_error(error_text)
 
         diagnostic = {
-            "symbol": symbol, "time": utc_now(),
-            "signal": "NONE", "trend": "DATA_INVALID" if is_quarantine else "ERROR",
-            "data_status": "QUARANTINED" if is_quarantine else "ERROR",
-            "reason": error_text,
-            "buy_blocked": [error_text],
-            "sell_blocked": [error_text]
+            "symbol": symbol,
+            "time": utc_now(),
+            "signal": "NONE",
+            "trend": "DATA_INVALID",
+            "reason": error_text
         }
         last_diagnostics[symbol] = diagnostic
-        if is_quarantine:
-            # Invalid market data invalidates any currently tracked signal.
-            record_signal(diagnostic)
-        # Ordinary API errors intentionally do not end a previously active signal.
+        record_signal(diagnostic)
         return diagnostic
 
 
 # ------------------------------------------------------------
-# STATE PERSISTENCE
+# POSITION / ORDER MONITOR
+# ------------------------------------------------------------
+
+def monitor_positions():
+    try:
+        positions = get_positions()
+        orders = get_open_orders()
+
+        open_symbols = set()
+        for p in positions:
+            size = safe_float(p.get("size"), 0)
+            if size:
+                open_symbols.add(
+                    str(p.get("product_symbol", p.get("symbol", ""))).upper()
+                )
+
+        # Cancel residual protective orders only when position is closed.
+        for symbol in list(products.keys()):
+            active = active_orders_for_symbol(symbol, orders)
+            if active and symbol not in open_symbols:
+                logger.info("[POSITION CLOSED] %s - cancelling residual orders", symbol)
+                for o in active:
+                    oid = o.get("id")
+                    if oid:
+                        try:
+                            cancel_order(oid)
+                        except Exception as exc:
+                            logger.error("[RESIDUAL CANCEL ERROR] %s %s", symbol, exc)
+
+        return positions, orders
+
+    except Exception as exc:
+        logger.error("[MONITOR ERROR] %s", exc)
+        add_error(f"Monitor: {exc}")
+        return [], []
+
+
+# ------------------------------------------------------------
+# STATE SAVE / LOAD
 # ------------------------------------------------------------
 
 def save_state():
     try:
-        payload = {
+        data = {
             "active_signals": active_signals,
             "signal_history": signal_history[-SIGNAL_HISTORY_LIMIT:],
             "scan_count": scan_count,
-            "last_scan": last_scan_time,
-            "symbols": symbols
+            "symbols": symbols,
+            "last_entry_candle": last_entry_candle,
+            "trade_history": trade_history[-100:]
         }
-        temp_file = STATE_FILE + ".tmp"
-        with open(temp_file, "w", encoding="utf-8") as file:
-            json.dump(payload, file, indent=2, default=str)
-        os.replace(temp_file, STATE_FILE)
+        with open(STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, default=str)
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
     except Exception as exc:
-        logger.error("[STATE SAVE ERROR] %s", exc)
+        logger.error("[SAVE STATE ERROR] %s", exc)
 
 
 def load_state():
-    global active_signals, signal_history, scan_count, symbols
+    global active_signals, signal_history, scan_count, last_entry_candle, trade_history
+
     try:
         if not os.path.exists(STATE_FILE):
-            logger.info("[STATE] No saved state file yet")
             return
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            payload = json.load(file)
 
-        active_signals = payload.get("active_signals", {})
-        signal_history = payload.get("signal_history", [])[-SIGNAL_HISTORY_LIMIT:]
-        scan_count = payload.get("scan_count", 0)
-        saved_symbols = payload.get("symbols", [])
-        if saved_symbols:
-            symbols = saved_symbols
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
 
-        logger.info("[STATE RESTORED] active=%s history=%s scan_count=%s",
-                    len(active_signals), len(signal_history), scan_count)
+        active_signals = data.get("active_signals", {})
+        signal_history = data.get("signal_history", [])[-SIGNAL_HISTORY_LIMIT:]
+        scan_count = data.get("scan_count", 0)
+        last_entry_candle = data.get("last_entry_candle", {})
+        trade_history = data.get("trade_history", [])[-100:]
+
+        logger.info("[STATE RESTORED] scan_count=%s", scan_count)
+
     except Exception as exc:
-        logger.error("[STATE LOAD ERROR] %s", exc)
+        logger.error("[LOAD STATE ERROR] %s", exc)
 
 
 # ------------------------------------------------------------
-# SCANNER LOOP
+# MAIN SCANNER LOOP
 # ------------------------------------------------------------
 
 def scanner_loop():
     global scan_count, last_scan_time, last_scan_duration
 
-    logger.info("DELTA INDIA TESTNET SIGNAL SCANNER STARTED - SIGNALS ONLY")
-    logger.info("BASE URL: %s | ORDER PLACEMENT: DISABLED", BASE_URL)
-    logger.info("TF: trend=%s entry=%s | scan=%ss | discovery=%ss",
-                TREND_RESOLUTION, ENTRY_RESOLUTION,
-                SCAN_INTERVAL, DISCOVERY_INTERVAL)
-    logger.info("FILTERS: EMA50/200 trend | EMA10/20 entry | RSI14 | "
-                "volume x%.2f | ATR14", VOLUME_MULTIPLIER)
-    logger.info("RSI: BUY %s-%s | SELL %s-%s",
-                BUY_RSI_MIN, BUY_RSI_MAX, SELL_RSI_MIN, SELL_RSI_MAX)
+    logger.warning("TESTNET AUTO BOT STARTED")
+    logger.warning("AUTO_TRADING=%s MARGIN=$%s MAX_POSITIONS=%s",
+                   AUTO_TRADING, MARGIN_USD, MAX_POSITIONS)
+    logger.warning("BASE URL=%s", BASE_URL)
+    logger.warning("Leverage is read from exchange; bot will not modify it.")
 
     while True:
-        scan_started = time.time()
+        started = time.time()
+
         try:
             current_symbols = discover_symbols()
-            if not current_symbols:
-                logger.error("[SCAN] No symbols available")
-            else:
-                buy_count, sell_count = 0, 0
-                for symbol in current_symbols:
-                    diagnostic = scan_symbol(symbol)
-                    if diagnostic.get("signal") == "BUY":
-                        buy_count += 1
-                    elif diagnostic.get("signal") == "SELL":
-                        sell_count += 1
 
-                scan_count += 1
-                last_scan_time = utc_now()
-                last_scan_duration = round(time.time() - scan_started, 2)
+            buys = sells = 0
 
-                logger.info(
-                    "[SCAN DONE] symbols=%s active_signals=%s BUY=%s SELL=%s "
-                    "duration=%.2fs next_scan_in=%ss",
-                    len(current_symbols), len(active_signals),
-                    buy_count, sell_count, last_scan_duration, SCAN_INTERVAL
-                )
+            for symbol in current_symbols:
+                d = scan_symbol(symbol)
+                if d.get("signal") == "BUY":
+                    buys += 1
+                elif d.get("signal") == "SELL":
+                    sells += 1
 
-                with state_lock:
-                    state.update({
-                        "bot_status": "RUNNING",
-                        "scan_count": scan_count,
-                        "last_scan": last_scan_time,
-                        "last_scan_duration": last_scan_duration,
-                        "active_signals": active_signals.copy(),
-                        "signal_history": signal_history[-SIGNAL_HISTORY_LIMIT:],
-                        "last_diagnostics": last_diagnostics.copy(),
-                        "symbols": current_symbols.copy(),
-                        "total_symbols": len(current_symbols)
-                    })
+            monitor_positions()
 
-                # Save state each completed scan; previously this was never called.
-                save_state()
+            scan_count += 1
+            last_scan_time = utc_now()
+            last_scan_duration = round(time.time() - started, 2)
+
+            logger.info(
+                "[SCAN COMPLETE] symbols=%s BUY=%s SELL=%s "
+                "active_signals=%s duration=%ss",
+                len(current_symbols), buys, sells,
+                len(active_signals), last_scan_duration
+            )
+
+            save_state()
 
         except Exception as exc:
-            logger.error("[SCANNER LOOP ERROR] %s", exc)
-            logger.debug(traceback.format_exc())
+            logger.exception("[SCANNER LOOP ERROR] %s", exc)
             add_error(str(exc))
-            with state_lock:
-                state["bot_status"] = "ERROR"
 
-        elapsed = time.time() - scan_started
-        time.sleep(max(1, SCAN_INTERVAL - elapsed))
+        time.sleep(max(1, SCAN_INTERVAL - (time.time() - started)))
 
 
 # ------------------------------------------------------------
-# HTTP DASHBOARD / API
+# DASHBOARD
 # ------------------------------------------------------------
 
 @app.route("/")
 def home():
     return Response("""
-<!doctype html>
-<html><head>
-<title>Delta Testnet Signal Scanner</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!DOCTYPE html>
+<html>
+<head>
+<title>Delta Testnet Auto Bot</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-body{background:#10151c;color:#e7edf5;font-family:Arial,sans-serif;padding:16px}
-h1{color:#64d8a4}.card{background:#1b2530;padding:15px;margin:10px 0;border-radius:10px}
-a{color:#6ec9ff}pre{white-space:pre-wrap;overflow-wrap:anywhere}
-</style></head><body>
-<h1>DELTA INDIA TESTNET</h1><h2>Signal Tracking Scanner</h2>
-<div class="card"><b>ORDER PLACEMENT: DISABLED</b><br>SAFETY MODE - SIGNALS ONLY</div>
-<div class="card"><a href="/health">Health</a> |
-<a href="/dashboard-data">Dashboard Data</a> |
-<a href="/signal-history">Signal History</a> |
-<a href="/diagnostics">Diagnostics</a></div>
-<div class="card"><h3>Scanner Data (refreshes every 10 seconds)</h3><pre id="data">Loading...</pre></div>
+body{background:#10151c;color:#e7edf5;font-family:Arial;padding:15px}
+h1{color:#64d8a4}
+.card{background:#1b2530;padding:15px;margin:10px 0;border-radius:10px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}
+a{color:#6ec9ff}
+</style>
+</head>
+<body>
+<h1>DELTA INDIA TESTNET</h1>
+<h2>Auto Trading Bot</h2>
+<div class="card">
+<b>TESTNET ONLY</b><br>
+Margin per trade: $20<br>
+Max positions: 10<br>
+Leverage: Exchange setting (read only)<br>
+SL: ATR × 1.2<br>
+TP: ATR × 2.0
+</div>
+<div class="card">
+<a href="/health">Health</a> |
+<a href="/dashboard-data">Dashboard JSON</a> |
+<a href="/diagnostics">Diagnostics</a> |
+<a href="/positions">Positions</a>
+</div>
+<div class="card">
+<pre id="data">Loading...</pre>
+</div>
 <script>
-async function update(){try{const r=await fetch('/dashboard-data');const d=await r.json();
-document.getElementById('data').textContent=JSON.stringify(d,null,2);
-}catch(e){document.getElementById('data').textContent='Dashboard loading error';}}
-update();setInterval(update,10000);
-</script></body></html>
+async function refresh(){
+ try{
+  const r=await fetch('/dashboard-data');
+  const d=await r.json();
+  document.getElementById('data').textContent=JSON.stringify(d,null,2);
+ }catch(e){
+  document.getElementById('data').textContent='Dashboard error';
+ }
+}
+refresh();setInterval(refresh,10000);
+</script>
+</body></html>
 """, mimetype="text/html")
 
 
 @app.route("/health")
 def health():
-    with state_lock:
-        return jsonify({
-            "status": "ok",
-            "bot_status": state.get("bot_status"),
-            "trading_enabled": False,
-            "exchange": "DELTA INDIA TESTNET",
-            "symbols": state.get("total_symbols", 0),
-            "scan_count": scan_count,
-            "active_signals": len(active_signals),
-            "last_scan": last_scan_time,
-            "last_scan_duration": last_scan_duration,
-            "time": utc_now()
-        }), 200
+    return jsonify({
+        "status": "ok",
+        "bot_status": "RUNNING",
+        "exchange": "DELTA INDIA TESTNET",
+        "auto_trading": AUTO_TRADING,
+        "margin_per_trade": MARGIN_USD,
+        "max_positions": MAX_POSITIONS,
+        "scan_count": scan_count,
+        "symbols": len(symbols),
+        "last_scan": last_scan_time,
+        "last_scan_duration": last_scan_duration,
+        "time": utc_now()
+    })
 
 
 @app.route("/dashboard-data")
 def dashboard_data():
-    with state_lock:
-        return jsonify({
-            "bot_status": state.get("bot_status"),
-            "trading_enabled": False,
-            "exchange": "DELTA INDIA TESTNET",
-            "symbols": symbols.copy(),
-            "total_symbols": len(symbols),
-            "scan_count": scan_count,
-            "last_scan": last_scan_time,
-            "last_scan_duration": last_scan_duration,
-            "active_signals": active_signals.copy(),
-            "signal_history": signal_history[-SIGNAL_HISTORY_LIMIT:],
-            "last_diagnostics": last_diagnostics.copy(),
-            "data_quarantine": data_quarantine.copy(),
-            "quarantined_symbols": sorted({v.get("symbol") for v in data_quarantine.values()}),
-            "errors": state.get("errors", [])[-20:],
-            "settings": {
-                "trend_resolution": TREND_RESOLUTION,
-                "entry_resolution": ENTRY_RESOLUTION,
-                "trend_ema_fast": TREND_EMA_FAST,
-                "trend_ema_slow": TREND_EMA_SLOW,
-                "entry_ema_fast": ENTRY_EMA_FAST,
-                "entry_ema_slow": ENTRY_EMA_SLOW,
-                "rsi_period": RSI_PERIOD,
-                "atr_period": ATR_PERIOD,
-                "max_atr_percent": MAX_ATR_PERCENT,
-                "max_candle_range_percent": MAX_CANDLE_RANGE_PERCENT,
-                "max_candle_body_percent": MAX_CANDLE_BODY_PERCENT,
-                "max_close_jump_percent": MAX_CLOSE_JUMP_PERCENT,
-                "zero_volume_quarantine_count": ZERO_VOLUME_QUARANTINE_COUNT,
-                "volume_ma_period": VOLUME_MA_PERIOD,
-                "volume_multiplier": VOLUME_MULTIPLIER,
-                "buy_rsi_range": [BUY_RSI_MIN, BUY_RSI_MAX],
-                "sell_rsi_range": [SELL_RSI_MIN, SELL_RSI_MAX],
-                "scan_interval": SCAN_INTERVAL,
-                "discovery_interval": DISCOVERY_INTERVAL
-            }
-        })
-
-
-@app.route("/signal-history")
-def signal_history_endpoint():
-    with state_lock:
-        return jsonify({
-            "active_signals": active_signals.copy(),
-            "history": signal_history[-SIGNAL_HISTORY_LIMIT:],
-            "count": len(signal_history),
-            "time": utc_now()
-        })
+    return jsonify({
+        "bot_status": "RUNNING",
+        "exchange": "DELTA INDIA TESTNET",
+        "auto_trading": AUTO_TRADING,
+        "margin_per_trade_usd": MARGIN_USD,
+        "max_positions": MAX_POSITIONS,
+        "leverage_policy": "READ FROM EXCHANGE - NEVER CHANGED",
+        "sl_atr_multiplier": SL_ATR_MULTIPLIER,
+        "tp_atr_multiplier": TP_ATR_MULTIPLIER,
+        "symbols": symbols,
+        "total_symbols": len(symbols),
+        "scan_count": scan_count,
+        "last_scan": last_scan_time,
+        "last_scan_duration": last_scan_duration,
+        "active_signals": active_signals,
+        "signal_history": signal_history[-SIGNAL_HISTORY_LIMIT:],
+        "diagnostics": last_diagnostics,
+        "data_quarantine": data_quarantine,
+        "execution_status": execution_status,
+        "trade_history": trade_history[-100:],
+        "errors": errors[-20:]
+    })
 
 
 @app.route("/diagnostics")
-def diagnostics_endpoint():
-    with state_lock:
+def diagnostics():
+    return jsonify({
+        "diagnostics": last_diagnostics,
+        "data_quarantine": data_quarantine,
+        "execution_status": execution_status,
+        "errors": errors[-20:],
+        "time": utc_now()
+    })
+
+
+@app.route("/positions")
+def positions_endpoint():
+    if not API_KEY or not API_SECRET:
+        return jsonify({"error": "API credentials missing"}), 503
+
+    try:
         return jsonify({
-            "symbols": symbols.copy(),
-            "diagnostics": last_diagnostics.copy(),
-            "data_quarantine": data_quarantine.copy(),
-            "errors": state.get("errors", [])[-20:],
+            "positions": get_positions(),
+            "active_orders": get_open_orders(),
             "time": utc_now()
         })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 # ------------------------------------------------------------
 # STARTUP
 # ------------------------------------------------------------
 
-def start_scanner():
+def startup_checks():
+    if BASE_URL != "https://cdn-ind.testnet.deltaex.org":
+        raise RuntimeError("Refusing to start: non-testnet URL")
+
+    if AUTO_TRADING and (not API_KEY or not API_SECRET):
+        logger.error(
+            "AUTO TRADING BLOCKED: set DELTA_API_KEY and DELTA_API_SECRET"
+        )
+        return False
+
+    if AUTO_TRADING:
+        # Verify authenticated connection before execution starts.
+        get_positions()
+        get_open_orders()
+        logger.warning("AUTHENTICATED TESTNET ACCOUNT CHECK OK")
+
+    return True
+
+
+def start_bot():
     load_state()
-    state["started_at"] = utc_now()
-    state["bot_status"] = "STARTING"
-    state["trading_enabled"] = False
+
+    try:
+        startup_checks()
+    except Exception as exc:
+        logger.critical("[STARTUP CHECK FAILED] %s", exc)
+        add_error(f"Startup check failed: {exc}")
 
     thread = threading.Thread(
-        target=scanner_loop, daemon=True, name="delta-scanner"
+        target=scanner_loop,
+        daemon=True,
+        name="delta-auto-scanner"
     )
     thread.start()
 
 
 if __name__ == "__main__":
-    start_scanner()
+    start_bot()
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
